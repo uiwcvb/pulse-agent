@@ -1,0 +1,15 @@
+{
+  "version": "4.0.22",
+  "version_name": "4.0.22",
+  "versionName": "4.0.22",
+  "tag_name": "v4.0.22",
+  "version_code": 110,
+  "versionCode": 110,
+  "build": 110,
+  "published_at": "2026-11-18T23:29:15.882735+08:00",
+  "apk_size": 32379388,
+  "sha256": "196d97703880769a2dcd4c39be03bc0bb4b0f49916c2eacee16ecb46f35416fb",
+  "download_url": "/proactive-agent/download/proactive-agent.apk",
+  "notes": "v4.0.22 (Build 110): 1) 苹果级「纯享正文阅读体 + 顶部唯一过程眉标 + 左滑 1:1 线性拉出工程遥测（缓存命中/TTFT/TPS/轮次）」极简美学 UI（桌面/手机全统一，过程 0 跳动不回弹）；2) 根治 Node DSH Sidecar 中途意外中断（`python_tools_plugin` 全面告别 Node 22 undici 改走原生 `http`，增加 4 图滑动折叠防 256MB 堆 OOM，提升内存配额）；3) 全局统一 0..1000 归一化坐标系（去黑边零偏移、DOM 不混发像素、支持 Alipay/收银台二维码智能框选与截图回看确认）；4) Prompt 与 Tool Schema 瘦身降噪 + 静态前缀锁死 Prefix Cache + 原生 choices 快捷按钮回归。",
+  "body": "v4.0.22 (Build 110): 1) 苹果级「纯享正文阅读体 + 顶部唯一过程眉标 + 左滑 1:1 线性拉出工程遥测（缓存命中/TTFT/TPS/轮次）」极简美学 UI（桌面/手机全统一，过程 0 跳动不回弹）；2) 根治 Node DSH Sidecar 中途意外中断（`python_tools_plugin` 全面告别 Node 22 undici 改走原生 `http`，增加 4 图滑动折叠防 256MB 堆 OOM，提升内存配额）；3) 全局统一 0..1000 归一化坐标系（去黑边零偏移、DOM 不混发像素、支持 Alipay/收银台二维码智能框选与截图回看确认）；4) Prompt 与 Tool Schema 瘦身降噪 + 静态前缀锁死 Prefix Cache + 原生 choices 快捷按钮回归。"
+}

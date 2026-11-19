@@ -1,0 +1,48 @@
+{
+  "name": "dsh-deepseek-claw",
+  "version": "4.0.0",
+  "description": "DSB · DeepSeek Bot 跨端智能助手与桌面工作台",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "assets",
+    "cua",
+    "cua-bridge.mjs",
+    "sentinel.mjs",
+    "setup.mjs",
+    "lib-sentinel-net.mjs",
+    "lib-file-bridge.mjs",
+    "lib-chat-cache.mjs",
+    "lib-chat-sync.mjs",
+    "lib-dsh-sessions.mjs",
+    "lib-dsh-pc-tools.mjs",
+    "lib-local-routes.mjs"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

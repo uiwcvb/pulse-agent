@@ -1,0 +1,96 @@
+package dev.bubuki.proactive;
+
+import android.content.*;
+import android.os.*;
+import java.io.*;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+import org.json.JSONObject;
+
+/** Private pipe child created by the Root parent. Android's clipboard verifies
+ * the package/uid pair even for uid 0; use the actual shell package owner for
+ * clipboard reads, never misattribute uid 0. Binder access references Mika,
+ * e9daf53, Apache-2.0. No socket, Activity, exported service or input tool here. */
+public final class RootClipboardBroker {
+    public static void main(String[] args)throws Exception {
+        int uid=android.os.Process.myUid();
+        if(uid!=0&&uid!=2000)throw new SecurityException("Clipboard broker requires uid 0 or 2000");
+        if(uid==0){android.system.Os.setgid(2000);android.system.Os.setuid(2000);}
+        Looper.prepareMainLooper();Context base=DisplayRuntime.systemContext();
+        Context context=new ContextWrapper(base){
+            @Override public String getPackageName(){return "com.android.shell";}
+            @Override public String getOpPackageName(){return "com.android.shell";}
+            @Override public Context getApplicationContext(){return this;}
+            @Override public android.content.AttributionSource getAttributionSource(){return new android.content.AttributionSource.Builder(2000).setPackageName("com.android.shell").build();}
+        };
+        java.lang.reflect.Constructor<ClipboardManager> constructor=ClipboardManager.class.getDeclaredConstructor(Context.class,Handler.class);constructor.setAccessible(true);
+        ClipboardManager manager=constructor.newInstance(context,new Handler(Looper.getMainLooper()));
+        Object binder=Class.forName("android.os.ServiceManager").getMethod("getService",String.class).invoke(null,"clipboard");
+        Object service=Class.forName("android.content.IClipboard$Stub").getMethod("asInterface",IBinder.class).invoke(null,binder);
+        Class<?> type=Class.forName("android.content.IClipboard");Method getter=null;
+        for (Method m : type.getMethods()) {
+            if ("getPrimaryClip".equals(m.getName())) { getter = m; break; }
+        }
+        BufferedReader in=new BufferedReader(new InputStreamReader(System.in,StandardCharsets.UTF_8));PrintWriter out=new PrintWriter(new OutputStreamWriter(System.out,StandardCharsets.UTF_8),true);
+        ClipData previous=null;
+        boolean previousReadOk=false;
+        try { previous=read(getter,service); previousReadOk=true; } catch (Throwable ignored) {}
+        String label="pulse-input-"+UUID.randomUUID();boolean changed=false;
+        try {
+            String request=in.readLine();if(request==null)return;
+            JSONObject reqObj=new JSONObject(request);
+            String op=reqObj.optString("op","paste");
+            if("get".equals(op)){
+                ClipData cur=read(getter,service);
+                String clipTxt="";
+                if(cur!=null&&cur.getItemCount()>0&&cur.getItemAt(0).getText()!=null){
+                    clipTxt=cur.getItemAt(0).getText().toString();
+                }
+                out.println(new JSONObject().put("ok",true).put("text",clipTxt).toString());
+                return;
+            }
+            if("set".equals(op)){
+                String text=reqObj.optString("text","");
+                ClipData clip=ClipData.newPlainText("pulse-clip",text);
+                manager.setPrimaryClip(clip);
+                out.println(new JSONObject().put("ok",true).put("text",text).toString());
+                return;
+            }
+            String text=reqObj.getString("text");
+            ClipData pending=ClipData.newPlainText(label,text);PersistableBundle extras=new PersistableBundle();extras.putBoolean("android.content.extra.IS_SENSITIVE",true);pending.getDescription().setExtras(extras);
+            manager.setPrimaryClip(pending);changed=true;out.println("{\"ready\":true}");
+            in.readLine();
+        }catch(Exception error){out.println(new JSONObject().put("error",error.getClass().getSimpleName()+": "+error.getMessage()));}
+        finally{
+            if(changed && previousReadOk){
+                try {
+                    ClipData current=read(getter,service);if(current==null||label.contentEquals(current.getDescription().getLabel())){if(previous==null)manager.clearPrimaryClip();else manager.setPrimaryClip(previous);}
+                } catch (Throwable ignored) {}
+                out.println("{\"restored\":true}");
+            } else if (changed) {
+                out.println("{\"restored\":false}");
+            }
+        }
+        System.exit(0);
+    }
+    private static ClipData read(Method getter,Object service)throws Exception{
+        if (getter == null || service == null) throw new IllegalStateException("Clipboard service unavailable");
+        int n = getter.getParameterCount();
+        if (n >= 5) {
+            Object[] args = new Object[n];
+            args[0] = "com.android.shell";
+            Class<?>[] pt = getter.getParameterTypes();
+            for (int i = 1; i < n; i++) {
+                if (pt[i] == int.class || pt[i] == Integer.class) args[i] = 0;
+                else if (pt[i] == boolean.class || pt[i] == Boolean.class) args[i] = false;
+                else args[i] = null;
+            }
+            return (ClipData)getter.invoke(service, args);
+        }
+        if (n == 4) return (ClipData)getter.invoke(service,"com.android.shell",null,0,0);
+        if (n == 3) return (ClipData)getter.invoke(service,"com.android.shell",null,0);
+        if (n == 2) return (ClipData)getter.invoke(service,"com.android.shell",0);
+        throw new IllegalStateException("Unsupported getPrimaryClip parameter count: " + n);
+    }
+}

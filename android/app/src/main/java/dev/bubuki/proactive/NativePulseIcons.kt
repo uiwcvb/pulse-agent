@@ -1,0 +1,209 @@
+package dev.bubuki.proactive
+
+import android.graphics.Paint
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.keyframes
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.core.graphics.PathParser
+
+private val nativePaths = mapOf(
+    "back" to "M15 5L8 12L15 19",
+    "next" to "M9 6L15 12L9 18",
+    "chevron_down" to "M6 9L12 15L18 9",
+    "chevron_up" to "M6 15L12 9L18 15",
+    "plus" to "M12 5V19M5 12H19",
+    "close" to "M6.5 6.5L17.5 17.5M17.5 6.5L6.5 17.5",
+    "search" to "M16.5 10.5A6 6 0 1 1 4.5 10.5A6 6 0 1 1 16.5 10.5M15.5 15.5L20 20",
+    "send" to "M12 19V5M6 11L12 5L18 11",
+    "more" to "M5 12h0.1M12 12h0.1M19 12h0.1",
+    "reply" to "M9 14L4 9L9 4M4 9H14.5A5.5 5.5 0 0 1 20 14.5V19",
+    "check" to "M4.5 12.5L9.2 17L19.5 6.5",
+    "check_double" to "M2.5 12.5L6.8 16.8L15.5 7.5M9.5 12.5L13.8 16.8L22 8",
+    "attach" to "M21.4 11.1L12.2 20.3A6 6 0 0 1 3.7 11.8L12.9 2.6A4 4 0 0 1 18.6 8.3L9.4 17.5A2 2 0 0 1 6.6 14.7L15.1 6.2",
+    "image" to "M4.5 6.5A2 2 0 0 1 6.5 4.5H17.5A2 2 0 0 1 19.5 6.5V17.5A2 2 0 0 1 17.5 19.5H6.5A2 2 0 0 1 4.5 17.5V6.5ZM8.5 9.5A1 1 0 1 0 8.5 9.4ZM5 17L10 12L13.5 15.5L16 13L19 16.5",
+    "refresh" to "M19.5 8.5A8 8 0 1 0 20 14.5M19.5 4V8.5H15",
+    "sticker" to "M12 3A9 9 0 1 0 21 12C21 10.5 20.5 9 19.5 8M15 20.5C15 16.5 16.5 15 20.5 15M9 10H9.1M15 10H15.1M9.5 15C10.8 16.3 13.2 16.3 14.5 15",
+    "edit" to "M16.5 3.5A2.1 2.1 0 0 1 19.5 6.5L7 19L3 20L4 16L16.5 3.5Z",
+    "broom" to "M19 5L14 10M4 20L9 15M14.5 6.5L17.5 9.5L9 18L5 19L6 15L14.5 6.5Z",
+    "stop" to "M6.5 6.5H17.5V17.5H6.5Z",
+    "user" to "M12 11A4 4 0 1 0 12 3A4 4 0 1 0 12 11ZM5 20C5 16.5 8.1 14 12 14C15.9 14 19 16.5 19 20",
+    "cloud" to "M6.5 18H17.5A4 4 0 0 0 18 10A5.5 5.5 0 0 0 7.5 8.5A4.5 4.5 0 0 0 6.5 18Z",
+    "screen" to "M4 5A2 2 0 0 1 6 3H18A2 2 0 0 1 20 5V15A2 2 0 0 1 18 17H6A2 2 0 0 1 4 15V5ZM9 21H15M12 17V21",
+    "spark" to "M12 3L14.2 9.8L21 12L14.2 14.2L12 21L9.8 14.2L3 12L9.8 9.8Z",
+    "chat" to "M20 11.5C20 15.8 16.9 18.5 12.5 18.5H7.5L4 21.5V11.5C4 7.2 7.1 4.5 11.5 4.5H12.5C16.9 4.5 20 7.2 20 11.5Z",
+    "tools" to "M12 2L20.5 6.8V17.2L12 22L3.5 17.2V6.8L12 2ZM3.5 6.8L12 11.6L20.5 6.8M12 11.6V22",
+    "folder" to "M3.5 7V5.5A1.5 1.5 0 0 1 5 4H9.5L12 6.5H19A1.5 1.5 0 0 1 20.5 8V18.5A1.5 1.5 0 0 1 19 20H5A1.5 1.5 0 0 1 3.5 18.5Z",
+    "file" to "M14 3.5H6.5A2 2 0 0 0 4.5 5.5V18.5A2 2 0 0 0 6.5 20.5H17.5A2 2 0 0 0 19.5 18.5V9L14 3.5ZM14 3.5V9H19.5M8.5 13H15.5M8.5 16.5H13",
+    "clock" to "M20.5 12A8.5 8.5 0 1 1 3.5 12A8.5 8.5 0 1 1 20.5 12M12 7V12L15.5 14",
+    "settings" to "M4 7.5H7M13 7.5H20M4 16.5H11M17 16.5H20M13 7.5A3 3 0 1 1 7 7.5A3 3 0 1 1 13 7.5M17 16.5A3 3 0 1 1 11 16.5A3 3 0 1 1 17 16.5",
+    "copy" to "M9.5 8.5H17.5A1.5 1.5 0 0 1 19 10V18.5A1.5 1.5 0 0 1 17.5 20H9.5A1.5 1.5 0 0 1 8 18.5V10A1.5 1.5 0 0 1 9.5 8.5ZM15.5 8.5V5.5A1.5 1.5 0 0 0 14 4H5.5A1.5 1.5 0 0 0 4 5.5V14A1.5 1.5 0 0 0 5.5 15.5H8",
+    "pin" to "M8.5 3.5H15.5L14.5 9.5L18 13H6L9.5 9.5ZM12 13V20.5",
+    "hide" to "M3.5 3.5L20.5 20.5M10.6 5.2L12 5C18 5 21.5 12 21.5 12L18.8 15.3M6.6 6.6C4.2 8.9 2.5 12 2.5 12C2.5 12 6 19 12 19C14.7 19 17 17.7 17 17.7",
+    "vault" to "M12 3.5L20.5 8L12 12.5L3.5 8L12 3.5ZM3.5 12L12 16.5L20.5 12M3.5 16L12 20.5L20.5 16",
+    "moon" to "M20.2 13.4C16.5 14.3 10.2 10.5 11.1 3.8C2.4 4.7 1.4 19.2 12.2 20.4C18.5 20.4 19.8 15.5 20.2 13.4Z",
+    "bell" to "M5.5 10C5.5 2 18.5 2 18.5 10C18.5 16.2 21 16.8 21 16.8H3C3 16.8 5.5 16.2 5.5 10M9.5 19.5C9.5 22.5 14.5 22.5 14.5 19.5"
+)
+
+@Composable
+internal fun PulseIcon(name: String, color: Color, modifier: Modifier = Modifier.size(20.dp)) {
+    val path = remember(name) { PathParser.createPathFromPathData(nativePaths[name] ?: nativePaths.getValue("next")) }
+    val paint = remember {
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+    }
+    Canvas(modifier) {
+        val scale = size.minDimension / 24f
+        paint.color = android.graphics.Color.argb(
+            (color.alpha * 255).toInt(),
+            (color.red * 255).toInt(),
+            (color.green * 255).toInt(),
+            (color.blue * 255).toInt()
+        )
+        paint.strokeWidth = when (name) {
+            "more" -> 3.0f
+            "send", "plus", "back", "reply", "check_double" -> 2.1f
+            else -> 1.8f
+        }
+        drawIntoCanvas { canvas ->
+            val native = canvas.nativeCanvas
+            native.save()
+            native.translate((size.width - 24f * scale) / 2f, (size.height - 24f * scale) / 2f)
+            native.scale(scale, scale)
+            native.drawPath(path, paint)
+            native.restore()
+        }
+    }
+}
+
+private val shapePaths: Map<String, String>
+    get() = BotAvatarView.shapePaths
+
+@Composable
+internal fun PulseAvatar(
+    bot: PulseBot,
+    state: NativePulseState,
+    diameter: Dp = 44.dp,
+    showStatusDot: Boolean = false,
+    ringColor: Color = Color(0xFF1C1C1E)
+) {
+    val radius = diameter * 0.36f
+    val image = state.avatars[bot.id]
+    val isBusy = state.streamBotId == bot.id || state.workingBot == bot.id || state.busyBot == bot.id
+    val dotSize = (diameter * 0.26f).coerceIn(10.dp, 15.dp)
+    val baseColor = remember(bot.color) {
+        BotAvatarView.parseColorSafe(bot.color, Color(0xFFB568F7))
+    }
+    val useWhalechanStamp = remember(bot.id, bot.shape) {
+        BotAvatarView.isWhalechanStamp(bot.id, bot.shape)
+    }
+
+    Box(Modifier.size(diameter)) {
+        if (image != null && bot.avatarVersion.isNotBlank()) {
+            Image(
+                image,
+                null,
+                Modifier
+                    .size(diameter)
+                    .clip(RoundedCornerShape(radius))
+                    .border(1.5.dp, baseColor.copy(alpha = 0.85f), RoundedCornerShape(radius)),
+                contentScale = ContentScale.Crop
+            )
+        } else if (useWhalechanStamp) {
+            Image(
+                painter = painterResource(id = R.drawable.whalechan_avatar),
+                contentDescription = bot.name,
+                modifier = Modifier
+                    .size(diameter)
+                    .clip(CircleShape)
+                    .background(baseColor.copy(alpha = 0.18f), CircleShape)
+                    .border(2.dp, baseColor, CircleShape),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            val shapeKey = remember(bot.shape, bot.id) {
+                if (bot.shape.isNotBlank() && bot.shape in BotAvatarView.shapePaths) {
+                    bot.shape
+                } else {
+                    BotAvatarView.resolveShapeKey(bot.id, bot.shape)
+                }
+            }
+            val fill = remember(shapeKey) { BotAvatarView.createPath(shapeKey) }
+            val fillPaint = remember { Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL } }
+            // Static eye geometry to eliminate 90Hz infinite Canvas invalidations & BLASTBufferQueue out-of-order buffers.
+            val eyeScaleY = 1f
+            val eyeShiftX = 0f
+            Canvas(Modifier.size(diameter)) {
+                val s = size.minDimension / 100f
+                fillPaint.color = android.graphics.Color.argb(
+                    (baseColor.alpha * 255).toInt(),
+                    (baseColor.red * 255).toInt(),
+                    (baseColor.green * 255).toInt(),
+                    (baseColor.blue * 255).toInt()
+                )
+                drawIntoCanvas {
+                    val native = it.nativeCanvas
+                    native.save()
+                    native.scale(s, s)
+                    native.drawPath(fill, fillPaint)
+                    native.restore()
+                }
+                val eyeH = (23f * eyeScaleY).coerceAtLeast(3.5f) * s
+                val eyeYOffset = (23f * s - eyeH) / 2f
+                rotate(-26f, Offset((58f + eyeShiftX) * s, 44f * s)) {
+                    drawRoundRect(
+                        Color.White,
+                        Offset((44.5f + eyeShiftX) * s, 32.5f * s + eyeYOffset),
+                        Size(8.6f * s, eyeH),
+                        CornerRadius(5f * s, 5f * s)
+                    )
+                    drawRoundRect(
+                        Color.White,
+                        Offset((59.5f + eyeShiftX) * s, 32.5f * s + eyeYOffset),
+                        Size(8.6f * s, eyeH),
+                        CornerRadius(5f * s, 5f * s)
+                    )
+                }
+            }
+        }
+        if (showStatusDot && (state.online || isBusy)) {
+            Box(
+                Modifier.align(Alignment.BottomEnd)
+                    .size(dotSize)
+                    .clip(CircleShape)
+                    .background(if (isBusy) Color(0xFF0A84FF) else Color(0xFF30D158))
+                    .border(2.dp, ringColor, CircleShape)
+            )
+        }
+    }
+}

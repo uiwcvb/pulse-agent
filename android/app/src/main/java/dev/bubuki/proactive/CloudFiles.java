@@ -1,0 +1,239 @@
+package dev.bubuki.proactive;
+
+import android.content.ContentValues;
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.net.Uri;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.util.Base64;
+import android.webkit.MimeTypeMap;
+import org.json.JSONObject;
+
+/** Chunked encrypted transfer into Android Downloads, including automatic image compression, thumbnail decoding & upload progress callbacks. */
+final class CloudFiles {
+    interface UploadProgressListener {
+        void onProgress(float progress, long uploadedBytes, long totalBytes);
+    }
+
+    static boolean isImageFilename(String name) {
+        if (name == null) return false;
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png")
+            || lower.endsWith(".webp") || lower.endsWith(".gif") || lower.endsWith(".heic") || lower.endsWith(".heif");
+    }
+
+    static JSONObject probeUriMeta(Context context, Uri uri) {
+        String name = "attachment";
+        long rawSize = -1;
+        boolean isImage = false;
+        try {
+            String mime = context.getContentResolver().getType(uri);
+            if (mime != null && mime.startsWith("image/")) isImage = true;
+            if ("file".equalsIgnoreCase(uri.getScheme()) && uri.getPath() != null) {
+                java.io.File localFile = new java.io.File(uri.getPath());
+                name = localFile.getName();
+                rawSize = localFile.length();
+            } else {
+                try (android.database.Cursor cursor = context.getContentResolver().query(
+                    uri,
+                    new String[]{android.provider.OpenableColumns.DISPLAY_NAME, android.provider.OpenableColumns.SIZE},
+                    null, null, null
+                )) {
+                    if (cursor != null && cursor.moveToFirst()) {
+                        name = cursor.getString(0);
+                        if (!cursor.isNull(1)) rawSize = cursor.getLong(1);
+                    }
+                }
+            }
+            if (name == null || name.isEmpty()) name = "attachment";
+            name = name.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_");
+            if (name.startsWith(".")) name = "file" + name;
+            if (name.length() > 150) name = name.substring(name.length() - 150);
+            if (!isImage) isImage = isImageFilename(name);
+            return new JSONObject().put("name", name).put("bytes", Math.max(0L, rawSize)).put("isImage", isImage);
+        } catch (Throwable ignored) {
+            return new JSONObject();
+        }
+    }
+
+    static Bitmap decodeThumbnailBitmap(Context context, Uri uri, int maxSidePx) {
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
+                if (in == null) return null;
+                BitmapFactory.decodeStream(in, null, bounds);
+            }
+            int w = bounds.outWidth, h = bounds.outHeight;
+            if (w <= 0 || h <= 0) return null;
+            int sample = 1;
+            int longest = Math.max(w, h);
+            while (longest / (sample * 2) >= Math.max(64, maxSidePx)) {
+                sample *= 2;
+            }
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = sample;
+            try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
+                if (in == null) return null;
+                return BitmapFactory.decodeStream(in, null, opts);
+            }
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean tryCompressImage(Context context, Uri uri, String name, java.io.File targetFile) {
+        String lower = name == null ? "" : name.toLowerCase(java.util.Locale.ROOT);
+        if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp"))) {
+            return false;
+        }
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
+                if (in == null) return false;
+                BitmapFactory.decodeStream(in, null, bounds);
+            }
+            int w = bounds.outWidth, h = bounds.outHeight;
+            if (w <= 0 || h <= 0) return false;
+            int maxSide = Math.max(w, h);
+            int sample = 1;
+            while (maxSide / (sample * 2) >= 1600) {
+                sample *= 2;
+            }
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = sample;
+            Bitmap decoded;
+            try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
+                if (in == null) return false;
+                decoded = BitmapFactory.decodeStream(in, null, opts);
+            }
+            if (decoded == null) return false;
+            int dw = decoded.getWidth(), dh = decoded.getHeight();
+            int longest = Math.max(dw, dh);
+            if (longest > 1600) {
+                float ratio = 1600f / longest;
+                int nw = Math.max(1, Math.round(dw * ratio));
+                int nh = Math.max(1, Math.round(dh * ratio));
+                Bitmap scaled = Bitmap.createScaledBitmap(decoded, nw, nh, true);
+                if (scaled != decoded) decoded.recycle();
+                decoded = scaled;
+            }
+            try (java.io.OutputStream out = new java.io.FileOutputStream(targetFile)) {
+                Bitmap.CompressFormat fmt = lower.endsWith(".png") && longest <= 1080
+                    ? Bitmap.CompressFormat.PNG
+                    : Bitmap.CompressFormat.JPEG;
+                decoded.compress(fmt, 82, out);
+            } finally {
+                decoded.recycle();
+            }
+            return targetFile.exists() && targetFile.length() > 0;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    static JSONObject upload(Context context, Uri uri, String source) throws Exception {
+        return upload(context, uri, source, null);
+    }
+
+    static JSONObject upload(Context context, Uri uri, String source, UploadProgressListener listener) throws Exception {
+        if(!"workspace".equals(source)&&!"computer".equals(source))throw new Exception("文件来源无效");
+        String name="attachment";
+        long rawSize=-1;
+        if("file".equalsIgnoreCase(uri.getScheme())&&uri.getPath()!=null){
+            java.io.File localFile=new java.io.File(uri.getPath());
+            name=localFile.getName();
+            rawSize=localFile.length();
+        }else{
+            try(android.database.Cursor cursor=context.getContentResolver().query(uri,new String[]{android.provider.OpenableColumns.DISPLAY_NAME,android.provider.OpenableColumns.SIZE},null,null,null)){
+                if(cursor!=null&&cursor.moveToFirst()){
+                    name=cursor.getString(0);
+                    if(!cursor.isNull(1))rawSize=cursor.getLong(1);
+                }
+            }
+        }
+        if(name==null)name="attachment";name=name.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]","_");
+        if(name.startsWith("."))name="file"+name;if(name.length()>150)name=name.substring(name.length()-150);
+        if(listener!=null)listener.onProgress(0.05f,0L,Math.max(0L,rawSize));
+        java.io.File staged=java.io.File.createTempFile("pulse-upload-",".partial",context.getCacheDir());
+        SecureTransport transport=new SecureTransport(context);String endpoint="computer".equals(source)?"/api/computer/uploads":"/api/files/uploads",uploadId=null;
+        try {
+            long total=0;
+            boolean compressed = (rawSize < 0 || rawSize > 450_000) && tryCompressImage(context, uri, name, staged);
+            if (compressed) {
+                total = staged.length();
+            } else {
+                try(java.io.InputStream input=context.getContentResolver().openInputStream(uri);java.io.OutputStream output=new java.io.FileOutputStream(staged)){
+                    if(input==null)throw new Exception("无法读取所选文件");byte[] buffer=new byte[262144];int n;
+                    while((n=input.read(buffer))!=-1){total+=n;if(total>50_000_000)throw new Exception("文件最大 50 MB");output.write(buffer,0,n);}
+                }
+            }
+            if(listener!=null)listener.onProgress(0.12f,0L,total);
+            JSONObject started=transport.request("POST",endpoint,new JSONObject().put("name",name).put("size",total).put("sha256",""),null);uploadId=started.getString("id");
+            long offset=0;
+            try(java.io.InputStream input=new java.io.FileInputStream(staged)){
+                byte[] buffer=new byte[262144];int n;
+                while((n=input.read(buffer))!=-1){
+                    JSONObject packet=transport.request("PUT",endpoint+"/"+uploadId,new JSONObject().put("offset",offset).put("data",Base64.encodeToString(buffer,0,n,Base64.NO_WRAP)),null);
+                    offset+=n;
+                    if(packet.getLong("offset")!=offset)throw new Exception("上传分块不连续");
+                    if(listener!=null&&total>0){
+                        float pct=0.12f+0.84f*Math.min(1f,(float)offset/(float)total);
+                        listener.onProgress(pct,offset,total);
+                    }
+                }
+            }
+            JSONObject receipt=transport.request("POST",endpoint+"/"+uploadId+"/finish",new JSONObject(),null);
+            if(receipt.getLong("bytes")!=total)throw new Exception("上传回读字节数不一致");
+            if(listener!=null)listener.onProgress(1f,total,total);
+            uploadId=null;return receipt.put("name",name);
+        } finally {
+            if(uploadId!=null)try{transport.request("DELETE",endpoint+"/"+uploadId,null,null);}catch(Exception ignored){}
+            staged.delete();
+        }
+    }
+    static JSONObject download(Context context,String source,String path) throws Exception {
+        if(!"computer".equals(source)&&!"workspace".equals(source))throw new Exception("文件来源无效");
+        String endpoint="computer".equals(source)?"/api/computer/file":"/api/files/file";
+        String name=path.substring(path.lastIndexOf('/')+1).replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]","_");
+        if(name.isEmpty()||name.length()>180)throw new Exception("文件名无效");
+        String extension=MimeTypeMap.getFileExtensionFromUrl(name),mime=MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.toLowerCase(java.util.Locale.ROOT));
+        ContentValues values=new ContentValues();values.put(MediaStore.Downloads.DISPLAY_NAME,name);
+        values.put(MediaStore.Downloads.MIME_TYPE,mime==null?"application/octet-stream":mime);
+        values.put(MediaStore.Downloads.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/DeepSeek Claw");values.put(MediaStore.Downloads.IS_PENDING,1);
+        Uri target=context.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,values);
+        if(target==null)throw new Exception("下载目录不可用");
+        long offset=0,expected=-1;boolean complete=false;String version=null;
+        try {
+            SecureTransport transport=new SecureTransport(context);
+            try(java.io.OutputStream output=context.getContentResolver().openOutputStream(target,"w")){
+                if(output==null)throw new Exception("无法写入下载文件");
+                while(true){
+                    JSONObject query=new JSONObject().put("path",path).put("offset",offset).put("size",262144);if(version!=null)query.put("version",version);
+                    JSONObject packet=transport.request("GET",endpoint,null,query);if(packet.has("version"))version=packet.getString("version");
+                    long total=packet.getLong("size");if(total<0||total>50_000_000||packet.getLong("offset")!=offset||expected!=-1&&expected!=total)throw new Exception("文件传输参数不一致");
+                    expected=total;byte[] data=Base64.decode(packet.getString("data"),Base64.DEFAULT);
+                    if(data.length>262144||packet.getLong("next_offset")!=offset+data.length||offset+data.length>expected)throw new Exception("文件分块不连续");
+                    output.write(data);offset+=data.length;
+                    if(packet.getBoolean("eof")){if(offset!=expected)throw new Exception("文件下载不完整");break;}
+                    if(data.length==0)throw new Exception("文件传输中断");
+                }
+            }
+            values.clear();values.put(MediaStore.Downloads.IS_PENDING,0);context.getContentResolver().update(target,values,null,null);complete=true;
+            String actualPath="/sdcard/Download/DeepSeek Claw/"+name;
+            try(android.database.Cursor c=context.getContentResolver().query(target,new String[]{MediaStore.MediaColumns.DATA,MediaStore.MediaColumns.DISPLAY_NAME},null,null,null)){
+                if(c!=null&&c.moveToFirst()){
+                    String dataPath=c.getString(0);
+                    String dispName=c.getString(1);
+                    if(dataPath!=null&&!dataPath.isEmpty())actualPath=dataPath;
+                    else if(dispName!=null&&!dispName.isEmpty())actualPath="/sdcard/Download/DeepSeek Claw/"+dispName;
+                }
+            }catch(Throwable ignored){}
+            try{android.media.MediaScannerConnection.scanFile(context,new String[]{actualPath},mime==null?null:new String[]{mime},null);}catch(Throwable ignored){}
+            return new JSONObject().put("name",name).put("bytes",offset).put("uri",target.toString()).put("path",actualPath);
+        } finally {if(!complete)context.getContentResolver().delete(target,null,null);}
+    }
+}

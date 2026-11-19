@@ -1,0 +1,9 @@
+{
+    "version_code": 95,
+    "version": "4.0.7",
+    "bytes": 32164576,
+    "versionName": "4.0.7",
+    "versionCode": 95,
+    "notes": "v4.0.7 / v5.0 (Build 95): 1) 虚拟屏中文输入法修复：默认 IME 策略改回 LOCAL(0)、DisplayTestActivity 改 adjustResize，悬浮窗与应用内展开栏新增快捷输入条与一键全屏 promote；2) 纯视觉 (0..1000 nx/ny + zoom) 与全栈诚实报错：彻底清除伪造 ok:true、盲贴(0,0)、首 EditText 劫持、wins[0] 回退、同步无障碍阻塞与强行工具熔断；3) 统一 CuriosityEngine v5 + SQLite 三表 (curiosity_topics / proactive_followups / curiosity_episodes) 与 1s 写爆修复。",
+    "version_name": "4.0.7"
+}

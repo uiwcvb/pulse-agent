@@ -1,0 +1,125 @@
+"""
+[Module Responsibility]
+Built-in modular Markdown skills stored in `memory_vault/skills/` (`server/core/skill_templates.py`).
+Each built-in skill starts with YAML frontmatter (`name`, `description`) and loads strictly on-demand.
+"""
+from __future__ import annotations
+
+SELF_ARCH_SKILL_MD = (
+    '---\n'
+    'name: self_architecture\n'
+    'description: DSB (DeepSeek Bot) 自身系统总纲：三域拓扑、分端独立 Bot 花名册、统一记忆架构、14 正交工具与 Skill 路由\n'
+    '---\n\n'
+    '# 🏛️ DSB · DeepSeek Bot 系统总纲与模块化 Skill 架构\n\n'
+    '当用户询问「你的架构是什么 / 多端怎么协同 / 记忆怎么整理 / 工具与技能怎么组织」时，以此技能文档为唯一权威事实依据。\n\n'
+    '## 一、三域物理拓扑与分端独立 Bot 花名册（手机端 + Windows 电脑端 + 共享云电脑）\n'
+    '1. **云端统一中枢（`Cloud Server` · `/opt/proactive-agent`）**：\n'
+    '   - 核心大脑（`Brain` + `@deepseek-ai/dsh-agent-loop` Sidecar + `BlackboardEngine` + `MemoryEngine` + `Vault`）常驻云端 `/opt/proactive-agent/server`，持久化目录 `/opt/proactive-agent/data/`。\n'
+    '   - 统一数据库：会话检索、长期事实（L0/L1/L2）与工作账本全部统一收口到单一 `context_index.db`（搭配 Obsidian Markdown 记忆金库 `memory_vault/`），零重复存储。\n'
+    '2. **分端独立 Bot 花名册（`home_node: "phone" | "pc"`）+ 档案一键导入导出**：\n'
+    '   - **手机端（`source="phone" / "phone2"`）**：常驻手机专属助理团（如 `companion`、`research`、`contrarian`），通过 `phone`（兼容 `phone_workspace`）操控后台隔离虚拟屏，并通过 `cloud`（兼容 `cloud_desktop`）操控共享云电脑。\n'
+    '   - **电脑端（`source="pc" / "pc2"`）**：常驻电脑专属助理团（如总工程师 `pc_engineer`、深研 `pc_research`、审校 `pc_reviewer`、伴侣 `pc_companion`），通过 `pc`（兼容 `dsh_workspace`，含本机 Git Bash `pc_shell`、CUA 桌面 `cua_desktop`、DSH 原生会话 `dispatch_session`）与 `cloud`（`cloud_desktop`）执行桌面与云端交付。\n'
+    '   - **档案迁移（`.dsb-bot.json`）**：支持 `/api/bots/{bot_id}/export` 与 `/api/bots/import` 一键导出/导入角色人设、外观、历史对话与核心记忆。\n'
+    '3. **全天候共享 Linux 云电脑（`cloud` / `cloud_desktop`）**：\n'
+    '   - 运行独立 `proactive-desktop.service`，手机端与电脑端均可随时接管操作与截图交付。\n\n'
+    '## 二、14 个正交工具与按需 Skill 加载原则\n'
+    '- 全系统收口为 14 个正交工具：`read_file`、`write_file`、`edit_file`、`search_files`、`bash`、`web`、`memory`、`blackboard`、`phone`、`pc`、`cloud`、`reply`、`subtask`、`admin`。\n'
+    '- **渐进式按需技能库 (`skills/*.md`)**：\n'
+    '  - 通知与手机全局悬浮窗 ➔ `skills/notify_and_overlay.md`\n'
+    '  - 手机虚拟屏 / Windows / 云电脑操控 ➔ `skills/device_control.md`\n'
+    '  - 跨端黑板 `@mention` 与 `peek_bots` 协同 ➔ `skills/blackboard_collab.md`\n'
+    '  - 零门槛开箱配置与部署 ➔ `skills/onboarding_guide.md`\n\n'
+    '## 三、原生工具历史、98%+ 前缀缓存与满 100K 局部压缩\n'
+    '- 历史严格保持原生 `assistant(tool_calls)` + `role: "tool"` 序列；`< 100K` Tokens 绝不压缩以锁住 98%~99% Prefix KV Cache 命中率；\n'
+    '- 达到阈值（默认 `100K`）后，仅分段局部压缩已告一段落的历史话题并保存 `compact_summary` 与单一工作账本，空闲期通过 `sleep_time_consolidate` 沉淀高价值个人事实入 `context_index.db` 与印象档案。\n'
+)
+
+NOTIFY_OVERLAY_SKILL_MD = (
+    '---\n'
+    'name: notify_and_overlay\n'
+    'description: 分级通知与手机主屏悬浮窗技能：弱通知走系统通知栏，强通知直接在手机物理主屏 Display 0 弹全局悬浮窗，支持所有端 Bot 直接调用\n'
+    '---\n\n'
+    '# 🔔 分级通知与手机主屏全局悬浮窗技能 (`skills/notify_and_overlay.md`)\n\n'
+    'DSB 将「通知推送」与「手机主屏悬浮窗」统一整合在 `reply(op="notify", ...)` 中。**手机端与电脑端（`pc`）Bot 均可直接调用**，无需走 `adb` 或尝试在虚拟屏里找弹窗入口。\n\n'
+    '## 一、强通知 vs 弱通知两档规则\n'
+    '1. **弱通知（通知栏轻提醒）**：\n'
+    '   - 适用：常规进度汇报、不急的定时资讯、静默完成通知。\n'
+    '   - 调用：`reply(op="notify", level="weak", title="标题", body="正文内容", collapse_key="可选折叠键")`\n'
+    '   - 效果：投递到手机系统通知栏（低/正常打扰通道，同 `collapse_key` 自动折叠更新，不打断当前屏幕）。\n'
+    '2. **强通知（手机主屏 `Display 0` 全局悬浮窗）**：\n'
+    '   - 适用：用户明确要求「**发个悬浮窗到手机 / 弹窗提醒 / 强提醒**」，或需立刻拍板/重点知会的重要事项。\n'
+    '   - 调用：`reply(op="notify", level="strong", title="标题", body="正文内容", urgent=True)`（传 `urgent=True` 或 `overlay=True` 亦自动触发强通知）。\n'
+    '   - 效果：在用户亮屏解锁的物理主屏 `Display 0` 直接由 `OverlayController` 弹出毛玻璃全局悬浮窗卡片（展示 Bot 名字、标题、可滚动正文、「打开对话」直达对应聊天窗、「我知道了」与「延后 15 分钟」），并附带高优通知栏兜底。\n\n'
+    '## 二、紧急响铃闹钟 vs 虚拟屏小窗\n'
+    '- **紧急闹钟 (`reply(op="alarm", title="...", reason="...", duration_sec=15)`)**：用于叫醒起床、十万火急大事，拉起手机硬件响铃与持续震动。\n'
+    '- **不要混淆两种悬浮窗**：\n'
+    '  - 强通知悬浮窗（`reply(op="notify", level="strong", ...)`）：推送图文消息卡给主人看。\n'
+    '  - 手机虚拟屏小窗（`FloatingVirtualDisplay`）：展示 `phone` 工具正在操控的后台隔离 `VirtualDisplay` 屏幕画面（支持退到桌面持续悬浮保活，切勿混淆）。\n'
+)
+
+DEVICE_CONTROL_SKILL_MD = (
+    '---\n'
+    'name: device_control\n'
+    'description: 三域设备操控技能：手机后台隔离虚拟屏 phone、Windows 本机 pc 与 24/7 云电脑 cloud 实战准则\n'
+    '---\n\n'
+    '# 📱💻☁️ 三域设备操控技能 (`skills/device_control.md`)\n\n'
+    '## 一、手机隔离虚拟屏 (`phone`)\n'
+    '1. **纯视觉 + 无障碍双通道**：每次交互动作自动附带无遮挡 `0..1000` 坐标尺截图与 `@eN` 节点树。无障碍精确用 `target="@eN"`；微信/小程序/游戏等自绘制页面 (`node_count=0`) 直接对照 `0..1000` 刻度传 `nx, ny`，小字区域用 `op="zoom", box=[nx1,ny1,nx2,ny2]` 局部放大后再点。\n'
+    '2. **主屏六重绝对隔离与小窗三态交互**：\n'
+    '   - `phone` 始终只在隔离 `VirtualDisplay`（`uid=0` Root 或 `uid=2000` 无线调试）中运行：动态匹配 `AttributionSource` 保留 `FLAG_TRUSTED | FLAG_OWN_FOCUS | FLAG_STEAL_TOP_FOCUS_DISABLED`、启动前拦截主屏前台/小窗冲突并静默预迁移后台 `singleTask` 任务、只按叶级 `tid` 迁移且严禁挪动 Launcher/`dev.bubuki.proactive` 共享容器、空屏下垫 `DisplayTestActivity` 且拦截根页 `KEYCODE_BACK`、应用抽屉默认不抢主屏焦点。切换/启动应用或返回桌面均绝不把物理主屏 `Display 0` 退回系统桌面或抢夺焦点。\n'
+    '   - 悬浮小窗三态手势：右下角缩放把手缩至最小 (`<0.38`) 转为可见的**迷你小窗挂起**（`enterMiniSuspend` 收在角落保留实时缩略画面，轻触恢复拉大，绝不从屏幕后台消失）；顶部把手拖至屏幕左右边缘收起为**侧边悬浮球**；仅点击右上角红色 `×` 按钮显式调用 `op="release", destroy=True` 彻底销毁虚拟屏。App 退回桌面后 `RootPhoneService` 持续前后台保活。\n'
+    '3. **防误区**：查状态 (`op="status"`)、查通知 (`op="notifications"`)、查电量/设备信息 (`op="device_info"`)、Shell (`op="shell"`) 不会无故弹出虚拟屏。\n\n'
+    '## 二、Windows 电脑端 (`pc` + `bash`)\n'
+    '- **首选终端**：在电脑端优先使用 `bash` / `pc(op="pc_shell")`（默认 Git Bash），少走冗余路径试探。\n'
+    '- **GUI 视觉键鼠**：使用 `pc(op="cua_desktop")` 查看桌面对照 `0..1000` 标尺执行点击/输入；与用户确认或协作长任务可调用 `pc(op="dispatch_session")`。\n\n'
+    '## 三、共享云电脑 (`cloud`)\n'
+    '- 手机端和电脑端均可直接调用 `cloud` 操作 24/7 在线的 Linux 桌面/Chromium 浏览器，执行网页调研、文件上传与脚本自动化，完成后用 `reply(op="send_image" | "send_file")` 交付。\n'
+)
+
+BLACKBOARD_COLLAB_SKILL_MD = (
+    '---\n'
+    'name: blackboard_collab\n'
+    'description: 跨端事件黑板协同与定时编排技能：blackboard 发帖唤醒、steer 抢占、claim/complete/review 与好奇心合批\n'
+    '---\n\n'
+    '# 📋 跨端事件黑板协作技能 (`skills/blackboard_collab.md`)\n\n'
+    '所有跨端（手机 ↔ 电脑）与同端 Bot 协作统一经由 `blackboard`（`<50ms` 瞬时响应，废除旧版点对点 `send_message`）。\n\n'
+    '## 一、高频动作速查\n'
+    '- **跨端/同端派活与唤醒**：`blackboard(action="post", text="@对方名字 具体任务...", mentions=["@对方名字"])`；若需立刻插话打断对方当前步骤，附加 `steer=True`。\n'
+    '- **只读窥视进度**：`blackboard(action="peek", target="all" | "Bot名字", limit=5)`（不打断对方当前轮）。\n'
+    '- **认领与闭环结项**：被唤醒的 Bot 先 `read` 看上下文，认领 `claim(post_id=...)`，实测完成后调用 `complete(post_id=..., summary=..., artifact_path=...)` 交差；若任务启用了审校门禁 (`review_by`)，须待审校员 `review` 通过后再结束。\n'
+    '- **定时闹钟与合批**：用 `blackboard(action="schedule"|"alarm", ...)` 设定一次性或周期提醒；若巡检类需求与后台好奇心周期高度重合，传 `merge_with_curiosity=True` 避免重复刷屏打扰。\n'
+)
+
+WHALECHAN_ONBOARDING_SKILL_MD = (
+    '---\n'
+    'name: onboarding_guide\n'
+    'description: 零门槛开箱向导与系统配置技能：上下文窗口、主动节奏、无线调试虚拟屏、Windows 端接入与闲置 VPS 部署云电脑\n'
+    '---\n\n'
+    '# 🚀 零门槛开箱向导与系统配置技能 (`skills/onboarding_guide.md`)\n\n'
+    '当用户首次接入 API Key 进入对话，或要求「配置/调整压缩阈值/连电脑/搭云电脑/开无线调试虚拟屏」时，按以下流程用自然对话配合 `admin` 工具一站式办妥：\n\n'
+    '1. **记忆与上下文压缩阈值（`auto_compact_tokens`）**\n'
+    '   - 通过 `admin(op="config", action="set", key="auto_compact_tokens", value=...)` 落盘。推荐 `100000`（满 100K 才对前序已告一段落的话题做局部压缩，日常保持 98%+ 前缀缓存命中），也可设 `64000` / `160000` / `200000`。\n'
+    '2. **主动交互节奏与免打扰**\n'
+    '   - 好奇心间隔 `curiosity_interval_minutes`（推荐 `30` 或 `90` 分钟）与夜间免打扰 `quiet_start_hour` ~ `quiet_end_hour`（推荐 `0` ~ `8` 点）。\n'
+    '3. **手机免 Root 隔离虚拟屏控屏（无线调试 `uid=2000` / Root `uid=0`）**\n'
+    '   - 所有手机自动化均在后台隔离 `VirtualDisplay` 进行；Root 手机直通 `uid=0`，未 Root（安卓 11+）在系统【开发者选项 → 无线调试 → 配对码配对】后直接在通知栏填入 6 位配对码即可启用 `uid=2000` 后台虚拟屏，并用 `phone(op="device_info")` / `admin(op="config", action="status")` 校验。\n'
+    '4. **连接 Windows 电脑端 (`DSB · DeepSeek Bot`)**\n'
+    '   - 调 `admin(op="config", action="status")` 获取接入地址与设备令牌，接入电脑端插件网关即可激活本机 `pc` 与守护中心。\n'
+    '5. **一键搭建 24/7 云电脑 (`cloud`)**\n'
+    '   - 拿到闲置 Linux VPS 的 IP、端口、用户名与密码/私钥后，直接调用 `admin(op="deploy_cloud", ...)` 自动安装云桌面并热挂载，再用 `cloud(op="screenshot")` 回传画面，最后调 `admin(op="config", action="mark_onboarded")` 完成引导。\n'
+)
+
+SKILLS_INDEX_MD = (
+    '---\n'
+    'name: skills_index\n'
+    'description: DSB 按需技能库总目录（日常对话不预载正文，按需 read_file 或 admin(op="skill", action="open") 加载）\n'
+    '---\n\n'
+    '# 🛠️ 按需技能库索引 (Skills Index)\n\n'
+    '> 日常对话不预载技能正文以保持 98%+ Prefix Cache 与最小 Token 开销；需要时调用 `read_file("memory_vault/skills/<name>.md")` 或 `admin(op="skill", action="open", name="<name>")` 按需加载。\n\n'
+    '## 📌 核心内置系统技能\n'
+    '- **[[skills/self_architecture]]** (`memory_vault/skills/self_architecture.md`)：DSB 三域拓扑、分端 Bot 花名册、统一 `context_index.db` 与 100K 局部压缩总纲。\n'
+    '- **[[skills/notify_and_overlay]]** (`memory_vault/skills/notify_and_overlay.md`)：分级通知架构——**弱通知 (`level="weak"`) 走通知栏**，**强通知 (`level="strong"`) 直接弹手机主屏全局悬浮窗**。\n'
+    '- **[[skills/device_control]]** (`memory_vault/skills/device_control.md`)：手机虚拟屏 `phone`（桌面悬浮小窗保活/双通道坐标）、Windows `pc` 与云电脑 `cloud` 操控技能。\n'
+    '- **[[skills/blackboard_collab]]** (`memory_vault/skills/blackboard_collab.md`)：`blackboard` 跨端 `@mention` 唤醒、`steer` 插话、`peek` 与定时合批协作。\n'
+    '- **[[skills/onboarding_guide]]** (`memory_vault/skills/onboarding_guide.md`)：零门槛开箱配置、无线调试配对与闲置 VPS 云电脑部署向导。\n'
+)
