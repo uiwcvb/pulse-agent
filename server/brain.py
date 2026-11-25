@@ -143,6 +143,8 @@ class Brain(
         self._last_scheduled_fire_by_bot: dict[str, float] = {}
         self._last_emergency_alarm_at: float = 0.0
         self._reply_box_by_sig: dict[str, list[dict]] = {}
+        self._active_manual_compact_tasks: dict[str, asyncio.Task] = {}
+        self._max_stop_epoch_by_node_bot: dict[str, int] = {}
 
         # Domain 1 Core Engines
         self.harness.active_bot_getter = lambda: str(self.room_context.get() or self.bot_context.get() or '')
@@ -266,7 +268,7 @@ class Brain(
         from core.sync_engine import summarize_trace_brief
         return summarize_trace_brief(trace_list, limit=limit)
 
-    async def stop_immediately(self, bot_id: str | None = None, reason: str = 'user_stop', commit_partial: bool = True, source: str | None = None) -> dict:
+    async def stop_immediately(self, bot_id: str | None = None, reason: str = 'user_stop', commit_partial: bool = True, source: str | None = None, client_epoch: int | None = None) -> dict:
         """
         0ms Hard Interrupt:
         1. Increment abort epoch and record turn_id in `_stopped_turn_ids`.
@@ -275,6 +277,9 @@ class Brain(
         3. Cancel ONLY the target bot's active/queued tasks (`active_tasks_by_bot[b_id]`), never killing independent peer Bots!
         """
         req_src = normalize_node_source(source or self.source_context.get())
+        if client_epoch is not None and int(client_epoch) > 0 and bot_id:
+            nb_ce = f'{req_src}:{bot_id}'
+            self._max_stop_epoch_by_node_bot[nb_ce] = max(self._max_stop_epoch_by_node_bot.get(nb_ce, 0), int(client_epoch))
         node_keys = (
             list(self.streams_by_node_bot.keys())
             + list(self.executions_by_node_bot.keys())
@@ -724,12 +729,12 @@ class Brain(
             self.store.state['messages_epoch'] = int(self.store.state.get('messages_epoch') or 1) + 1
         return u_msg, removed_ids
 
-    async def enqueue_chat(self, text: str, bot_id: str = 'companion', mode: str = 'auto', client_msg_id: str | None = None, source: str = 'phone') -> dict:
+    async def enqueue_chat(self, text: str, bot_id: str = 'companion', mode: str = 'auto', client_msg_id: str | None = None, source: str = 'phone', client_epoch: int | None = None) -> dict:
         src = normalize_node_source(source)
         nb_enq = f'{src}:{bot_id}'
         enq_lock = self._enqueue_locks.setdefault(nb_enq, asyncio.Lock())
         async with enq_lock:
-            return await self._enqueue_chat_locked(text=text, bot_id=bot_id, mode=mode, client_msg_id=client_msg_id, source=src)
+            return await self._enqueue_chat_locked(text=text, bot_id=bot_id, mode=mode, client_msg_id=client_msg_id, source=src, client_epoch=client_epoch)
 
     def _is_non_user_execution_context(self) -> bool:
         hop_val = max(
@@ -751,9 +756,15 @@ class Brain(
             return str(self.turn_origin_context.get() or '').strip().lower() != 'user_direct'
         return False
 
-    async def _enqueue_chat_locked(self, text: str, bot_id: str = 'companion', mode: str = 'auto', client_msg_id: str | None = None, source: str = 'phone') -> dict:
+    async def _enqueue_chat_locked(self, text: str, bot_id: str = 'companion', mode: str = 'auto', client_msg_id: str | None = None, source: str = 'phone', client_epoch: int | None = None) -> dict:
         src = normalize_node_source(source)
         nb_enq = f'{src}:{bot_id}'
+        if client_epoch is not None and int(client_epoch) > 0 and int(client_epoch) <= self._max_stop_epoch_by_node_bot.get(nb_enq, 0):
+            return {'ok': True, 'queued': False, 'aborted_by_epoch': True, 'client_epoch': int(client_epoch), 'seq': self.stream_seq}
+        if hasattr(self, '_get_cache_keepalive'):
+            await self._get_cache_keepalive().cancel_idle_compaction(src, bot_id)
+        manual_compact_task = self._active_manual_compact_tasks.get(nb_enq)
+        manual_compacting = bool(manual_compact_task is not None and not manual_compact_task.done())
         cur_exec_b = self.executions_by_bot.get(bot_id)
         same_src_exec = bool(
             self.executions_by_node_bot.get(nb_enq)
@@ -780,9 +791,9 @@ class Brain(
                 }
             self._recent_client_msg_ids[client_msg_id] = now_ts
 
-        # User Input is ALWAYS Priority #1 on the SAME node (`src`):
+        # User Input is ALWAYS Priority #1 on the SAME node (`src`), EXCEPT manual compaction queues chat until done:
         TaskContinuityManager.clear_foreground_state(self, bot_id, source=src)
-        if is_bot_busy:
+        if is_bot_busy and not manual_compacting:
             await self.stop_immediately(bot_id=bot_id, reason='user_preempt', source=src)
             for _ in range(60):
                 if not self._get_bot_lock(bot_id, src).locked():
@@ -864,6 +875,11 @@ class Brain(
 
         async def _bg():
             try:
+                if manual_compacting and manual_compact_task is not None:
+                    with contextlib.suppress(Exception):
+                        await manual_compact_task
+                if client_epoch is not None and int(client_epoch) > 0 and int(client_epoch) <= self._max_stop_epoch_by_node_bot.get(nb_enq, 0):
+                    return
                 await self.chat(text, bot_id=bot_id, mode=mode, pre_recorded_user_msg=m, turn_id=turn_id, source=src)
             except asyncio.CancelledError:
                 pass

@@ -66,9 +66,11 @@ class ChatInput(BaseModel):
     mode:Literal['auto','chat','execute']='auto'
     async_ack:bool=False
     client_msg_id:str|None=Field(None,max_length=80)
+    client_epoch:int|None=Field(None,ge=0)
     source:str=Field('phone',max_length=60)
 class StopInput(BaseModel):
     bot_id:str|None=Field(None,max_length=40)
+    client_epoch:int|None=Field(None,ge=0)
     source:str|None=Field(None,max_length=60)
 class VaultInput(BaseModel):
     path:str=Field(min_length=1,max_length=240)
@@ -222,6 +224,7 @@ def create_app(data_dir=None, scheduler=True):
     async def lifespan(app):
         internal_client_holder['client']=httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://local',timeout=httpx.Timeout(600.0,connect=30.0))
         task=asyncio.create_task(brain.scheduler()) if scheduler else None
+        keepalive_task=asyncio.create_task(brain.keepalive_loop()) if (scheduler and hasattr(brain,'keepalive_loop')) else None
         clock_task=asyncio.create_task(brain.clock_wheel.run_forever()) if (scheduler and hasattr(brain,'clock_wheel')) else None
         gc_task=asyncio.create_task(_periodic_storage_gc()) if scheduler else None
         brain.activity=brain.ready_state()
@@ -247,7 +250,7 @@ def create_app(data_dir=None, scheduler=True):
             if hasattr(brain, 'shutdown_background_tasks'):
                 with contextlib.suppress(Exception):
                     await brain.shutdown_background_tasks()
-            for t in (gc_task,clock_task,task):
+            for t in (gc_task,clock_task,keepalive_task,task):
                 if t:
                     t.cancel()
                     with contextlib.suppress(asyncio.CancelledError): await t
@@ -590,15 +593,7 @@ def create_app(data_dir=None, scheduler=True):
                 store.update_config({'auto_compact_tokens':val},source_tag=f'compact_explicit:{src}')
             except Exception:
                 pass
-        src_tok=brain.source_context.set(src)
-        try:
-            res=await brain._auto_compact_if_needed(target_bot,force=True,source=src)
-            if hasattr(brain,'dsh_adapter'):
-                with contextlib.suppress(Exception):
-                    await brain.dsh_adapter.reset_session(target_bot,src)
-        finally:
-            brain.source_context.reset(src_tok)
-            brain._clear_bot_stream(target_bot,source=src)
+        res=await brain.run_manual_compaction(target_bot,source=src)
         stats=brain.memory_engine.get_all_bots_context_stats(source=src)
         await publish({'type':'context_compacted','source':src,'bot_id':target_bot,'result':res,'context_by_bot':stats})
         res_d=res if isinstance(res,dict) else {}
@@ -713,7 +708,7 @@ def create_app(data_dir=None, scheduler=True):
         try: bot=get_assistant(store,bot_id)
         except ValueError as e: raise HTTPException(404,str(e))
         if data.async_ack:
-            return await brain.enqueue_chat(data.text.strip(),bot_id,data.mode,client_msg_id=data.client_msg_id,source=src)
+            return await brain.enqueue_chat(data.text.strip(),bot_id,data.mode,client_msg_id=data.client_msg_id,source=src,client_epoch=data.client_epoch)
         try:
             res=await brain.chat(data.text.strip(),bot_id,data.mode,client_msg_id=data.client_msg_id,source=src)
             tail=_filter_msgs_by_source(store.state['messages'],src)[-10:]
@@ -769,7 +764,7 @@ def create_app(data_dir=None, scheduler=True):
     @app.post('/api/stop',dependencies=[Depends(auth)])
     async def stop_execution(data:StopInput|None=None,source:str|None=None):
         raw_src=(data.source if (data and data.source) else None) or source
-        return await brain.stop_immediately(bot_id=(data.bot_id if data else None),source=(normalize_node_source(raw_src) if raw_src else None))
+        return await brain.stop_immediately(bot_id=(data.bot_id if data else None),source=(normalize_node_source(raw_src) if raw_src else None),client_epoch=(data.client_epoch if data else None))
 
     @app.post('/api/ack',dependencies=[Depends(auth)])
     async def ack(data:AckInput):

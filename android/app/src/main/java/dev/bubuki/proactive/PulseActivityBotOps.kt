@@ -755,21 +755,10 @@ internal fun NativePulseModel.applyContextWindowTokens(tokens: Int, botId: Strin
 internal fun NativePulseModel.compactBotContext(botId: String = ui.botId) {
     if (ui.compactingContext) return
     dismissMenu()
-    val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
-    ui = ui.copy(
-        compactingContext = true,
-        activePanel = null,
-        botId = botId,
-        chatOpen = true,
-        workingBot = botId,
-        streamBotId = botId,
-        streamText = "📦 正在流式压缩上下文，请查看实时进度..."
-    )
-    toast("📦 正在流式压缩上下文，请查看实时进度...")
+    ui = ui.copy(compactingContext = true)
     perform {
         try {
-            val payload = JSONObject()
-                .put("bot_id", botId)
+            val payload = JSONObject().put("bot_id", botId)
             val res = request("POST", "/api/context/compact", payload)
             val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(res.optJSONObject("context_by_bot"))
             if (ctxTokensMap.isNotEmpty()) {
@@ -780,15 +769,8 @@ internal fun NativePulseModel.compactBotContext(botId: String = ui.botId) {
             val compacted = res.optBoolean("compacted", false) ||
                 res.optJSONObject("result")?.optBoolean("compacted", false) == true ||
                 (res.optJSONObject("result")?.optInt("compacted_messages", 0) ?: 0) > 0
-            val archivedCount = res.optInt(
-                "archived_count",
-                res.optJSONObject("result")?.optInt(
-                    "archived_count",
-                    res.optJSONObject("result")?.optInt("compacted_messages", 0) ?: 0
-                ) ?: 0
-            )
             if (alreadyCompacted) {
-                toast("当前上下文已是最新压缩状态，无需重复压缩")
+                toast("当前上下文已是最新压缩状态")
             } else if (compacted) {
                 val msgResp = request("GET", "/api/messages", null, JSONObject().put("limit", 120))
                 val freshMsgs = msgResp.optJSONArray("messages")?.objects()?.mapNotNull {
@@ -796,17 +778,12 @@ internal fun NativePulseModel.compactBotContext(botId: String = ui.botId) {
                 }.orEmpty()
                 mergeRemoteMessages(freshMsgs, fullReplace = true)
                 ui = ui.copy(messages = combinedMessages())
-                toast("✅ 上下文压缩完成 (归档 $archivedCount 条消息)")
+                toast("上下文已静默整理完成")
             } else {
-                toast(res.optString("message").ifBlank { "当前对话条数较少，暂无需压缩" })
+                toast(res.optString("message").ifBlank { "当前对话较少，暂无需压缩" })
             }
         } finally {
-            ui = ui.copy(
-                compactingContext = false,
-                workingBot = if (ui.workingBot == botId) null else ui.workingBot,
-                streamBotId = if (ui.streamBotId == botId && ui.streamText.startsWith("📦")) null else ui.streamBotId,
-                streamText = if (ui.streamBotId == botId && ui.streamText.startsWith("📦")) "" else ui.streamText
-            )
+            ui = ui.copy(compactingContext = false)
         }
     }
 }

@@ -72,7 +72,6 @@ function nodeHttpJsonPost(urlStr, headers, bodyStr, signal) {
 const READ_ONLY_SAFE_TOOLS = new Set([
   'read_file',
   'search_files',
-  'web',
   'subtask',
 ]);
 
@@ -103,58 +102,53 @@ export const DEFAULT_TOOL_SCHEMAS = [
   },
   {
     name: 'bash',
-    description: '沙箱命令行（最长 300s）、后台任务（支持 bg_wait）与 0-Token 定时哨兵；target="pc_windows" 指向 Windows 电脑',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, command: { type: 'string' }, timeout: { type: 'integer' }, cwd: { type: 'string' }, target: { type: 'string' }, task_id: { type: 'string' } }, additionalProperties: true },
-  },
-  {
-    name: 'web',
-    description: '联网搜索 (search)、抓取网页正文 (fetch) 或发起结构化 HTTP/JSON 请求 (request)',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, url: { type: 'string' }, method: { type: 'string' }, headers: { type: 'object' }, body: { type: 'string' }, json_body: { type: 'object' }, limit: { type: 'integer' }, max_chars: { type: 'integer' } }, additionalProperties: true },
+    description: 'VPS 本地 Linux 沙箱命令行（算日期/周次/Python脚本/后台任务/0-Token哨兵，最长 300s）；Windows 请用 pc，公网请用 cloud',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, command: { type: 'string' }, timeout: { type: 'integer' }, cwd: { type: 'string' }, task_id: { type: 'string' } }, additionalProperties: true },
   },
   {
     name: 'memory',
-    description: '长期记忆与置顶规则 (op="search"|"conversation"|"ctx"|"pin"|"unpin"|"list_pins")',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, ctx_id: { type: 'string' }, text: { type: 'string' }, pin_id: { type: 'string' } }, additionalProperties: true },
+    description: '日常长期记忆与跨压缩检索 (op="search"|"conversation"|"query_facts"|"upsert_fact"|"delete_fact"|"pin"|"unpin"|"list_pins")',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, ctx_id: { type: 'string' }, entity: { type: 'string' }, attr: { type: 'string' }, value: { type: 'string' }, text: { type: 'string' }, pin_id: { type: 'string' } }, additionalProperties: true },
   },
   {
     name: 'blackboard',
-    description: '多 Bot 共享黑板与事件监听协作（跨端 @同事、任务认领/验收、KV/待办共享与 watch 条件触发）',
-    parameters: { type: 'object', properties: { action: { type: 'string' }, text: { type: 'string' }, title: { type: 'string' }, post_id: { type: 'string' }, mentions: { type: 'array', items: { type: 'string' } }, watch: { type: 'string' }, trigger_value: { type: 'string' }, overwrite: { type: 'boolean' } }, additionalProperties: true },
+    description: '多 Bot 共享黑板协作（高阶协作见 memory_vault/skills/blackboard_collab.md；定时请用 schedule）',
+    parameters: { type: 'object', properties: { action: { type: 'string' }, text: { type: 'string' }, title: { type: 'string' }, post_id: { type: 'string' }, mentions: { type: 'array', items: { type: 'string' } }, key: { type: 'string' }, value: { type: 'string' }, params: { type: 'object' } }, additionalProperties: true },
   },
   {
     name: 'schedule',
-    description: '定时提醒、闹钟与周期例程管理 (op="schedule"|"alarm"|"cancel"|"list"|"add_routine"|"update_routine"|"remove_routine"|"list_routines")',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, task_id: { type: 'string' }, post_id: { type: 'string' }, title: { type: 'string' }, text: { type: 'string' }, when: { type: 'string' }, run_at: { type: 'string' }, delay_minutes: { type: 'integer' }, daily_time: { type: 'string' }, cron_expr: { type: 'string' }, overwrite: { type: 'boolean' } }, required: ['op'], additionalProperties: true },
+    description: '唯一周期/定时提醒与闹钟管理 (op="schedule"|"alarm"|"cancel"|"list"|"add_routine"|"update_routine"|"remove_routine"|"list_routines")',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, task_id: { type: 'string' }, title: { type: 'string' }, text: { type: 'string' }, when: { type: 'string' }, daily_time: { type: 'string' }, weekdays: { type: 'string' }, cron_expr: { type: 'string' }, overwrite: { type: 'boolean' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'phone',
-    description: '手机隔离虚拟屏 VirtualDisplay、通知读取与验证码读取 (op="screenshot"|"tap"|"long_press"|"swipe"|"type"|"key"|"back"|"home"|"enter"|"recents"|"keyevent"|"app"|"notifications"|"read_otp"|"ime_policy"|"status"|"zoom"|"send_screenshot")；纯视觉 0..1000 归一化坐标 (nx, ny) 与区域框 box=[nx1,ny1,nx2,ny2]',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, action: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, text: { type: 'string' }, target: { type: 'string' }, app: { type: 'string' }, direction: { type: 'string' }, command: { type: 'string' }, keycode: { type: 'string' }, source: { type: 'string' }, destroy: { type: 'boolean' }, keep_alive: { type: 'boolean' } }, required: ['op'], additionalProperties: true },
+    description: '手机隔离虚拟屏 VirtualDisplay、通知与验证码读取（@eN 优先，自绘页用 0..1000 nx,ny 与 zoom；过滤用 query）',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, text: { type: 'string' }, target: { type: 'string' }, query: { type: 'string' }, app: { type: 'string' }, direction: { type: 'string' }, command: { type: 'string' }, destroy: { type: 'boolean' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'pc',
-    description: 'Windows 电脑端 DSH 协同（桌面状态、0..1000 坐标 CUA 键鼠截图、本机 Shell 与 Session 派单）',
+    description: '唯一 Windows 本机入口（pc_shell、扁平 0..1000 桌面键鼠截图与 DSH 会话协同）',
     parameters: { type: 'object', properties: { op: { type: 'string' }, command: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, text: { type: 'string' }, target: { type: 'string' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'cloud',
-    description: '24/7 共享 Linux 云电脑（桌面、浏览器 CDP、Shell、eval_js、zoom 局部放大、send_screenshot、文件传输 push/pull）；bash/eval_js 默认精简无截图输出（传 screenshot=true 附带截图）；统一 0..1000 坐标 (nx, ny) 与 box=[nx1,ny1,nx2,ny2]',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, ref: { type: 'string' }, command: { type: 'string' }, script: { type: 'string' }, url: { type: 'string' }, text: { type: 'string' }, direction: { type: 'string' }, full_page: { type: 'boolean' }, lean: { type: 'boolean' }, screenshot: { type: 'boolean' }, include_frame: { type: 'boolean' }, src: { type: 'string' }, dst: { type: 'string' }, path: { type: 'string' }, name: { type: 'string' } }, required: ['op'], additionalProperties: true },
+    description: '24/7 云电脑与唯一公网搜索/抓网页入口（search/navigate 默认无图 CDP 快读且用完自动释放浏览器；需画面传 screenshot=true）',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, url: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, ref: { type: 'string' }, command: { type: 'string' }, script: { type: 'string' }, text: { type: 'string' }, direction: { type: 'string' }, screenshot: { type: 'boolean' }, keep_open: { type: 'boolean' }, path: { type: 'string' }, name: { type: 'string' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'reply',
-    description: '交互控制与分级通知 (op="notify"|"alarm"|"send_image"|"send_file"|"sticker"|"choices"|"silent"|"dnd"|"complete_goal")；需提供快捷按钮时调用 op="choices" 传入 2~3 个用户第一人称点击短句，并在本轮输出完整正文',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, name: { type: 'string' }, code: { type: 'string' }, caption: { type: 'string' }, crop_box: { type: 'array', items: { type: 'integer' } }, max_side: { type: 'integer' }, choices: { type: 'array', items: { type: 'string' } }, title: { type: 'string' }, body: { type: 'string' }, level: { type: 'string' }, urgent: { type: 'boolean' }, overlay: { type: 'boolean' }, summary: { type: 'string' } }, required: ['op'], additionalProperties: true },
+    description: '交互控制与分级通知 (op="notify"|"alarm"|"send_image"|"send_file"|"sticker"|"choices"|"silent"|"dnd"|"complete_goal")；alarm 仅立刻响',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, name: { type: 'string' }, code: { type: 'string' }, caption: { type: 'string' }, crop_box: { type: 'array', items: { type: 'integer' } }, choices: { type: 'array', items: { type: 'string' } }, title: { type: 'string' }, body: { type: 'string' }, level: { type: 'string' }, urgent: { type: 'boolean' }, overlay: { type: 'boolean' }, summary: { type: 'string' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'subtask',
-    description: '在独立隔离上下文运行聚焦子任务（查源码/长日志/网页核对）并折叠返回精简结论',
-    parameters: { type: 'object', properties: { goal: { type: 'string' }, mode: { type: 'string' }, context_paths: { type: 'array', items: { type: 'string' } }, max_steps: { type: 'integer' } }, required: ['goal'], additionalProperties: true },
+    description: '瞬发异步子任务（research 预设走 cloud 无图快读自动释放浏览器；支持 spawn/status/list/cancel/resume/steer）',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, task_id: { type: 'string' }, title: { type: 'string' }, goal: { type: 'string' }, preset: { type: 'string' }, tools: { type: 'array', items: { type: 'string' } }, context_paths: { type: 'array', items: { type: 'string' } }, max_steps: { type: 'integer' }, wait: { type: 'boolean' }, use_main_model: { type: 'boolean' } }, additionalProperties: true },
   },
   {
     name: 'admin',
-    description: '系统运维、配置、Bot管理、Skill/插件、模型列表与云电脑部署 (op="status"|"doctor"|"context"|"config"|"bot"|"skill"|"custom_tool"|"models"|"deploy_cloud")',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, action: { type: 'string' }, key: { type: 'string' }, value: { type: 'string' } }, required: ['op'], additionalProperties: true },
+    description: '系统运维与记忆库整理（非主人要求勿调，调前必读 memory_vault/skills/tool_admin.md）',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, action: { type: 'string' }, params: { type: 'object' } }, required: ['op'], additionalProperties: true },
   },
 ];
 

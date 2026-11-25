@@ -43,7 +43,7 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
     val haptics = LocalHapticFeedback.current
     val chatReduceMotion = rememberReducedMotion()
     val otherUnreadCount = remember(s.unread, s.messages, bot.id) {
-        s.messages.count { it.botId != bot.id && it.id in s.unread }
+        s.messages.count { it.botId != bot.id && it.kind != "compact_summary" && it.id in s.unread }
     }
     var chatScrolled by remember(bot.id) { mutableStateOf(false) }
     val phoneSt by RootPhoneHarness.changes.collectAsState()
@@ -132,75 +132,45 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                         }
                     }
 
-                    // Center: Bot Avatar + Name + 3-Bot Switcher Dots + Live Status / Token Cache Subtitle
-                    val effectiveModel = bot.model.ifBlank { s.defaultModel.ifBlank { "默认模型" } }
+                    // Center: Compact Apple-HIG Bot Avatar + Name + Minimal Live Status (Telemetry moved to Bot Secondary Page)
                     val isLiveHere = s.streamBotId == bot.id || s.workingBot == bot.id || s.busyBot == bot.id
                     Row(
                         Modifier.padding(start = 2.dp)
                             .weight(1f)
-                            .clip(RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(14.dp))
                             .iosPressScale(0.97f) {
                                 focus.clearFocus()
                                 model.openBotEditor(bot.id)
                             }
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                            .padding(horizontal = 6.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        PulseAvatar(bot, s, diameter = 38.dp, showStatusDot = true, ringColor = c.surface)
-                        Column(Modifier.padding(start = 10.dp).weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    bot.name,
-                                    modifier = Modifier.weight(1f, fill = false),
-                                    color = c.ink,
-                                    fontSize = 16.5.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    letterSpacing = (-0.2).sp
-                                )
-                                if (s.primary == bot.id) {
-                                    Text(
-                                        "主控",
-                                        Modifier.padding(start = 6.dp)
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .background(c.accent.copy(alpha = 0.14f))
-                                            .padding(horizontal = 5.dp, vertical = 1.dp),
-                                        color = c.accent,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                            }
-                            val (hdrCurTok, _, _) = remember(
-                                s.contextTokensByBot,
-                                s.contextMsgsByBot,
-                                s.autoCompactTokens,
-                                s.messages,
-                                bot.id
-                            ) {
-                                model.contextStatsFor(bot.id)
-                            }
-                            val (hdrCachedTok, hdrCachePct) = remember(s.contextCachedByBot, hdrCurTok, bot.id) {
-                                model.contextCacheFor(bot.id, precomputedCurTok = hdrCurTok)
-                            }
-                            val ctxBadge = if (hdrCurTok > 0) {
-                                if (hdrCachedTok > 0) " · ${model.formatTokenCount(hdrCurTok)} ($hdrCachePct%)"
-                                else " · ${model.formatTokenCount(hdrCurTok)}"
-                            } else ""
+                        PulseAvatar(bot, s, diameter = 34.dp, showStatusDot = true, ringColor = c.surface)
+                        Column(Modifier.padding(start = 9.dp).weight(1f)) {
                             Text(
-                                if (isLiveHere) {
-                                    (s.streamTool.takeIf { it.isNotBlank() }?.let { "正在${humanizeToolName(it, null)}…" }
-                                        ?: "${s.streamSpeakerName.ifBlank { bot.name }} 正在输入…") + ctxBadge
-                                } else {
-                                    effectiveModel + ctxBadge
-                                },
-                                color = if (isLiveHere) c.accent else c.muted,
-                                fontSize = 11.5.sp,
+                                bot.name,
+                                color = c.ink,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                style = TextStyle(fontFeatureSettings = "tnum")
+                                letterSpacing = (-0.2).sp
                             )
+                            val liveHint = when {
+                                isLiveHere -> s.streamTool.takeIf { it.isNotBlank() }?.let { "正在${humanizeToolName(it, null)}…" }
+                                    ?: "正在思考…"
+                                !s.online -> "离线"
+                                else -> ""
+                            }
+                            if (liveHint.isNotEmpty()) {
+                                Text(
+                                    liveHint,
+                                    color = if (isLiveHere) c.accent else c.muted,
+                                    fontSize = 11.5.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
 
@@ -261,17 +231,17 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                 }
 
                 val hdrDivAlpha by animateFloatAsState(
-                    targetValue = if (chatScrolled || s.pinnedMemories.isNotEmpty()) 0.65f else 0f,
+                    targetValue = if (chatScrolled) 0.55f else 0f,
                     animationSpec = if (chatReduceMotion) snap() else tween(160),
                     label = "chat_hdr_div"
                 )
                 HorizontalDivider(color = c.line.copy(alpha = hdrDivAlpha), thickness = 0.5.dp)
 
-                // 2. Telegram-Style Pinned Memory Bar (`📌 置顶记忆`)
+                // Pinned memories moved into Bot Secondary Page (`NativeBotEditorPanel`) to keep chat pristine.
                 AnimatedVisibility(
-                    visible = s.pinnedMemories.isNotEmpty(),
-                    enter = if (chatReduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
-                    exit = if (chatReduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
+                    visible = false,
+                    enter = fadeIn(tween(110)),
+                    exit = fadeOut(tween(90))
                 ) {
                     var pinsExpanded by remember { mutableStateOf(false) }
                     val latestPin = s.pinnedMemories.lastOrNull()?.optString("text").orEmpty()

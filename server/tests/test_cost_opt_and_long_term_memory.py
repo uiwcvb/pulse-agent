@@ -204,6 +204,151 @@ def test_cache_keepalive_bounded_pings_and_9m_idle_sleep():
     assert len(pings) == 1 and len(compacts) == 1
 
 
+def test_cache_keepalive_session_not_warm_and_restart_hydration():
+    mgr = CacheKeepaliveManager()
+    pings: list[tuple[str, str]] = []
+    compacts: list[tuple[str, str]] = []
+    resets: list[tuple[str, str]] = []
+
+    class _ColdDsh:
+        async def keepalive_session(self, bid, src):
+            pings.append((src, bid))
+            return {'ok': True, 'skipped': True, 'reason': 'session_not_warm'}
+
+        async def reset_session(self, bid, src):
+            resets.append((src, bid))
+
+    t0 = 50_000.0
+
+    class _ColdBrain:
+        def __init__(self):
+            self.store = SimpleNamespace(
+                config=Config(
+                    cache_keepalive_enabled=True,
+                    cache_keepalive_interval_sec=260,
+                    cache_keepalive_max_pings=2,
+                    idle_compact_minutes=9,
+                    auto_compact_tokens=100_000,
+                ),
+                state={
+                    'messages': [
+                        {'role': 'user', 'bot_id': 'companion', 'source': 'phone', 'text': 'hi', 'created_at': t0 - 30},
+                        {'role': 'assistant', 'bot_id': 'companion', 'source': 'phone', 'text': 'hello', 'created_at': t0},
+                    ],
+                },
+            )
+            self.last_prompt_tokens = {'phone:companion': 92_000}
+            self.last_cached_tokens = {'phone:companion': 70_000}
+            self.dsh_adapter = _ColdDsh()
+            self.active_tasks_by_node_bot = {}
+            self.executions_by_node_bot = {}
+
+        def is_node_bot_busy(self, bid, src):
+            return False
+
+        async def _auto_compact_if_needed(self, bid, force=False, source='phone'):
+            compacts.append((source, bid))
+            return {'compacted': True, 'after_tokens': 11_000}
+
+    brain = _ColdBrain()
+    # 1. After restart (_sessions empty), tick() hydrates phone:companion from state + last_prompt_tokens!
+    a1 = asyncio.run(mgr.tick(brain, now_ts=t0 + 265))
+    assert a1 and a1[0]['action'] == 'keepalive_ping'
+    assert len(pings) == 1
+    # 2. session_not_warm caps further pings, but MUST NOT set idle_slept=True!
+    st = mgr.get_state('phone', 'companion')
+    assert st is not None and st['idle_slept'] is False
+    assert asyncio.run(mgr.tick(brain, now_ts=t0 + 470)) == []
+    assert len(pings) == 1
+    # 3. At 9m+5s, idle_hot_compact MUST still fire!
+    a2 = asyncio.run(mgr.tick(brain, now_ts=t0 + 545))
+    assert a2 and a2[0]['action'] == 'idle_hot_compact'
+    assert len(compacts) == 1 and len(resets) == 1
+    assert brain.last_prompt_tokens['phone:companion'] == 11_000
+
+
+def test_v4046_compact_ts_idle_cancel_14tools_and_cloud_auto_release():
+    from core.cloud_desktop_controller import CloudDesktopControllerMixin
+    from core.subtask_runner import SUBTASK_PRESETS
+    from core.tool_schemas import CANONICAL_TOOL_NAMES, normalize_tool_name
+    from vault_manager import fmt_compact_ts
+
+    # 1. Ultra-compact lossless timestamp (year+month+day+weekday+time)
+    assert fmt_compact_ts('2026-11-25T22:35:00+08:00', include_time=True) == '26-11-25三22:35'
+    assert fmt_compact_ts('2026-11-25T22:35:00+08:00', include_time=False) == '26-11-25三'
+
+    # 2. 14 canonical tools, web retired -> cloud, subtask research -> cloud
+    assert len(CANONICAL_TOOL_NAMES) == 14
+    assert 'web' not in CANONICAL_TOOL_NAMES
+    assert normalize_tool_name('web') == 'cloud'
+    assert normalize_tool_name('web_search') == 'cloud'
+    assert 'cloud' in SUBTASK_PRESETS['research'][0]
+    assert 'web' not in SUBTASK_PRESETS['research'][0]
+
+    # 3. Idle compaction cancels immediately on incoming user turn (zero commit, zero reset, stays active)
+    async def _run_cancel():
+        mgr = CacheKeepaliveManager()
+        started = asyncio.Event()
+        resets = []
+
+        class _SlowBrain:
+            def __init__(self):
+                self.store = SimpleNamespace(
+                    config=Config(cache_keepalive_enabled=True, idle_compact_minutes=9, auto_compact_tokens=100_000),
+                    state={},
+                )
+                self.last_prompt_tokens = {'phone:companion': 88_000}
+                self.last_cached_tokens = {}
+                self.dsh_adapter = SimpleNamespace(reset_session=lambda b, s: resets.append((b, s)))
+                self.active_tasks_by_node_bot = {}
+                self.executions_by_node_bot = {}
+
+            def is_node_bot_busy(self, bid, src):
+                return False
+
+            async def _auto_compact_if_needed(self, bid, force=False, source='phone', silent=True, cancel_check=None):
+                started.set()
+                await asyncio.sleep(5.0)
+                return {'compacted': True}
+
+        b = _SlowBrain()
+        mgr.touch('phone', 'companion', now_ts=1000.0)
+        tick_task = asyncio.create_task(mgr.tick(b, now_ts=1600.0))
+        await started.wait()
+        cancelled = await mgr.cancel_idle_compaction('phone', 'companion')
+        assert cancelled is True
+        actions = await tick_task
+        assert actions and actions[0]['action'] == 'idle_compact_cancelled'
+        assert resets == []
+        assert mgr.get_state('phone', 'companion')['idle_slept'] is False
+
+    asyncio.run(_run_cancel())
+
+    # 4. Cloud search/navigate default fast-text CDP read + auto browser release when browser was closed
+    calls: list[tuple[str, str, dict | None]] = []
+
+    class _FakeClient:
+        async def status(self, force=False):
+            return {'windows': [], 'url': ''}
+
+        async def call(self, method, path, body=None):
+            calls.append((method, path, body))
+            if path == '/search':
+                return {'ok': True, 'title': 'Search', 'url': 'https://example.com', 'page_text': 'x' * 120, 'links': [{'t': 'a', 'u': 'https://example.com'}]}
+            return {'ok': True}
+
+    class _DummyCloud(CloudDesktopControllerMixin):
+        def __init__(self):
+            self.computer = SimpleNamespace(client=_FakeClient())
+            self.harness = SimpleNamespace(root=Path('.'))
+
+    res = asyncio.run(_DummyCloud()._tool_cloud_desktop({'op': 'search', 'query': 'hello'}))
+    assert res['ok'] is True
+    assert res['mode'] == 'fast_text_cdp'
+    assert res['browser_released'] is True
+    assert any(p == '/input' and (b or {}).get('kind') == 'close_window' for _, p, b in calls)
+
+
 def test_subtask_presets_custom_tools_and_worker_model_routing(tmp_path: Path):
     import contextvars
     captured: list[dict] = []
@@ -607,3 +752,93 @@ def test_memory_vector_space_projection_probe_and_sleep_consolidate_sync(tmp_pat
     tables.close()
     cs.close()
     store.close()
+
+
+def test_v4046_prompt_time_anchor_and_silent_manual_compaction(tmp_path):
+    """Verify v4.0.46 user message compact timestamp anchor, silent compaction, and run_manual_compaction."""
+    import inspect
+    from contextvars import ContextVar
+    from core.brain_prompt_mixin import BrainPromptMixin
+    from vault_manager import fmt_compact_ts
+
+    sig = inspect.signature(BrainPromptMixin._auto_compact_if_needed)
+    assert 'cancel_check' in sig.parameters
+    assert sig.parameters['silent'].default is True
+
+    published = []
+    cancelled_idle = []
+    reset_calls = []
+
+    class _FakeKeepalive:
+        async def cancel_idle_compaction(self, src, bid):
+            cancelled_idle.append((src, bid))
+        def mark_compacted(self, src, bid):
+            pass
+
+    class _FakeDsh:
+        async def reset_session(self, bid, src):
+            reset_calls.append((bid, src))
+
+    class _FakeMemEngine:
+        async def auto_compact_if_needed(self, **kwargs):
+            assert kwargs.get('on_stream') is None, 'silent compaction must NOT emit streaming bubble'
+            assert kwargs.get('force') is True
+            return {
+                'compacted': True,
+                'already_compacted': False,
+                'after_tokens': 1234,
+                'marker': {'id': 'm-compact', 'role': 'assistant', 'kind': 'compact_summary', 'text': 'hidden'},
+            }
+        def build_static_pinned_block(self):
+            return ''
+        def get_all_bots_context_stats(self, source='phone'):
+            return {'companion': {'current_tokens': 1234}}
+
+    class _DummyBrain(BrainPromptMixin):
+        def __init__(self):
+            self.source_context = ContextVar('src', default='phone')
+            self.bot_context = ContextVar('bot', default='companion')
+            self._active_manual_compact_tasks = {}
+            self._bot_locks = {}
+            self.last_prompt_tokens = {'phone:companion': 88000}
+            self.last_cached_tokens = {'phone:companion': 80000}
+            self.streams_by_node_bot = {}
+            self.streams_by_bot = {}
+            self.stream_seq = 0
+            self.store = SimpleNamespace(
+                state={'assistants': [], 'last_prompt_tokens': {}, 'last_cached_tokens': {}},
+                save=lambda: None,
+            )
+            self.harness = SimpleNamespace(system_instructions=lambda _c: 'sys')
+            self.llm = SimpleNamespace()
+            self.memory_engine = _FakeMemEngine()
+            self.dsh_adapter = _FakeDsh()
+            self._ka = _FakeKeepalive()
+
+        def context(self):
+            return ''
+
+        def _get_cache_keepalive(self):
+            return self._ka
+
+        def _get_bot_lock(self, bid, src):
+            k = f'{src}:{bid}'
+            if k not in self._bot_locks:
+                self._bot_locks[k] = asyncio.Lock()
+            return self._bot_locks[k]
+
+        async def publish(self, ev):
+            published.append(ev)
+
+    b = _DummyBrain()
+    res = asyncio.run(b.run_manual_compaction('companion', source='phone'))
+    assert res and res['compacted'] is True
+    assert cancelled_idle == [('phone', 'companion')]
+    assert reset_calls == [('companion', 'phone')]
+    assert published and all(e['type'] == 'context_compacted' for e in published)
+    assert not any(e['type'] == 'message' for e in published)
+    assert 'phone:companion' not in b._active_manual_compact_tasks
+
+    # Verify compact timestamp format used in user message prefix
+    ts_str = fmt_compact_ts('2026-11-25T22:35:00+08:00', include_time=True)
+    assert ts_str == '26-11-25三22:35'

@@ -69,6 +69,8 @@ class BrainTurnOpsMixin:
         """
         src = normalize_node_source(src)
         nb_enq = f'{src}:{bot_id}'
+        if hasattr(self, '_get_cache_keepalive'):
+            await self._get_cache_keepalive().cancel_idle_compaction(src, bot_id)
         bot = get_assistant(self.store, bot_id)
         text = str(user_msg.get('text') or '').strip()
         turn_id = 'turn-' + secrets.token_hex(6)

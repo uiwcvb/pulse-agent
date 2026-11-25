@@ -78,48 +78,48 @@ internal data class PulsePalette(
 internal val LocalPulsePalette = compositionLocalOf { pulsePalette(true) }
 
 internal fun pulsePalette(dark: Boolean) = if (dark) PulsePalette(
-    bg = Color(0xFF000000),
-    chatBg = Color(0xFF000000),
-    surface = Color(0xFF141416),
-    elevated = Color(0xFF1C1C1E),
-    pinnedRowBg = Color(0xFF121316),
-    aiBubble = Color(0xFF1C1C1E),
-    fill = Color(0xFF242426),
-    line = Color(0x26FFFFFF),
-    ink = Color(0xFFFFFFFF),
-    muted = Color(0xFF98989F),
-    faint = Color(0xFF636366),
-    accent = Color(0xFF0A84FF),
+    bg = Color(0xFF0A0A0C),
+    chatBg = Color(0xFF0A0A0C),
+    surface = Color(0xFF141418),
+    elevated = Color(0xFF1C1C21),
+    pinnedRowBg = Color(0xFF141418),
+    aiBubble = Color(0xFF1A1A20),
+    fill = Color(0xFF23232A),
+    line = Color(0x1EFFFFFF),
+    ink = Color(0xFFF5F5F7),
+    muted = Color(0xFF8E8E99),
+    faint = Color(0xFF5D5D66),
+    accent = Color(0xFFF4F4F6),
     green = Color(0xFF30D158),
     amber = Color(0xFFFF9F0A),
     warn = Color(0xFFFF453A),
-    userBubble = Color(0xFF0A84FF),
-    userInk = Color(0xFFFFFFFF),
-    userMeta = Color(0xCCFFFFFF),
-    codeBg = Color(0xFF111216),
-    codeHeader = Color(0xFF181A20),
+    userBubble = Color(0xFFF4F4F6),
+    userInk = Color(0xFF111114),
+    userMeta = Color(0x99111114),
+    codeBg = Color(0xFF111116),
+    codeHeader = Color(0xFF1A1A21),
     isDark = true
 ) else PulsePalette(
     bg = Color(0xFFF5F5F7),
-    chatBg = Color(0xFFF3F4F8),
+    chatBg = Color(0xFFF5F5F7),
     surface = Color(0xFFFFFFFF),
-    elevated = Color(0xFFF2F2F7),
+    elevated = Color(0xFFEFEFF3),
     pinnedRowBg = Color(0xFFF5F5F7),
     aiBubble = Color(0xFFFFFFFF),
     fill = Color(0xFFEAEAEF),
-    line = Color(0x1A000000),
-    ink = Color(0xFF000000),
-    muted = Color(0xFF6C6C70),
-    faint = Color(0xFF8E8E93),
-    accent = Color(0xFF007AFF),
+    line = Color(0x14000000),
+    ink = Color(0xFF141417),
+    muted = Color(0xFF6C6C75),
+    faint = Color(0xFF9A9AA3),
+    accent = Color(0xFF18181B),
     green = Color(0xFF34C759),
     amber = Color(0xFFFF9500),
     warn = Color(0xFFFF3B30),
-    userBubble = Color(0xFF007AFF),
+    userBubble = Color(0xFF18181B),
     userInk = Color(0xFFFFFFFF),
-    userMeta = Color(0xCCFFFFFF),
-    codeBg = Color(0xFFF5F6F8),
-    codeHeader = Color(0xFFECEEF2),
+    userMeta = Color(0xBBFFFFFF),
+    codeBg = Color(0xFFF2F2F6),
+    codeHeader = Color(0xFFE8E8EE),
     isDark = false
 )
 
@@ -269,8 +269,8 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot, isSelected: Bo
     val rowScope = rememberCoroutineScope()
     val reduceMotion = rememberReducedMotion()
 
-    val latest = s.messages.lastOrNull { it.botId == bot.id }
-    val unread = s.messages.count { it.botId == bot.id && it.id in s.unread }
+    val latest = s.messages.lastOrNull { it.botId == bot.id && it.kind != "compact_summary" }
+    val unread = s.messages.count { it.botId == bot.id && it.kind != "compact_summary" && it.id in s.unread }
     val isStreamingHere = s.streamBotId == bot.id
     val isWorkingHere = isStreamingHere || s.workingBot == bot.id || s.busyBot == bot.id
     val unsentDraft = model.draftOf(bot.id).trim()

@@ -1,15 +1,15 @@
 {
-  "version": "4.0.45",
-  "version_name": "4.0.45",
-  "versionName": "4.0.45",
-  "tag_name": "v4.0.45",
-  "version_code": 133,
-  "versionCode": 133,
-  "build": 133,
-  "published_at": "2026-11-25T20:48:38.523174+08:00",
-  "apk_size": 33423866,
-  "sha256": "256dae78df06e2ea3e74d046648d29d5589c27642ab572ff7992037ae5260e71",
+  "version": "4.0.46",
+  "version_name": "4.0.46",
+  "versionName": "4.0.46",
+  "tag_name": "v4.0.46",
+  "version_code": 134,
+  "versionCode": 134,
+  "build": 134,
+  "published_at": "2026-11-25T23:41:11.454802+08:00",
+  "apk_size": 33441922,
+  "sha256": "82d0c8fa460af912ef7d37bf0af6279a6bfd18d75b56cc90486831fff53de0d4",
   "download_url": "/proactive-agent/download/proactive-agent.apk",
-  "notes": "v4.0.45 (Build 133): 1) 彻底修复虚拟屏操控导致主屏老是跳回桌面/主页面的根因：虚拟屏 back 键改为优先走仅作用于虚拟屏窗口的无障碍节点级返回（零穿透 Display 0），彻底禁用易漏屏的 shell input keyevent 4 兜底与 HOME/APP_SWITCH 偷转 BACK，并加入主屏前台自检秒恢复与 ROM 穿透自动熔断；2) 修复 DisplayTaskContainment.isTaskVisible 在 Android 14/15 反射失效与 Launcher 误设基线问题，防止 launch 搬走主屏前台应用；3) 内置 v4.0.43–44 全量向量记忆空间、Token 计数校准与主动关心反幻觉。",
-  "body": "v4.0.45 (Build 133): 1) 彻底修复虚拟屏操控导致主屏老是跳回桌面/主页面的根因：虚拟屏 back 键改为优先走仅作用于虚拟屏窗口的无障碍节点级返回（零穿透 Display 0），彻底禁用易漏屏的 shell input keyevent 4 兜底与 HOME/APP_SWITCH 偷转 BACK，并加入主屏前台自检秒恢复与 ROM 穿透自动熔断；2) 修复 DisplayTaskContainment.isTaskVisible 在 Android 14/15 反射失效与 Launcher 误设基线问题，防止 launch 搬走主屏前台应用；3) 内置 v4.0.43–44 全量向量记忆空间、Token 计数校准与主动关心反幻觉。"
+  "notes": "v4.0.46 (Build 134): 1) 全新黑白极简 Apple HIG + 流体空间动效：首页升级为居中大尺寸活体头像舞台（保留形状/颜色/自然眨眼与视线跟随，支持横向拖拽视差切 Bot 与底栏椭圆快发框，合并二级工具至单一设置入口），首页↔对话 1:1 可逆连续形变与二级面板景深后退动效；2) 对话页全面焕新：精简顶栏、椭圆融合输入胶囊（移除贴纸插件按钮）、邻近时间戳聚合、气泡弹性发射入场；思考与工具轨迹改为独立可折叠条目（[思考过程] / [记忆召回·N条] / 各工具输入输出互不抢占滚动）；3) 单调因果纪元 client_epoch 彻底根治“发消息→快速暂停又跳回加载→需二次暂停”的竞态问题；4) 100% 隐藏后台压缩气泡与摘要卡片，手动压缩期间用户消息自动排队不丢失，9m 闲置热压缩遇新消息秒级原子取消；5) 全链路极简无损时间锚点（26-11-25三22:35，0 破坏 KV 前缀缓存）；6) 14 工具统一重构：退役独立 web 工具由 cloud 默认极速纯文本 CDP 接管并在查询后自动释放临时浏览器标签，同步精简 admin/blackboard/memory/phone/pc/schedule 契约与架构 Skill/Map。",
+  "body": "v4.0.46 (Build 134): 1) 全新黑白极简 Apple HIG + 流体空间动效：首页升级为居中大尺寸活体头像舞台（保留形状/颜色/自然眨眼与视线跟随，支持横向拖拽视差切 Bot 与底栏椭圆快发框，合并二级工具至单一设置入口），首页↔对话 1:1 可逆连续形变与二级面板景深后退动效；2) 对话页全面焕新：精简顶栏、椭圆融合输入胶囊（移除贴纸插件按钮）、邻近时间戳聚合、气泡弹性发射入场；思考与工具轨迹改为独立可折叠条目（[思考过程] / [记忆召回·N条] / 各工具输入输出互不抢占滚动）；3) 单调因果纪元 client_epoch 彻底根治“发消息→快速暂停又跳回加载→需二次暂停”的竞态问题；4) 100% 隐藏后台压缩气泡与摘要卡片，手动压缩期间用户消息自动排队不丢失，9m 闲置热压缩遇新消息秒级原子取消；5) 全链路极简无损时间锚点（26-11-25三22:35，0 破坏 KV 前缀缓存）；6) 14 工具统一重构：退役独立 web 工具由 cloud 默认极速纯文本 CDP 接管并在查询后自动释放临时浏览器标签，同步精简 admin/blackboard/memory/phone/pc/schedule 契约与架构 Skill/Map。"
 }

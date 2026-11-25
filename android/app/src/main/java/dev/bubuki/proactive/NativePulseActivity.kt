@@ -214,6 +214,18 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
     internal var sendGuardBotId: String? = null
     internal var stoppedGuardBotId: String? = null
     internal var stoppedGuardUntilUptime: Long = 0L
+    internal val clientEpochByBot = mutableMapOf<String, Long>()
+    internal val stoppedEpochByBot = mutableMapOf<String, Long>()
+    internal val stopJobsByBot = mutableMapOf<String, Job>()
+    internal fun nextClientEpoch(botId: String): Long {
+        val next = (clientEpochByBot[botId] ?: 0L) + 1L
+        clientEpochByBot[botId] = next
+        return next
+    }
+    internal fun isEpochCancelled(botId: String, epoch: Long): Boolean {
+        val stopped = stoppedEpochByBot[botId] ?: 0L
+        return stopped > 0L && epoch <= stopped
+    }
     internal var streamPacerJob: Job? = null
     internal var targetStreamFullText: String = ""
     internal val avatarLoading = mutableSetOf<String>()
@@ -491,6 +503,21 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
             } finally { ui = ui.copy(busyBot = null) }
         }
     }
+    fun sendFromHome(targetBotId: String, rawInput: String) {
+        val clean = rawInput.trim()
+        if (clean.isEmpty() || ui.uploading) return
+        if (!ensurePaired()) return
+        open(targetBotId)
+        sendPayload(
+            id = targetBotId,
+            rawText = clean,
+            sentAttachments = emptyList(),
+            stickerUrl = "",
+            replyMsg = null,
+            clearComposerDraft = true,
+            restoreDraftText = clean
+        )
+    }
     fun send() {
         ui.editingMessage?.let { editing ->
             editMessageAndResend(editing, ui.draft)
@@ -545,6 +572,7 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
             localRevision++
             persistDrafts()
         }
+        val myEpoch = nextClientEpoch(id)
         stoppedGuardBotId = null
         stoppedGuardUntilUptime = 0L
         streamPacerJob?.cancel()
@@ -577,20 +605,35 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
         )
         perform {
             try {
+                if (isEpochCancelled(id, myEpoch)) {
+                    optimisticList.removeAll { it.id == pending.id }
+                    ui = ui.copy(messages = combinedMessages())
+                    return@perform
+                }
                 val payload = JSONObject()
                     .put("text", text)
                     .put("bot_id", id)
                     .put("mode", "auto")
                     .put("async_ack", true)
                     .put("client_msg_id", pending.id)
+                    .put("client_epoch", myEpoch)
                 if (stickerUrl.isNotBlank()) payload.put("sticker", stickerUrl)
                 val res = request("POST", "/api/chat", payload)
+                val abortedByEpoch = res.optBoolean("aborted_by_epoch", false) || isEpochCancelled(id, myEpoch)
                 val respEpoch = res.optLong("messages_epoch", 0L)
                 if (respEpoch > 0L) lastMessagesEpoch = respEpoch
                 val seq = res.optLong("seq", 0L)
                 if (seq > lastStreamSeq) lastStreamSeq = seq
                 val turnId = res.optString("turn_id", "")
                 val isQueued = res.optBoolean("queued", false)
+                if (abortedByEpoch) {
+                    if (turnId.isNotBlank()) markTurnCompleted(turnId)
+                    optimisticList.removeAll { it.id == pending.id }
+                    remoteWorkingBot = null
+                    clearStreamUi(targetBot = id, clearWorking = true)
+                    ui = ui.copy(messages = combinedMessages())
+                    return@perform
+                }
                 if (turnId.isNotBlank()) {
                     if (isQueued) {
                         completedTurnIds.remove(turnId)
@@ -715,26 +758,33 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
             )
             mergeRemoteMessages(listOf(frozenMsg), fullReplace = false)
         }
+        val stopEpoch = nextClientEpoch(targetBot)
+        stoppedEpochByBot[targetBot] = stopEpoch
         if (currentTurnId.isNotBlank()) markTurnCompleted(currentTurnId)
         if (activeStreamTurnId.isNotBlank()) markTurnCompleted(activeStreamTurnId)
         stoppedGuardBotId = targetBot
-        stoppedGuardUntilUptime = SystemClock.uptimeMillis() + 2_500L
+        stoppedGuardUntilUptime = SystemClock.uptimeMillis() + 4_500L
+        remoteWorkingBot = null
         clearStreamUi(targetBot = targetBot, clearWorking = true)
         ui = ui.copy(messages = combinedMessages())
         val stopComputerToo = ui.computerBot == targetBot || ui.cloudDesktopLiveBotId == targetBot
-        scope.launch {
+        stopJobsByBot[targetBot]?.cancel()
+        stopJobsByBot[targetBot] = scope.launch {
             runCatching {
                 request(
                     "POST",
                     "/api/stop",
                     JSONObject()
                         .put("bot_id", targetBot)
+                        .put("client_epoch", stopEpoch)
                         .put("source", SecureTransport.getNodeSource(activity))
                 )
                 if (stopComputerToo) {
                     runCatching { request("POST", "/api/computer/stop") }
                 }
-                refresh()
+                if ((clientEpochByBot[targetBot] ?: 0L) == stopEpoch) {
+                    refresh()
+                }
             }
         }
     }

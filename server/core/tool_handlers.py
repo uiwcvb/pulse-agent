@@ -757,6 +757,9 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
 
     async def _tool_blackboard(self, args: dict):
         eff = dict(args or {})
+        nested = eff.pop('params', None)
+        if isinstance(nested, dict):
+            eff = {**nested, **eff}
         act = str(eff.get('action') or eff.get('op') or 'read').strip().lower()
         eff['action'] = act
         if act in ('add_routine', 'update_routine', 'remove_routine', 'list_routines'):

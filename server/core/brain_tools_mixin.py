@@ -110,6 +110,8 @@ class BrainToolsMixin(StreamPublisherMixin):
                     from core.slash_commands import try_handle_slash_command
                     slash_md = await try_handle_slash_command(self, str(text or '').strip(), bot_id, src, bot, current_user_msg=m)
                     if slash_md is not None:
+                        if not str(slash_md).strip():
+                            return {'ok': True, 'silent_slash': True}
                         final_msg_for_handoff = await self.emit(
                             slash_md,
                             'chat',

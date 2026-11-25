@@ -79,136 +79,26 @@ internal fun NativeMessage(
     val maxSwipeLeftPx = with(density) { 104.dp.toPx() }
     var replyThresholdCrossed by remember(message.id) { mutableStateOf(false) }
 
-    if (message.kind == "compact_summary") {
-        val meta = remember(message.decision) { runCatching { org.json.JSONObject(message.decision) }.getOrNull() }
-        val beforeTok = meta?.optInt("before_tokens", 0) ?: 0
-        val afterTok = meta?.optInt("after_tokens", 0) ?: 0
-        val msgCnt = meta?.optInt("compacted_messages", 0) ?: 0
-        val vaultPath = (meta?.optString("vault_path", "") ?: "").ifBlank { "INDEX.md" }
-        val ctxId = meta?.optString("ctx_id", "").orEmpty()
-        val modeLabel = (meta?.optString("mode", "上下文压缩归档") ?: "").ifBlank { "上下文压缩归档" }
-        var summaryExpanded by rememberSaveable(message.id) { mutableStateOf(false) }
-        val summaryReduceMotion = rememberReducedMotion()
+    // All compaction summaries are completely hidden from the chat conversation stream.
+    if (message.kind == "compact_summary") return
 
-        Column(
-            Modifier.fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .background(c.surface)
-                .border(0.6.dp, c.line.copy(alpha = 0.72f), RoundedCornerShape(16.dp))
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier.clip(RoundedCornerShape(7.dp))
-                        .background(c.accent.copy(alpha = 0.14f))
-                        .padding(horizontal = 7.dp, vertical = 3.dp)
-                ) {
-                    Text(modeLabel, color = c.accent, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
-                }
-                Spacer(Modifier.weight(1f))
-                Text(model.time(message.created), color = c.faint, fontSize = 11.sp, style = TextStyle(fontFeatureSettings = "tnum"))
-            }
-            Text(
-                if (beforeTok > 0 || afterTok > 0) {
-                    "上下文已浓缩：${model.formatTokenCount(beforeTok)} → ${model.formatTokenCount(afterTok)} Tokens（共浓缩 $msgCnt 条对话）"
-                } else {
-                    "上下文已浓缩并归档至记忆库"
-                },
-                color = c.ink,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                style = TextStyle(fontFeatureSettings = "tnum")
-            )
-            Column(
-                Modifier.fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(c.fill.copy(alpha = 0.72f))
-                    .padding(horizontal = 11.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(5.dp)
-            ) {
-                Text("压缩记忆存储去向：", color = c.muted, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "1. 记忆库归档：memory_vault/$vaultPath",
-                        Modifier.weight(1f),
-                        color = c.ink.copy(alpha = 0.9f),
-                        fontSize = 12.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Box(
-                        Modifier.padding(start = 4.dp)
-                            .heightIn(min = 40.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .iosPressScale(0.95f) { model.openVault(vaultPath) },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            "查看归档记忆 ›",
-                            Modifier.clip(RoundedCornerShape(6.dp))
-                                .background(c.accent.copy(alpha = 0.14f))
-                                .padding(horizontal = 8.dp, vertical = 4.dp),
-                            color = c.accent,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-                Text(
-                    "2. 时间线与检索库：memory_vault/timeline · SQLite FTS5" + (if (ctxId.isNotBlank()) " ($ctxId)" else ""),
-                    color = c.muted,
-                    fontSize = 11.5.sp
-                )
-            }
-            Row(
-                Modifier.fillMaxWidth()
-                    .heightIn(min = 40.dp)
-                    .iosPressScale(0.98f) {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        summaryExpanded = !summaryExpanded
-                    }
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    if (summaryExpanded) "收起浓缩摘要正文 ▴" else "展开查看浓缩摘要正文 ▾",
-                    color = c.accent,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-            AnimatedVisibility(
-                visible = summaryExpanded,
-                enter = if (summaryReduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
-                exit = if (summaryReduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
-            ) {
-                SelectionContainer {
-                    MarkdownText(
-                        nativeWikiMarkdown(message.text),
-                        TextStyle(color = c.ink.copy(alpha = 0.9f), fontSize = 13.5.sp, lineHeight = 20.sp),
-                        streaming = false,
-                        onOpenUri = model::openLink
-                    )
-                }
-            }
-        }
-        return
-    }
-
-    // One-shot settle entrance only for newly arrived latest messages (< 2s old)
+    // Fluid launch entrance for newly sent / arrived messages (bubble rises from composer with spring physics)
     val reduceMotion = rememberReducedMotion()
     val isBrandNew = remember(message.id) {
-        isLatestMessage && !reduceMotion && message.created > 0.0 &&
-            ((System.currentTimeMillis() / 1000.0) - message.created) in -5.0..2.0
+        !reduceMotion && (
+            message.optimistic || (
+                isLatestMessage && message.created > 0.0 &&
+                    ((System.currentTimeMillis() / 1000.0) - message.created) in -5.0..3.0
+                )
+            )
     }
     val arriveAnim = remember(message.id) { Animatable(if (isBrandNew) 0f else 1f) }
     LaunchedEffect(message.id, isBrandNew) {
         if (isBrandNew && arriveAnim.value < 0.99f) {
-            arriveAnim.animateTo(1f, spring(dampingRatio = 0.82f, stiffness = 380f))
+            arriveAnim.animateTo(1f, spring(dampingRatio = 0.78f, stiffness = 360f))
         }
     }
-    val arriveShiftPx = with(density) { 8.dp.toPx() }
+    val arriveShiftPx = with(density) { (if (user) 38.dp else 18.dp).toPx() }
 
     // Shared Finger-Tracking Left-Swipe Gesture Modifier
     val swipeGestureModifier = Modifier.pointerInput(message.id) {
@@ -360,22 +250,22 @@ internal fun NativeMessage(
                     ) {
                         if (quotePart.isNotBlank()) {
                             Row(
-                                Modifier.padding(bottom = 5.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color.White.copy(alpha = 0.15f))
+                                Modifier.padding(bottom = 6.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(c.userInk.copy(alpha = 0.12f))
                                     .padding(horizontal = 8.dp, vertical = 5.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Box(
                                     Modifier.width(2.5.dp).height(24.dp)
                                         .clip(RoundedCornerShape(1.5.dp))
-                                        .background(Color.White.copy(alpha = 0.9f))
+                                        .background(c.userInk.copy(alpha = 0.78f))
                                 )
                                 Column(Modifier.padding(start = 7.dp)) {
-                                    Text("引用消息", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                    Text("引用消息", color = c.userInk, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                                     Text(
                                         quotePart,
-                                        color = Color.White.copy(alpha = 0.88f),
+                                        color = c.userInk.copy(alpha = 0.82f),
                                         fontSize = 12.sp,
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
@@ -384,24 +274,22 @@ internal fun NativeMessage(
                             }
                         }
                         if (effectiveUserBody.isNotBlank()) {
-                            Text(effectiveUserBody, color = c.userInk, fontSize = 16.sp, lineHeight = 21.5.sp)
+                            Text(effectiveUserBody, color = c.userInk, fontSize = 15.5.sp, lineHeight = 22.sp)
                         }
-                        Row(
-                            Modifier.align(Alignment.End).padding(top = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(3.dp)
-                        ) {
-                            Text(
-                                if (message.optimistic) "发送中" else model.time(message.created),
-                                color = c.userMeta,
-                                fontSize = 10.5.sp,
-                                style = TextStyle(fontFeatureSettings = "tnum")
-                            )
-                            PulseIcon(
-                                if (message.optimistic) "check" else "check_double",
-                                c.userMeta,
-                                Modifier.size(13.dp)
-                            )
+                        if (message.optimistic) {
+                            Row(
+                                Modifier.align(Alignment.End).padding(top = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Text(
+                                    "发送中",
+                                    color = c.userMeta,
+                                    fontSize = 10.5.sp,
+                                    style = TextStyle(fontFeatureSettings = "tnum")
+                                )
+                                PulseIcon("check", c.userMeta, Modifier.size(12.dp))
+                            }
                         }
                     }
                 } else {

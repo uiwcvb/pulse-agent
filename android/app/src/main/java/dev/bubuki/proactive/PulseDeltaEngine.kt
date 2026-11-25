@@ -289,6 +289,16 @@ internal fun NativePulseModel.handleStateSyncEvent(event: JSONObject) {
                 scope.launch { refreshSchedulesSilently() }
             }
         }
+        "context_compacted" -> {
+            val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(event.optJSONObject("context_by_bot"))
+            if (ctxTokensMap.isNotEmpty()) {
+                ui = ui.copy(
+                    contextTokensByBot = ui.contextTokensByBot + ctxTokensMap,
+                    contextCachedByBot = ui.contextCachedByBot + ctxCachedMap,
+                    contextMsgsByBot = ui.contextMsgsByBot + ctxMsgsMap
+                )
+            }
+        }
         "curiosity_changed" -> {
             val remoteCurMin = event.optInt("curiosity_interval_minutes", 0)
             val botId = event.optString("bot_id", "")

@@ -335,45 +335,74 @@ internal fun UnifiedTimelineBubbleContent(
                 ) {
                     Column(
                         Modifier.fillMaxWidth()
-                            .padding(top = 8.dp, bottom = 2.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                            .padding(top = 6.dp, bottom = 2.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         if (cleanThought.isNotBlank()) {
-                            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
-                                Box(
-                                    Modifier.width(2.dp)
-                                        .fillMaxHeight()
-                                        .clip(CircleShape)
-                                        .background(c.line)
-                                )
-                                Text(
-                                    cleanThought,
-                                    Modifier.padding(start = 8.dp),
-                                    color = c.muted,
-                                    fontSize = 12.sp,
-                                    lineHeight = 17.sp
-                                )
+                            var thoughtOpen by rememberSaveable("th_$stateKey") { mutableStateOf(false) }
+                            val thChev by animateFloatAsState(
+                                targetValue = if (thoughtOpen) 90f else 0f,
+                                animationSpec = if (effectiveReduce) snap() else iosGentleSpring(),
+                                label = "th_chev"
+                            )
+                            Column(
+                                Modifier.fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(c.fill.copy(alpha = 0.42f))
+                                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Row(
+                                    Modifier.fillMaxWidth()
+                                        .heightIn(min = 34.dp)
+                                        .clickable(
+                                            interactionSource = remember { MutableInteractionSource() },
+                                            indication = null
+                                        ) {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            thoughtOpen = !thoughtOpen
+                                        },
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                                ) {
+                                    Box(Modifier.size(5.5.dp).clip(CircleShape).background(c.muted.copy(alpha = 0.7f)))
+                                    Text(
+                                        "思考过程（${cleanThought.length} 字）",
+                                        Modifier.weight(1f),
+                                        color = c.ink.copy(alpha = 0.82f),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        "›",
+                                        Modifier.graphicsLayer { rotationZ = thChev },
+                                        color = c.faint,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                                AnimatedVisibility(
+                                    visible = thoughtOpen,
+                                    enter = if (effectiveReduce) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(140)),
+                                    exit = if (effectiveReduce) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(100))
+                                ) {
+                                    Text(
+                                        cleanThought,
+                                        Modifier.padding(top = 4.dp, bottom = 6.dp),
+                                        color = c.muted,
+                                        fontSize = 12.sp,
+                                        lineHeight = 18.sp
+                                    )
+                                }
                             }
                         }
                         if (processSteps.isNotEmpty()) {
                             Column(
                                 Modifier.fillMaxWidth().padding(start = 2.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                                verticalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
-                                var prevCtx = ""
                                 processSteps.forEachIndexed { idx, step ->
-                                    if (step.contextNote.isNotBlank() && step.contextNote != prevCtx) {
-                                        prevCtx = step.contextNote
-                                        Text(
-                                            "“${step.contextNote}”",
-                                            color = c.faint,
-                                            fontSize = 11.sp,
-                                            fontStyle = FontStyle.Italic,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.padding(start = 12.dp, top = 2.dp)
-                                        )
-                                    }
                                     var stepOpen by rememberSaveable("st_${cardKey}_$idx") { mutableStateOf(false) }
                                     val stErr = step.status == "error" || step.result?.has("error") == true || step.result?.optBoolean("ok", true) == false
                                     val stRun = step.status == "running"
@@ -383,18 +412,47 @@ internal fun UnifiedTimelineBubbleContent(
                                         step.durationMs > 0L -> "${step.durationMs}ms"
                                         else -> ""
                                     }
-                                    Column(Modifier.fillMaxWidth()) {
+                                    val recallItems = remember(step.tool, step.result) {
+                                        val r = step.result ?: return@remember emptyList<String>()
+                                        val arr = r.optJSONArray("facts") ?: r.optJSONArray("results") ?: r.optJSONArray("hits") ?: r.optJSONArray("items")
+                                        if (arr == null || arr.length() == 0) emptyList()
+                                        else (0 until arr.length().coerceAtMost(8)).mapNotNull { i ->
+                                            val o = arr.optJSONObject(i)
+                                            if (o != null) {
+                                                val head = o.optString("entity").ifBlank { o.optString("title") }.ifBlank { o.optString("path") }
+                                                val attr = o.optString("attr")
+                                                val body = o.optString("value").ifBlank { o.optString("body") }.ifBlank { o.optString("text") }.ifBlank { o.optString("summary") }
+                                                val left = if (attr.isNotBlank()) "$head · $attr" else head
+                                                listOf(left, body.take(120)).filter { it.isNotBlank() }.joinToString("：")
+                                            } else arr.optString(i).take(120)
+                                        }.filter { it.isNotBlank() }
+                                    }
+                                    val stepLabel = remember(step.tool, step.args, recallItems) {
+                                        val base = humanizeToolName(step.tool, step.args)
+                                        if (recallItems.isNotEmpty()) "$base · 召回 ${recallItems.size} 条" else base
+                                    }
+                                    Column(
+                                        Modifier.fillMaxWidth()
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(c.fill.copy(alpha = 0.42f))
+                                            .padding(horizontal = 10.dp, vertical = 2.dp)
+                                    ) {
                                         Row(
-                                            Modifier.fillMaxWidth().heightIn(min = 38.dp),
+                                            Modifier.fillMaxWidth().heightIn(min = 36.dp),
                                             verticalAlignment = Alignment.CenterVertically,
                                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                                         ) {
                                             Row(
                                                 Modifier.weight(1f)
-                                                    .heightIn(min = 38.dp)
-                                                    .clip(RoundedCornerShape(6.dp))
-                                                    .clickable { stepOpen = !stepOpen }
-                                                    .padding(vertical = 6.dp),
+                                                    .heightIn(min = 36.dp)
+                                                    .clickable(
+                                                        interactionSource = remember { MutableInteractionSource() },
+                                                        indication = null
+                                                    ) {
+                                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                        stepOpen = !stepOpen
+                                                    }
+                                                    .padding(vertical = 4.dp),
                                                 verticalAlignment = Alignment.CenterVertically,
                                                 horizontalArrangement = Arrangement.spacedBy(7.dp)
                                             ) {
@@ -410,10 +468,11 @@ internal fun UnifiedTimelineBubbleContent(
                                                         )
                                                 )
                                                 Text(
-                                                    humanizeToolName(step.tool, step.args),
+                                                    stepLabel,
                                                     Modifier.weight(1f),
                                                     color = if (stErr) c.warn else c.ink.copy(alpha = 0.86f),
                                                     fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Medium,
                                                     maxLines = 1,
                                                     overflow = TextOverflow.Ellipsis
                                                 )
@@ -428,14 +487,14 @@ internal fun UnifiedTimelineBubbleContent(
                                             }
                                             if (step.tool == "cloud_desktop" || step.tool == "cloud" || step.tool == "cloud_computer") {
                                                 Box(
-                                                    Modifier.heightIn(min = 34.dp)
+                                                    Modifier.heightIn(min = 30.dp)
                                                         .clip(RoundedCornerShape(10.dp))
                                                         .background(c.accent.copy(alpha = 0.12f))
                                                         .iosPressScale(0.95f) { model.openCloudDesktop() }
-                                                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                                                        .padding(horizontal = 9.dp, vertical = 4.dp),
                                                     contentAlignment = Alignment.Center
                                                 ) {
-                                                    Text("查看电脑 ›", color = c.accent, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                                                    Text("云电脑 ›", color = c.accent, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
                                                 }
                                             }
                                             if (step.tool == "subtask" || step.tool == "run_subtask") {
@@ -454,14 +513,14 @@ internal fun UnifiedTimelineBubbleContent(
                                                     else -> "查看"
                                                 }
                                                 Box(
-                                                    Modifier.heightIn(min = 34.dp)
+                                                    Modifier.heightIn(min = 30.dp)
                                                         .clip(RoundedCornerShape(10.dp))
                                                         .background(
                                                             if (liveSub?.status == "failed") c.warn.copy(alpha = 0.14f)
                                                             else c.accent.copy(alpha = 0.12f)
                                                         )
                                                         .iosPressScale(0.95f) { model.openSubtaskPanel(subTaskId) }
-                                                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                                                        .padding(horizontal = 9.dp, vertical = 4.dp),
                                                     contentAlignment = Alignment.Center
                                                 ) {
                                                     Text(
@@ -480,22 +539,32 @@ internal fun UnifiedTimelineBubbleContent(
                                             enter = if (effectiveReduce) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(140)),
                                             exit = if (effectiveReduce) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(100))
                                         ) {
-                                            val argsStr = step.args?.toString()?.take(2400).orEmpty()
-                                            val resStr = step.result?.toString()?.take(3200).orEmpty()
+                                            val argsStr = step.args?.toString()?.take(1800).orEmpty()
+                                            val resStr = step.result?.toString()?.take(2400).orEmpty()
                                             Column(
-                                                Modifier.fillMaxWidth().padding(start = 13.dp, top = 3.dp, bottom = 2.dp),
-                                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                                                Modifier.fillMaxWidth().padding(start = 12.dp, top = 2.dp, bottom = 6.dp),
+                                                verticalArrangement = Arrangement.spacedBy(4.dp)
                                             ) {
-                                                if (argsStr.isNotBlank() && argsStr != "{}") {
-                                                    Text("参数：$argsStr", color = c.faint, fontSize = 10.5.sp, lineHeight = 14.sp)
+                                                if (recallItems.isNotEmpty()) {
+                                                    recallItems.forEachIndexed { rIdx, rLine ->
+                                                        Text(
+                                                            "${rIdx + 1}. $rLine",
+                                                            color = c.muted,
+                                                            fontSize = 11.5.sp,
+                                                            lineHeight = 16.sp
+                                                        )
+                                                    }
                                                 }
-                                                if (resStr.isNotBlank() && resStr != "{}") {
+                                                if (argsStr.isNotBlank() && argsStr != "{}") {
+                                                    Text("输入：$argsStr", color = c.faint, fontSize = 11.sp, lineHeight = 15.sp)
+                                                }
+                                                if (recallItems.isEmpty() && resStr.isNotBlank() && resStr != "{}") {
                                                     Text(
-                                                        "返回：$resStr",
+                                                        "输出：$resStr",
                                                         color = if (stErr) c.warn else c.faint,
-                                                        fontSize = 10.5.sp,
-                                                        lineHeight = 14.sp,
-                                                        maxLines = 24,
+                                                        fontSize = 11.sp,
+                                                        lineHeight = 15.sp,
+                                                        maxLines = 20,
                                                         overflow = TextOverflow.Ellipsis
                                                     )
                                                 }

@@ -414,6 +414,49 @@ class BrainProactiveMixin:
             if saved_vc:
                 self._cached_vault_context = saved_vc
 
+    async def keepalive_loop(self):
+        """Dedicated lightweight daemon for KV cache keepalive, 9m idle hot-compaction & 8m sleep memory consolidation.
+
+        Strictly decoupled from `scheduler()` so slow routines / curiosity / research can NEVER starve idle compaction!
+        """
+        self._keepalive_loop_active = True
+        try:
+            while True:
+                try:
+                    await asyncio.sleep(5)
+                    s, c = self.store.state, self.store.config
+                    if not c.enabled:
+                        continue
+                    now = time.time()
+                    has_api = bool(
+                        (c.effective_api_key(big=True) or c.effective_api_key(big=False))
+                        and (c.effective_model(big=True) or c.effective_model(big=False))
+                    )
+                    if has_api:
+                        try:
+                            await asyncio.wait_for(self._get_cache_keepalive().tick(self, now_ts=now), timeout=240.0)
+                        except Exception as ke:
+                            logger.warning('keepalive_loop tick error: %s', ke)
+                    with contextlib.suppress(Exception):
+                        if hasattr(self.memory_engine, 'get_embedding_engine'):
+                            self.memory_engine.get_embedding_engine().maybe_unload_idle(now)
+                    if (
+                        has_api
+                        and not TaskContinuityManager.is_any_foreground_busy(self)
+                        and (now - float(s.get('last_user') or 0)) >= self.memory_engine.get_sleep_consolidate_idle_seconds()
+                        and float(s.get('last_user') or 0) > float(s.get('last_sleep_consolidate') or 0)
+                    ):
+                        try:
+                            await asyncio.wait_for(self._sleep_time_consolidate(), timeout=180.0)
+                        except Exception as se:
+                            logger.warning('keepalive_loop sleep_consolidate error: %s', se)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning('keepalive_loop unexpected error: %s', exc)
+        finally:
+            self._keepalive_loop_active = False
+
     async def scheduler(self):
         while True:
             try:
@@ -503,7 +546,10 @@ class BrainProactiveMixin:
                             )
                             t0_rt = time.perf_counter()
                             try:
-                                rt_res = await self.run_scheduled(eff_goal, bot_id=r_bot, label=r_label + ('·补跑' if is_late else ''))
+                                rt_res = await asyncio.wait_for(
+                                    self.run_scheduled(eff_goal, bot_id=r_bot, label=r_label + ('·补跑' if is_late else '')),
+                                    timeout=600.0,
+                                )
                                 rt_silent = bool(isinstance(rt_res, dict) and rt_res.get('silent'))
                                 r['last_status'] = 'silent' if rt_silent else ('late_ok' if is_late else 'ok')
                                 r['last_error'] = ''
@@ -530,29 +576,33 @@ class BrainProactiveMixin:
                         break
                 # 2.5 Passive background notification convergence every 75s when phone is online and idle
                 if not TaskContinuityManager.is_any_foreground_busy(self) and self.is_phone_online() and now - self._last_notif_bg_poll >= 75.0 and not self.executions_by_bot:
-                    await self._poll_and_converge_notifications(timeout=4.5)
-                # 2.6 Bounded KV Prefix Cache keepalive & 9-minute idle hot-compaction (0 overnight burn)
-                if has_api:
                     with contextlib.suppress(Exception):
-                        await self._get_cache_keepalive().tick(self, now_ts=now)
-                # 2.7 Idle-unload local ONNX embedding session (0 MB idle RAM) & weekly Memory Gardener
-                with contextlib.suppress(Exception):
-                    if hasattr(self.memory_engine, 'get_embedding_engine'):
-                        self.memory_engine.get_embedding_engine().maybe_unload_idle(now)
+                        await asyncio.wait_for(self._poll_and_converge_notifications(timeout=4.5), timeout=8.0)
+                # 2.6 Fallback when keepalive_loop is not running (e.g. unit tests calling scheduler directly)
+                if not getattr(self, '_keepalive_loop_active', False):
+                    if has_api:
+                        try:
+                            await asyncio.wait_for(self._get_cache_keepalive().tick(self, now_ts=now), timeout=240.0)
+                        except Exception as ke:
+                            logger.warning('scheduler cache_keepalive error: %s', ke)
+                    with contextlib.suppress(Exception):
+                        if hasattr(self.memory_engine, 'get_embedding_engine'):
+                            self.memory_engine.get_embedding_engine().maybe_unload_idle(now)
+                    if (
+                        has_api
+                        and not TaskContinuityManager.is_any_foreground_busy(self)
+                        and (now - s.get('last_user', 0)) >= self.memory_engine.get_sleep_consolidate_idle_seconds()
+                        and s.get('last_user', 0) > s.get('last_sleep_consolidate', 0)
+                    ):
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(self._sleep_time_consolidate(), timeout=180.0)
+                # 2.7 Weekly Memory Gardener
                 if not TaskContinuityManager.is_any_foreground_busy(self) and (now - float(s.get('last_memory_gardener') or 0)) >= 7 * 86400:
                     with contextlib.suppress(Exception):
                         from core.memory_migrator import run_memory_gardener
                         run_memory_gardener(self, now_ts=now)
                         s['last_memory_gardener'] = now
                         self.store.save()
-                # 3. Sleep-Time Compute memory consolidation when user has been idle >= configured threshold (default 480s / 8 min, just before 9m idle hot-compact)
-                if (
-                    has_api
-                    and not TaskContinuityManager.is_any_foreground_busy(self)
-                    and (now - s.get('last_user', 0)) >= self.memory_engine.get_sleep_consolidate_idle_seconds()
-                    and s.get('last_user', 0) > s.get('last_sleep_consolidate', 0)
-                ):
-                    await self._sleep_time_consolidate()
                 # 4. Background curiosity & idle research respect quiet hours (00:00 - 08:00) and active chat sessions
                 if self.quiet():
                     continue
@@ -577,7 +627,7 @@ class BrainProactiveMixin:
                         rr_idx = int(getattr(self, '_curiosity_rr_idx', 0) or 0) % len(curiosity_targets)
                         target_bot_id, target_src = curiosity_targets[rr_idx]
                         self._curiosity_rr_idx = (rr_idx + 1) % len(curiosity_targets)
-                        cur_res = await self.curiosity(bot_id=target_bot_id, source=target_src)
+                        cur_res = await asyncio.wait_for(self.curiosity(bot_id=target_bot_id, source=target_src), timeout=600.0)
                         if isinstance(cur_res, dict) and cur_res.get('suppressed'):
                             delay_s = float(cur_res.get('next_delay_s') or cur_interval_s)
                             s['curiosity_next_run'] = max(float(s.get('curiosity_next_run') or 0), now + delay_s)

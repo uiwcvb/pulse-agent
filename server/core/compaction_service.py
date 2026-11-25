@@ -537,6 +537,7 @@ async def execute_streaming_compaction(
     llm_stream_fn: Optional[Callable] = None,
     silent_complete_fn: Optional[Callable] = None,
     on_stream: Optional[Callable] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Optional[Dict[str, Any]]:
     src = normalize_node_source(source or "phone")
     lock = get_compaction_lock(bot_id, src)
@@ -718,6 +719,8 @@ async def execute_streaming_compaction(
             f"- **记忆存储位置**：`memory_vault/{vault_note_path}`、`memory_vault/timeline`、{ctx_hint}\n\n"
             f"{final_summary}\n"
         )
+        if cancel_check is not None and cancel_check():
+            return {"compacted": False, "cancelled": True}
         prev_suppress = getattr(memory_engine, "_suppress_vault_listener", False)
         memory_engine._suppress_vault_listener = True
         try:

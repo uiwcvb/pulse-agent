@@ -181,12 +181,13 @@ def _search_archived_messages(
         sc = float(r.get('score') or 0.0) + _lexical_score(txt.lower(), terms, entities, q_low) * 0.5
         if sc < 3.5:
             continue
-        t_str = str(r.get('time') or '')[:16]
+        from vault_manager import fmt_compact_ts
+        t_str = fmt_compact_ts(r.get('created_at') or r.get('time'), include_time=True) or str(r.get('time') or '')[:16]
         speaker = str(r.get('speaker') or r.get('role') or '')
         out.append({
             'source_type': 'archived_msg',
             'key': f"msg:{r.get('msg_id') or len(out)}",
-            'badge': f'历史对话:{t_str} {speaker}'.strip(),
+            'badge': f'历史:{t_str} {speaker}'.strip(),
             'title': txt.splitlines()[0][:90],
             'body': txt[:360],
             'score': sc,
@@ -239,12 +240,15 @@ def unified_cross_compaction_recall(
             fact_hits = memory_tables.query_facts(
                 query=expanded_q, limit=max(limit, 6), query_vec=shared_q_vec, non_blocking_warmup=True,
             )
+            from vault_manager import fmt_compact_ts
             norm_facts: list[dict[str, Any]] = []
             for f in fact_hits:
+                ft = fmt_compact_ts(f.get('updated_at') or f.get('created_at'), include_time=False)
+                ft_s = f' {ft}' if ft else ''
                 norm_facts.append({
                     'source_type': 'entity_fact',
                     'key': f"ef:{f.get('id')}",
-                    'badge': f"事实表:{f.get('entity', '')} [{f.get('ttl_type', 'stateful')}]",
+                    'badge': f"事实:{f.get('entity', '')}{ft_s}",
                     'title': f"{f.get('entity', '')} · {f.get('attr', '')}",
                     'body': str(f.get('value') or '')[:380],
                     'score': float(f.get('score') or 0.0),
@@ -273,10 +277,11 @@ def unified_cross_compaction_recall(
             norm_eps: list[dict[str, Any]] = []
             for ep in ep_hits:
                 ctx_n = f' (ctx_id="{ep["ctx_id"]}")' if ep.get('ctx_id') else ''
+                ept = fmt_compact_ts(ep.get('occurred_at') or ep.get('created_at'), include_time=False)
                 norm_eps.append({
                     'source_type': 'episode',
                     'key': f"ep:{ep.get('id')}",
-                    'badge': '情景轴',
+                    'badge': f'情景:{ept}' if ept else '情景',
                     'title': f"{ep.get('title', '')}{ctx_n}",
                     'body': str(ep.get('summary') or '')[:340],
                     'score': float(ep.get('score') or 0.0),

@@ -15,6 +15,37 @@ except ZoneInfoNotFoundError:
 def now_iso():
     return datetime.now(TZ).isoformat(timespec='seconds')
 
+_WK_SHORT = ('一', '二', '三', '四', '五', '六', '日')
+
+def fmt_compact_ts(ts: float | int | str | None, *, include_time: bool = True) -> str:
+    """Format epoch/ISO timestamp into ultra-compact lossless form: `26-11-25三22:35` or `26-11-25三`."""
+    if ts is None or ts == '':
+        return ''
+    try:
+        if isinstance(ts, (int, float)):
+            if float(ts) <= 0:
+                return ''
+            dt = datetime.fromtimestamp(float(ts), TZ)
+        else:
+            s = str(ts).strip()
+            if not s:
+                return ''
+            try:
+                f = float(s)
+                if f <= 0:
+                    return ''
+                dt = datetime.fromtimestamp(f, TZ)
+            except ValueError:
+                dt = datetime.fromisoformat(s.replace(' ', 'T').replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TZ)
+                else:
+                    dt = dt.astimezone(TZ)
+        wk = _WK_SHORT[dt.weekday()]
+        return f"{dt.strftime('%y-%m-%d')}{wk}{dt.strftime('%H:%M')}" if include_time else f"{dt.strftime('%y-%m-%d')}{wk}"
+    except Exception:
+        return ''
+
 def atomic_write(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
@@ -46,6 +77,7 @@ from core.skill_templates import (
     NOTIFY_OVERLAY_SKILL_MD,
     SELF_ARCH_SKILL_MD,
     SKILLS_INDEX_MD,
+    TOOL_ADMIN_SKILL_MD,
     TOOLS_REFERENCE_SKILL_MD,
     WHALECHAN_ONBOARDING_SKILL_MD,
 )
@@ -53,6 +85,7 @@ from core.skill_templates import (
 BUILTIN_SKILL_PATHS = (
     'skills/INDEX.md',
     'skills/tools_reference.md',
+    'skills/tool_admin.md',
     'skills/self_architecture.md',
     'skills/notify_and_overlay.md',
     'skills/device_control.md',
@@ -64,10 +97,11 @@ TEMPLATES = {
     'INDEX.md': (
         '# 共生记忆库\n\n'
         '所有记忆都可以查看、修改。只记录已知事实；猜测必须标注。\n'
-        '> 📌 **架构自省置顶索引**：[[skills/onboarding_guide]]（开箱配置向导）｜[[skills/tools_reference]]（工具契约速查）｜[[skills/self_architecture]]（DSB 系统总纲）｜[[skills/notify_and_overlay]]（分级通知与悬浮窗）｜[[skills/device_control]]（三域设备操控）｜[[skills/blackboard_collab]]（黑板协同）｜[[skills/INDEX]]（技能库目录）｜[[profile/pinned_memories]]（核心钉住记忆）\n\n'
+        '> 📌 **架构自省置顶索引**：[[skills/onboarding_guide]]（开箱配置向导）｜[[skills/tools_reference]]（14工具契约速查）｜[[skills/tool_admin]]（系统运维手册）｜[[skills/self_architecture]]（DSB 系统总纲）｜[[skills/notify_and_overlay]]（分级通知与悬浮窗）｜[[skills/device_control]]（三域设备操控）｜[[skills/blackboard_collab]]（黑板协同）｜[[skills/INDEX]]（技能库目录）｜[[profile/pinned_memories]]（核心钉住记忆）\n\n'
     ),
     'skills/INDEX.md': SKILLS_INDEX_MD,
     'skills/tools_reference.md': TOOLS_REFERENCE_SKILL_MD,
+    'skills/tool_admin.md': TOOL_ADMIN_SKILL_MD,
     'skills/onboarding_guide.md': WHALECHAN_ONBOARDING_SKILL_MD,
     'skills/self_architecture.md': SELF_ARCH_SKILL_MD,
     'skills/notify_and_overlay.md': NOTIFY_OVERLAY_SKILL_MD,

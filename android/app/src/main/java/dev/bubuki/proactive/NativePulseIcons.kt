@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -18,9 +19,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
@@ -110,7 +113,9 @@ internal fun PulseAvatar(
     state: NativePulseState,
     diameter: Dp = 44.dp,
     showStatusDot: Boolean = false,
-    ringColor: Color = Color(0xFF1C1C1E)
+    ringColor: Color = Color(0xFF1C1C1E),
+    gazeShiftX: Float = 0f,
+    enableLiveBlink: Boolean = false
 ) {
     val radius = diameter * 0.36f
     val image = state.avatars[bot.id]
@@ -122,8 +127,50 @@ internal fun PulseAvatar(
     val useWhalechanStamp = remember(bot.id, bot.shape) {
         BotAvatarView.isWhalechanStamp(bot.id, bot.shape)
     }
+    val reduceMotion = LocalReduceMotion.current
+    val powerSave = LocalPowerSaveMode.current
+    val lifecycleStarted = rememberLifecycleStarted()
+    val blinkAnim = remember(bot.id) { androidx.compose.animation.core.Animatable(1f) }
+    val breathAnim = remember(bot.id) { androidx.compose.animation.core.Animatable(1f) }
+    val shouldAnimateLive = (enableLiveBlink || diameter >= 96.dp) && !reduceMotion && !powerSave && lifecycleStarted
+    LaunchedEffect(shouldAnimateLive, bot.id) {
+        if (!shouldAnimateLive) {
+            blinkAnim.snapTo(1f)
+            return@LaunchedEffect
+        }
+        var cycle = 0
+        while (true) {
+            kotlinx.coroutines.delay(if (cycle % 3 == 2) 5200L else 3600L)
+            blinkAnim.animateTo(0.10f, androidx.compose.animation.core.tween(75))
+            blinkAnim.animateTo(1f, androidx.compose.animation.core.spring(dampingRatio = 0.68f, stiffness = 540f))
+            if (cycle % 4 == 3) {
+                kotlinx.coroutines.delay(140L)
+                blinkAnim.animateTo(0.12f, androidx.compose.animation.core.tween(65))
+                blinkAnim.animateTo(1f, androidx.compose.animation.core.spring(dampingRatio = 0.72f, stiffness = 560f))
+            }
+            cycle++
+        }
+    }
+    LaunchedEffect(shouldAnimateLive, isBusy, bot.id) {
+        if (!shouldAnimateLive) {
+            breathAnim.snapTo(1f)
+            return@LaunchedEffect
+        }
+        while (true) {
+            val dur = if (isBusy) 900 else 2200
+            val peak = if (isBusy) 1.045f else 1.024f
+            breathAnim.animateTo(peak, androidx.compose.animation.core.tween(dur, easing = androidx.compose.animation.core.FastOutSlowInEasing))
+            breathAnim.animateTo(1f, androidx.compose.animation.core.tween(dur, easing = androidx.compose.animation.core.FastOutSlowInEasing))
+        }
+    }
 
-    Box(Modifier.size(diameter)) {
+    Box(
+        Modifier.size(diameter).graphicsLayer {
+            val sc = breathAnim.value
+            scaleX = sc
+            scaleY = sc
+        }
+    ) {
         if (image != null && bot.avatarVersion.isNotBlank()) {
             Image(
                 image,
@@ -155,11 +202,21 @@ internal fun PulseAvatar(
             }
             val fill = remember(shapeKey) { BotAvatarView.createPath(shapeKey) }
             val fillPaint = remember { Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL } }
-            // Static eye geometry to eliminate 90Hz infinite Canvas invalidations & BLASTBufferQueue out-of-order buffers.
-            val eyeScaleY = 1f
-            val eyeShiftX = 0f
+            val eyeScaleY = blinkAnim.value
+            val eyeShiftX = gazeShiftX.coerceIn(-8f, 8f)
             Canvas(Modifier.size(diameter)) {
                 val s = size.minDimension / 100f
+                if (size.minDimension >= 180f) {
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(baseColor.copy(alpha = 0.24f), Color.Transparent),
+                            center = Offset(size.width / 2f, size.height * 0.56f),
+                            radius = size.minDimension * 0.62f
+                        ),
+                        radius = size.minDimension * 0.62f,
+                        center = Offset(size.width / 2f, size.height * 0.56f)
+                    )
+                }
                 fillPaint.color = android.graphics.Color.argb(
                     (baseColor.alpha * 255).toInt(),
                     (baseColor.red * 255).toInt(),
@@ -173,7 +230,7 @@ internal fun PulseAvatar(
                     native.drawPath(fill, fillPaint)
                     native.restore()
                 }
-                val eyeH = (23f * eyeScaleY).coerceAtLeast(3.5f) * s
+                val eyeH = (23f * eyeScaleY).coerceAtLeast(3.2f) * s
                 val eyeYOffset = (23f * s - eyeH) / 2f
                 rotate(-26f, Offset((58f + eyeShiftX) * s, 44f * s)) {
                     drawRoundRect(

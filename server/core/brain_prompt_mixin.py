@@ -15,13 +15,14 @@
 - `core.xml_tool_parser`: XML/DSML 内联工具解析器
 """
 from __future__ import annotations
-import contextlib, json, re, secrets, time
+import asyncio, contextlib, json, re, secrets, time
 from pathlib import Path
 from typing import Any
 from assistants import get_assistant
 from core.llm_client import LLMClient
 from core.memory_engine import MemoryEngine
 from core.tool_schemas import is_tool_allowed, normalize_bot_tools
+from vault_manager import fmt_compact_ts
 from core.prompt_guards import (
     BAIKE_CALIBRATION_TAIL,
     UNIVERSAL_ASSISTANT_CALIBRATION_TAIL,
@@ -454,8 +455,43 @@ class BrainPromptMixin:
         """Disabled by design: zero cross-device prompt injection during normal turns."""
         return ''
 
-    async def _auto_compact_if_needed(self, bot_id: str, force: bool = False, source: str | None = None, on_stream=None) -> dict | None:
-        """Streaming 200K / manual compaction via MemoryEngine & CompactionService."""
+    async def run_manual_compaction(self, bot_id: str, source: str | None = None) -> dict | None:
+        """Execute user-triggered manual compaction exclusively; incoming user chats queue behind it."""
+        src = normalize_node_source(source or self.source_context.get())
+        nb_k = f'{src}:{bot_id}'
+        existing = self._active_manual_compact_tasks.get(nb_k)
+        if existing is not None and not existing.done():
+            return await existing
+        if hasattr(self, '_get_cache_keepalive'):
+            with contextlib.suppress(Exception):
+                await self._get_cache_keepalive().cancel_idle_compaction(src, bot_id)
+
+        async def _do_manual() -> dict | None:
+            async with self._get_bot_lock(bot_id, src):
+                res = await self._auto_compact_if_needed(bot_id, force=True, source=src, silent=True)
+                if res and res.get('compacted') and not res.get('already_compacted') and hasattr(self, 'dsh_adapter'):
+                    with contextlib.suppress(Exception):
+                        await self.dsh_adapter.reset_session(bot_id, src)
+                return res
+
+        task = asyncio.create_task(_do_manual())
+        self._active_manual_compact_tasks[nb_k] = task
+        try:
+            return await task
+        finally:
+            if self._active_manual_compact_tasks.get(nb_k) is task:
+                self._active_manual_compact_tasks.pop(nb_k, None)
+
+    async def _auto_compact_if_needed(
+        self,
+        bot_id: str,
+        force: bool = False,
+        source: str | None = None,
+        on_stream=None,
+        silent: bool = True,
+        cancel_check=None,
+    ) -> dict | None:
+        """Silent 100%-hidden compaction via MemoryEngine & CompactionService with atomic cancel_check."""
         src = normalize_node_source(source or self.source_context.get())
         sys_tokens = self._estimate_tokens(self.harness.system_instructions(self.context())) + 800
         stream_emitted = False
@@ -470,7 +506,7 @@ class BrainPromptMixin:
             finally:
                 self.source_context.reset(tok)
 
-        eff_on_stream = on_stream or _default_on_stream
+        eff_on_stream = on_stream if (on_stream is not None or silent) else _default_on_stream
         rep_tokens = (
             int(self.last_prompt_tokens.get(f'{src}:{bot_id}') or 0)
             or int(self.last_prompt_tokens.get(bot_id) or 0)
@@ -488,6 +524,7 @@ class BrainPromptMixin:
                 on_stream=eff_on_stream,
                 force=force,
                 source=src,
+                cancel_check=cancel_check,
             )
             if res and res.get('compacted', True) and not res.get('already_compacted') and isinstance(res.get('marker'), dict):
                 self._cached_vault_context = self.context()[:6400]
@@ -517,7 +554,14 @@ class BrainPromptMixin:
                     self._get_cache_keepalive().mark_compacted(src, bot_id)
                 self.stream_seq += 1
                 self.store.save()
-                await self.publish({'type': 'message', 'source': src, 'message': marker, 'seq': self.stream_seq})
+                await self.publish({
+                    'type': 'context_compacted',
+                    'source': src,
+                    'bot_id': bot_id,
+                    'after_tokens': post_tok,
+                    'context_by_bot': self.memory_engine.get_all_bots_context_stats(source=src),
+                    'seq': self.stream_seq,
+                })
             return res
         finally:
             if stream_emitted and on_stream is None:
@@ -579,18 +623,23 @@ class BrainPromptMixin:
                     continue
             eff_role = 'user' if is_incoming_bot_msg else msg_item['role']
             prefix = ''
+            if eff_role == 'user':
+                msg_ts = msg_item.get('created_at') or msg_item.get('time')
+                ts_compact = fmt_compact_ts(msg_ts, include_time=True) if msg_ts else ''
+                if ts_compact:
+                    prefix = f'[{ts_compact}] '
             if is_incoming_bot_msg:
                 from_lbl = str(msg_item.get('from_bot_name') or m_from or '同事 Bot')
                 if is_current_trigger:
                     raw_llm_str = str(msg_item.get('llm_text') or '')
                     if '协作来信' not in raw_llm_str:
-                        prefix = (
+                        prefix += (
                             f'【跨端/同事 Bot 协作来信 · 来自「{from_lbl}」的同级触发委托】'
                             '（请站在你自己的专业职责视角独立处理该协作事项，或仅就该协作新进展向用户简报；'
                             '严禁重复回答用户此前已经得到回复的历史提问！）：\n'
                         )
                 else:
-                    prefix = f'[历史协作归档 · 来自「{from_lbl}」（该委托已在当时回复结项，当前轮次请勿重复执行或回发）]：\n'
+                    prefix += f'[历史协作归档 · 来自「{from_lbl}」（该委托已在当时回复结项，当前轮次请勿重复执行或回发）]：\n'
             has_native_steps = bool(eff_role == 'assistant' and isinstance(msg_item.get('turn_steps'), list) and msg_item.get('turn_steps'))
             if has_native_steps:
                 trace_note = '\n（注：该轮中途被用户打断，后续已转向新指令）' if msg_item.get('stopped_early') else ''

@@ -666,6 +666,7 @@ class MemoryEngine:
         source: str | None = None,
         llm_stream_fn=None,
         on_stream=None,
+        cancel_check=None,
     ) -> dict | None:
         from core.compaction_service import execute_streaming_compaction
         res = await execute_streaming_compaction(
@@ -678,6 +679,7 @@ class MemoryEngine:
             llm_stream_fn=llm_stream_fn,
             silent_complete_fn=silent_complete_fn,
             on_stream=on_stream,
+            cancel_check=cancel_check,
         )
         if isinstance(res, dict) and res.get('compacted') and not res.get('already_compacted'):
             try:

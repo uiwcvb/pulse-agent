@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import re
 from pathlib import Path
@@ -459,11 +460,80 @@ class CloudDesktopControllerMixin:
                         }
                     return {'ok': False, 'op': 'bash', 'error': '云电脑返回无效响应'}
                 return await self._finalize_desktop_result(res, 'bash')
-            if op == 'navigate':
-                return await self._finalize_desktop_result(await self.computer.client.call('POST', '/navigate', body={'url': str(args.get('url') or args.get('target') or args.get('text') or ''), 'include_frame': True}), 'navigate')
-            if op in ('search', 'web_search'):
-                q = str(args.get('query') or args.get('text') or args.get('goal') or args.get('url') or '').strip()
-                return await self._finalize_desktop_result(await self.computer.client.call('POST', '/search', body={'query': q, 'engine': str(args.get('engine') or args.get('target') or 'auto').strip(), 'include_frame': True}), 'search')
+            if op in ('navigate', 'search', 'web_search', 'fetch'):
+                want_frame = bool(args.get('screenshot') or args.get('include_frame'))
+                keep_open = bool(args.get('keep_open') or want_frame)
+                was_browser_open = False
+                if not keep_open:
+                    with contextlib.suppress(Exception):
+                        pre_st = await self.computer.client.status(force=False)
+                        wins = list((pre_st or {}).get('windows') or (pre_st or {}).get('x11_windows') or [])
+                        was_browser_open = bool(
+                            str((pre_st or {}).get('url') or '').strip()
+                            or any(any(bk in str(w).lower() for bk in ('chrom', 'firefox', 'browser', 'edge')) for w in wins)
+                        )
+                try:
+                    if op in ('search', 'web_search'):
+                        q = str(args.get('query') or args.get('text') or args.get('goal') or args.get('url') or '').strip()
+                        raw_res = await self.computer.client.call('POST', '/search', body={'query': q, 'engine': str(args.get('engine') or args.get('target') or 'auto').strip(), 'include_frame': want_frame})
+                        eff_op = 'search'
+                    else:
+                        u = str(args.get('url') or args.get('target') or args.get('text') or '').strip()
+                        raw_res = await self.computer.client.call('POST', '/navigate', body={'url': u, 'include_frame': want_frame})
+                        eff_op = 'navigate'
+                    if want_frame:
+                        return await self._finalize_desktop_result(raw_res, eff_op)
+                    res_d = dict(raw_res) if isinstance(raw_res, dict) else {'ok': False, 'error': '云电脑返回无效响应'}
+                    page_txt = str(res_d.get('page_text') or res_d.get('text') or '').strip()
+                    links = res_d.get('links') or []
+                    if res_d.get('ok', True) and (not page_txt or len(page_txt) < 80):
+                        with contextlib.suppress(Exception):
+                            extract_js = (
+                                "(() => {"
+                                "const txt = (document.body ? document.body.innerText : '').replace(/\\s+\\n/g, '\\n').trim().slice(0, 7500);"
+                                "const links = Array.from(document.querySelectorAll('a[href]')).map(a => ({t: (a.innerText||'').trim().slice(0,80), u: a.href})).filter(x => x.t && /^https?:/.test(x.u)).slice(0, 15);"
+                                "return {title: document.title || '', url: location.href || '', text: txt, links};"
+                                "})()"
+                            )
+                            js_r = await self.computer.client.call('POST', '/input', body={'kind': 'eval_js', 'script': extract_js, 'timeout': 8, 'include_frame': False})
+                            val = js_r.get('value') if isinstance(js_r, dict) else None
+                            if isinstance(val, dict):
+                                if val.get('title') and not res_d.get('title'):
+                                    res_d['title'] = val['title']
+                                if val.get('url') and not res_d.get('url'):
+                                    res_d['url'] = val['url']
+                                if val.get('text'):
+                                    page_txt = str(val['text'])
+                                if val.get('links'):
+                                    links = val['links']
+                    out_fast = {
+                        'ok': bool(res_d.get('ok', not res_d.get('error'))),
+                        'op': eff_op,
+                        'mode': 'fast_text_cdp',
+                        'url': str(res_d.get('url') or ''),
+                        'title': str(res_d.get('title') or ''),
+                        'page_text': page_txt[:7500],
+                        'links': links[:15] if isinstance(links, list) else [],
+                    }
+                    if res_d.get('results'):
+                        out_fast['results'] = res_d['results']
+                    if res_d.get('error'):
+                        out_fast['error'] = res_d['error']
+                    out_fast['browser_released'] = False
+                    return out_fast
+                finally:
+                    if not keep_open:
+                        released = False
+                        with contextlib.suppress(Exception):
+                            if not was_browser_open:
+                                await self.computer.client.call('POST', '/input', body={'kind': 'close_window', 'target': 'browser', 'include_frame': False})
+                                released = True
+                            else:
+                                # Keep user's browser alive, only close transient active tab when opened via fast read
+                                await self.computer.client.call('POST', '/input', body={'kind': 'hotkey', 'key': 'ctrl+w', 'include_frame': False})
+                                released = True
+                        if 'out_fast' in locals() and isinstance(out_fast, dict):
+                            out_fast['browser_released'] = released
             if op in ('launch_app', 'app', 'open_app'):
                 app_name = str(args.get('app') or args.get('target') or args.get('text') or 'browser').strip()
                 return await self._finalize_desktop_result(await self.computer.client.call('POST', '/input', body={'kind': 'launch_app', 'app': app_name, 'text': str(args.get('url') or args.get('text') or ''), 'include_frame': True, 'actor': 'agent'}), 'launch_app')

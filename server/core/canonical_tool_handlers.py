@@ -495,6 +495,8 @@ class CanonicalToolHandlersMixin:
         if op in ('list_pins', 'pins', 'list'):
             return await self._tool_memory_pin({**eff, 'action': 'list'})
         if op in ('conversation', 'conv'):
+            if eff.get('ctx_id'):
+                return await self._tool_ctx_search(eff)
             return await self._tool_conversation_search(eff)
         if op in ('ctx', 'context'):
             return await self._tool_ctx_search(eff)
@@ -642,6 +644,9 @@ class CanonicalToolHandlersMixin:
 
     async def _tool_admin(self, args: dict):
         eff = dict(args or {})
+        nested = eff.pop('params', None)
+        if isinstance(nested, dict):
+            eff = {**nested, **eff}
         op = str(eff.get('op') or 'status').strip().lower()
         if op in ('status', 'doctor', 'context', 'all', 'check', ''):
             return await self._tool_system_status({**eff, 'op': op or 'status'})
@@ -649,6 +654,9 @@ class CanonicalToolHandlersMixin:
             return await self._tool_system_config({**eff, 'action': eff.get('action') or 'status'})
         if op in ('bot', 'manage_bot'):
             return await self._tool_manage_bot({**eff, 'action': eff.get('action') or 'list'})
+        if op in ('memory_ops', 'memory'):
+            mem_op = str(eff.get('action') or eff.get('mem_op') or 'ledger').strip().lower()
+            return await self._tool_memory({**eff, 'op': mem_op})
         if op == 'skill':
             s_act = str(eff.get('action') or 'list_skills').strip().lower()
             s_map = {
@@ -663,15 +671,12 @@ class CanonicalToolHandlersMixin:
             return await self._tool_list_models(eff)
         if op in ('deploy_cloud', 'deploy_cloud_computer'):
             return await self._tool_deploy_cloud_computer(eff)
-        return {'ok': False, 'error': f'未知 admin op: {op}（支持 status/doctor/context/config/bot/skill/custom_tool/models/deploy_cloud）'}
+        return {'ok': False, 'error': f'未知 admin op: {op}，请先 read_file("memory_vault/skills/tool_admin.md") 查看完整用法'}
 
     @staticmethod
     def _fmt_bj(ts: float | None) -> str:
-        if not ts:
-            return ''
-        dt = datetime.fromtimestamp(float(ts), TZ)
-        wk = ('周一', '周二', '周三', '周四', '周五', '周六', '周日')[dt.weekday()]
-        return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} ({wk})"
+        from vault_manager import fmt_compact_ts
+        return fmt_compact_ts(ts, include_time=True)
 
     @staticmethod
     def _parse_wall_time(raw: str, now_ts: float | None = None) -> float:

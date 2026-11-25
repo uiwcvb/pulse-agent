@@ -273,14 +273,21 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                 }
                         ) {
                             val width = constraints.maxWidth.toFloat()
+                            val height = constraints.maxHeight.toFloat().coerceAtLeast(1f)
                             val chatFraction = model.predictiveBack?.let { 1f - it } ?: progress.value
                             val pFraction = panelDragBack?.let { 1f - it } ?: panelProgress.value
 
                             if (pFraction < 0.999f) {
+                                val outerCorner = (26f * pFraction).dp
                                 val outerLayerMod = if (pFraction > 0.001f) {
-                                    Modifier.fillMaxSize().graphicsLayer {
-                                        translationX = -width * 0.24f * pFraction
-                                    }
+                                    Modifier.fillMaxSize()
+                                        .graphicsLayer {
+                                            val sc = 1f - 0.06f * pFraction
+                                            scaleX = sc
+                                            scaleY = sc
+                                            translationY = -height * 0.015f * pFraction
+                                        }
+                                        .clip(RoundedCornerShape(outerCorner))
                                 } else {
                                     Modifier.fillMaxSize()
                                 }
@@ -288,8 +295,11 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                     if (chatFraction < 0.999f) {
                                         val homeLayerMod = if (chatFraction > 0.001f) {
                                             Modifier.fillMaxSize().graphicsLayer {
-                                                translationX = -width * 0.26f * chatFraction
-                                                alpha = (1f - 0.18f * chatFraction).coerceIn(0.75f, 1f)
+                                                val hSc = 1f - 0.16f * chatFraction
+                                                scaleX = hSc
+                                                scaleY = hSc
+                                                translationY = -height * 0.18f * chatFraction
+                                                alpha = (1f - 1.15f * chatFraction).coerceIn(0f, 1f)
                                             }
                                         } else {
                                             Modifier.fillMaxSize()
@@ -302,11 +312,17 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                     }
                                     val bot = model.bot()
                                     if (bot != null && (chatFraction > 0.001f || state.chatOpen)) {
+                                        val chatCorner = (30f * (1f - chatFraction)).dp
                                         val chatLayerMod = if (chatFraction < 0.999f) {
-                                            Modifier.fillMaxSize().graphicsLayer {
-                                                translationX = width * (1f - chatFraction)
-                                                alpha = if (chatFraction <= 0.001f) 0f else 1f
-                                            }
+                                            Modifier.fillMaxSize()
+                                                .graphicsLayer {
+                                                    val cSc = 0.92f + 0.08f * chatFraction
+                                                    scaleX = cSc
+                                                    scaleY = cSc
+                                                    translationY = height * 0.06f * (1f - chatFraction)
+                                                    alpha = (chatFraction * 1.45f).coerceIn(0f, 1f)
+                                                }
+                                                .clip(RoundedCornerShape(chatCorner))
                                         } else {
                                             Modifier.fillMaxSize()
                                         }
@@ -319,18 +335,25 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                     if (pFraction > 0.01f) {
                                         Box(
                                             Modifier.fillMaxSize()
-                                                .background(Color.Black.copy(alpha = 0.28f * pFraction))
+                                                .background(Color.Black.copy(alpha = 0.30f * pFraction))
                                         )
                                     }
                                 }
                             }
 
                             if (shownPanel != null && pFraction > 0.001f) {
+                                val panelCorner = (28f * (1f - pFraction)).dp
                                 val panelLayerMod = if (pFraction < 0.999f) {
-                                    Modifier.fillMaxSize().graphicsLayer {
-                                        translationX = width * (1f - pFraction)
-                                        shadowElevation = 24f * pFraction
-                                    }
+                                    Modifier.fillMaxSize()
+                                        .graphicsLayer {
+                                            val pSc = 0.96f + 0.04f * pFraction
+                                            scaleX = pSc
+                                            scaleY = pSc
+                                            translationX = width * 0.85f * (1f - pFraction)
+                                            translationY = height * 0.04f * (1f - pFraction)
+                                            shadowElevation = 26f * pFraction
+                                        }
+                                        .clip(RoundedCornerShape(panelCorner))
                                 } else {
                                     Modifier.fillMaxSize()
                                 }
@@ -417,223 +440,6 @@ internal fun NativePulseScreen(model: NativePulseModel) {
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-internal fun NativeHome(
-    model: NativePulseModel,
-    modifier: Modifier,
-    phoneState: RootPhoneState,
-    selectedBotId: String? = null
-) {
-    val s = model.ui
-    val c = LocalPulsePalette.current
-    val reduceMotion = rememberReducedMotion()
-    val homeListState = rememberLazyListState()
-    val homeScrolled by remember {
-        derivedStateOf { homeListState.firstVisibleItemIndex > 0 || homeListState.firstVisibleItemScrollOffset > 8 }
-    }
-    val allRows = remember(s.bots, s.query, s.messages, s.workingBot, s.streamBotId, s.busyBot) {
-        model.visibleBots()
-    }
-    val apiReady = s.hasApiKey && s.defaultModel.isNotBlank()
-    val haptics = LocalHapticFeedback.current
-    var showQuickDrawer by rememberSaveable { mutableStateOf(false) }
-    var activeFilter by rememberSaveable { mutableStateOf("all") } // "all" | "unread" | "pinned" | "working"
-
-    val rows = remember(allRows, activeFilter, s.unread, s.workingBot, s.streamBotId) {
-        when (activeFilter) {
-            "unread" -> allRows.filter { b -> s.messages.any { it.botId == b.id && it.id in s.unread } }
-            "pinned" -> allRows.filter { it.pinned || it.id == s.primary }
-            "working" -> allRows.filter { it.id == s.workingBot || it.id == s.streamBotId || it.id == s.busyBot }
-            else -> allRows
-        }
-    }
-
-    val showFilters = s.unread.isNotEmpty() || s.workingBot != null || s.streamBotId != null ||
-        s.query.isNotBlank() || activeFilter != "all" || allRows.size > 5
-
-    Column(
-        modifier
-            .background(c.bg)
-            .pointerInput(Unit) {
-                var accY = 0f
-                detectVerticalDragGestures(
-                    onVerticalDrag = { _, dragAmount -> accY += dragAmount },
-                    onDragEnd = {
-                        if (accY > 64f && !showQuickDrawer) {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            showQuickDrawer = true
-                        } else if (accY < -54f && showQuickDrawer) {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            showQuickDrawer = false
-                        }
-                        accY = 0f
-                    }
-                )
-            }
-    ) {
-        // 1. Clean Apple HIG Navigation Header + Search + Control-Center Quick Hub
-        Surface(
-            color = c.surface.copy(alpha = 0.96f),
-            tonalElevation = 0.dp
-        ) {
-            Column(Modifier.fillMaxWidth()) {
-                AppleHomeHeader(
-                    model = model,
-                    drawerOpen = showQuickDrawer,
-                    onToggleDrawer = { showQuickDrawer = !showQuickDrawer }
-                )
-
-                Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, bottom = 10.dp)) {
-                    AppleSearchField(
-                        query = s.query,
-                        onQueryChange = { model.search(it) }
-                    )
-
-                    AnimatedVisibility(
-                        visible = showFilters,
-                        enter = if (reduceMotion) fadeIn(tween(120)) else expandVertically(iosFluidSpring()) + fadeIn(tween(140)),
-                        exit = if (reduceMotion) fadeOut(tween(100)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(100))
-                    ) {
-                        LazyRow(
-                            Modifier.fillMaxWidth().padding(top = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            val unreadTotal = s.unread.size
-                            val filterItems = listOf(
-                                "all" to "全部",
-                                "unread" to if (unreadTotal > 0) "未读 $unreadTotal" else "未读",
-                                "pinned" to "置顶",
-                                "working" to "运行中"
-                            )
-                            items(filterItems, key = { it.first }) { (key, label) ->
-                                val selected = activeFilter == key
-                                val bgCol by animateColorAsState(
-                                    if (selected) c.accent else c.fill.copy(alpha = 0.72f),
-                                    animationSpec = iosInteractiveSpring(reduceMotion),
-                                    label = "filter_bg"
-                                )
-                                Box(
-                                    Modifier.heightIn(min = 40.dp)
-                                        .iosPressScale(0.95f) {
-                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            activeFilter = key
-                                        },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        label,
-                                        Modifier.clip(CircleShape)
-                                            .background(bgCol)
-                                            .padding(horizontal = 12.dp, vertical = 5.dp),
-                                        color = if (selected) Color.White else c.muted,
-                                        fontSize = 12.5.sp,
-                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                                        style = TextStyle(fontFeatureSettings = "tnum")
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    AppleWorkspaceHub(
-                        visible = showQuickDrawer,
-                        model = model,
-                        phoneState = phoneState,
-                        onDismiss = { showQuickDrawer = false }
-                    )
-                }
-                val homeDivAlpha by animateFloatAsState(
-                    targetValue = if (homeScrolled || showQuickDrawer) 0.55f else 0f,
-                    animationSpec = if (reduceMotion) snap() else tween(160),
-                    label = "home_hdr_div"
-                )
-                HorizontalDivider(color = c.line.copy(alpha = homeDivAlpha), thickness = 0.5.dp)
-            }
-        }
-
-        // 2. Clean Apple Conversation List
-        LazyColumn(
-            Modifier.fillMaxSize().background(c.surface),
-            state = homeListState,
-            contentPadding = PaddingValues(top = 2.dp, bottom = 36.dp)
-        ) {
-            item(key = "active_vd_banner", contentType = "vd_banner") {
-                AppleLiveActivityPill(
-                    visible = phoneState.displayCreated,
-                    displayId = phoneState.displayId,
-                    onExpand = { model.launchFloatingVirtualDisplay() },
-                    onDestroy = { model.destroyVirtualDisplay() }
-                )
-            }
-
-            if (!apiReady) {
-                item(key = "api_banner", contentType = "api_banner") {
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 6.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(c.accent.copy(alpha = 0.10f))
-                            .iosPressScale(0.98f) { model.openSettings() }
-                            .padding(horizontal = 14.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(Modifier.size(7.dp).clip(CircleShape).background(c.accent))
-                        Text(
-                            "前往设置配置 API 与可用模型",
-                            Modifier.weight(1f).padding(start = 10.dp),
-                            color = c.accent,
-                            fontSize = 13.5.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        PulseIcon("next", c.accent, Modifier.size(14.dp))
-                    }
-                }
-            }
-
-            if (rows.isEmpty()) {
-                item(key = "empty_rows", contentType = "empty") {
-                    Column(
-                        Modifier.fillMaxWidth().padding(vertical = 64.dp, horizontal = 24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text("暂无匹配的对话", color = c.ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.2).sp)
-                        Text("可清空搜索关键词或切换筛选", color = c.muted, fontSize = 13.5.sp)
-                    }
-                }
-            } else {
-                items(rows.size, key = { idx -> rows[idx].id }, contentType = { "bot_row" }) { idx ->
-                    val bot = rows[idx]
-                    Column(
-                        Modifier.animateItem(
-                            fadeInSpec = tween(160),
-                            fadeOutSpec = tween(120),
-                            placementSpec = iosPlacementSpring(reduceMotion)
-                        )
-                    ) {
-                        if (idx > 0) {
-                            HorizontalDivider(
-                                Modifier.padding(start = 82.dp),
-                                color = c.line.copy(alpha = 0.52f),
-                                thickness = 0.5.dp
-                            )
-                        }
-                        NativeBotRow(model, bot, isSelected = selectedBotId == bot.id)
-                    }
-                }
-                item(key = "bottom_hairline", contentType = "divider") {
-                    HorizontalDivider(
-                        Modifier.padding(start = 82.dp),
-                        color = c.line.copy(alpha = 0.42f),
-                        thickness = 0.5.dp
-                    )
-                }
-            }
-        }
-    }
-}
-
 @Composable
 internal fun NativeChatRoomViewport(
     model: NativePulseModel,
@@ -642,7 +448,7 @@ internal fun NativeChatRoomViewport(
 ) {
     val s = model.ui
     val c = LocalPulsePalette.current
-    val messages = remember(s.messages, bot.id) { s.messages.filter { it.botId == bot.id } }
+    val messages = remember(s.messages, bot.id) { s.messages.filter { it.botId == bot.id && it.kind != "compact_summary" } }
     val list = rememberLazyListState()
     val chatScope = rememberCoroutineScope()
     var initialScrollDoneForBot by remember(bot.id) { mutableStateOf(false) }

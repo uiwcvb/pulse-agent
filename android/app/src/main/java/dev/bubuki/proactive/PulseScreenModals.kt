@@ -129,7 +129,7 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                             ) {
                                 Text(
                                     if (s.savingSettings) "同步中…" else "保存",
-                                    color = Color.White,
+                                    color = c.userInk,
                                     fontSize = 13.5.sp,
                                     fontWeight = FontWeight.SemiBold)
                             }
@@ -151,10 +151,42 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
         ) {
             when (page) {
                 null -> {
-                    // Level 1: Minimal Grouped Category Rows
+                    // Level 1: Minimal Apple-HIG Grouped Categories (All secondary tools consolidated here)
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("工作台与工具", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 6.dp))
+                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(c.surface)) {
+                            SettingsCategoryRow(
+                                icon = "vault",
+                                title = "向量记忆空间",
+                                subtitle = "长期事实、语义星图与记忆金库",
+                                value = if (s.pinnedMemories.isNotEmpty()) "${s.pinnedMemories.size} 置顶" else ""
+                            ) { model.openVault() }
+                            HorizontalDivider(Modifier.padding(start = 52.dp), color = c.line.copy(alpha = 0.5f), thickness = 0.5.dp)
+                            SettingsCategoryRow(
+                                icon = "cloud",
+                                title = "24/7 云电脑",
+                                subtitle = "远程桌面与公网快读浏览环境",
+                                value = if (s.computerBot != null) "运行中" else "就绪"
+                            ) { model.openCloudDesktop() }
+                            HorizontalDivider(Modifier.padding(start = 52.dp), color = c.line.copy(alpha = 0.5f), thickness = 0.5.dp)
+                            SettingsCategoryRow(
+                                icon = "clock",
+                                title = "定时与日程",
+                                subtitle = "闹钟提醒与周期巡检例程",
+                                value = if (s.routineCount > 0) "${s.routineCount} 项" else ""
+                            ) { model.openSchedules() }
+                            HorizontalDivider(Modifier.padding(start = 52.dp), color = c.line.copy(alpha = 0.5f), thickness = 0.5.dp)
+                            SettingsCategoryRow(
+                                icon = "plus",
+                                title = "新建助手",
+                                subtitle = "创建自定义角色、形状与颜色",
+                                value = "${s.bots.size} 位"
+                            ) { model.openBotEditor(null) }
+                        }
+                    }
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("连接与模型", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 6.dp))
-                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface)) {
+                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(c.surface)) {
                             SettingsCategoryRow(
                                 icon = "cloud",
                                 title = "模型与接口",

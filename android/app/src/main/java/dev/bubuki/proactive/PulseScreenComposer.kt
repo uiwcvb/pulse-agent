@@ -114,13 +114,11 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                     }
                 }
             },
-        color = c.surface.copy(alpha = 0.98f),
+        color = Color.Transparent,
         tonalElevation = 0.dp
     ) {
         Column(Modifier.fillMaxWidth()) {
-            HorizontalDivider(color = c.line.copy(alpha = 0.65f), thickness = 0.5.dp)
-
-            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp)) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
                 // 1. Unified Apple-HIG Attach & Workspace Hub (Single `+` Drawer)
                 AnimatedVisibility(
                     visible = showPlusHub,
@@ -502,119 +500,97 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                     }
                 }
 
-                // 8. Clean Apple-HIG Composer Row: [Unified + Trigger] + [Input Capsule with Sticker Button] + [Morphing Send/Stop Circle]
+                // 8. Apple-HIG Unified Floating Oval Capsule wrapping [+], InputField, and [Send/Stop]
+                val plusActive = showPlusHub || s.menu != null
+                val plusRot by animateFloatAsState(
+                    targetValue = if (showPlusHub) 45f else 0f,
+                    animationSpec = iosInteractiveSpring(reduceMotion),
+                    label = "plus_rot"
+                )
+                val showStopOnly = executing && !hasDraft
+                val buttonEnabled = (!s.uploading && hasDraft) || showStopOnly
+                val btnScale by animateFloatAsState(
+                    targetValue = if (buttonEnabled) 1f else 0.90f,
+                    animationSpec = iosInteractiveSpring(reduceMotion),
+                    label = "send_btn_scale"
+                )
+                val btnColor by animateColorAsState(
+                    targetValue = when {
+                        showStopOnly -> c.warn
+                        buttonEnabled -> c.accent
+                        else -> c.fill
+                    },
+                    animationSpec = if (reduceMotion) snap() else tween(150),
+                    label = "send_btn_color"
+                )
+                val btnGlyphColor = when {
+                    showStopOnly -> Color.White
+                    buttonEnabled -> c.userInk
+                    else -> c.faint
+                }
                 Row(
-                    Modifier.fillMaxWidth(),
+                    Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(28.dp))
+                        .background(c.surface.copy(alpha = 0.96f))
+                        .border(0.6.dp, c.line.copy(alpha = 0.72f), RoundedCornerShape(28.dp))
+                        .padding(horizontal = 6.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.Bottom,
-                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    val plusActive = showPlusHub || s.menu != null
-                    val plusRot by animateFloatAsState(
-                        targetValue = if (showPlusHub) 45f else 0f,
-                        animationSpec = iosInteractiveSpring(reduceMotion),
-                        label = "plus_rot"
-                    )
                     Box(
-                        Modifier.padding(bottom = 1.dp)
-                            .size(40.dp)
+                        Modifier.size(38.dp)
                             .clip(CircleShape)
-                            .background(if (plusActive) c.accent.copy(alpha = 0.16f) else c.fill.copy(alpha = 0.82f))
-                            .iosPressScale(0.92f) {
+                            .background(if (plusActive) c.accent.copy(alpha = 0.14f) else c.fill.copy(alpha = 0.82f))
+                            .iosPressScale(0.90f) {
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 focus.clearFocus()
                                 showStickerDrawer = false
                                 showPlusHub = !showPlusHub
                             }
-                            .semantics { contentDescription = "附件与工作台工具" },
+                            .semantics { contentDescription = "附件与快捷操作" },
                         contentAlignment = Alignment.Center
                     ) {
                         PulseIcon(
                             "plus",
-                            if (plusActive) c.accent else c.muted,
-                            Modifier.size(19.dp).graphicsLayer { rotationZ = plusRot }
+                            if (plusActive) c.accent else c.ink.copy(alpha = 0.78f),
+                            Modifier.size(18.dp).graphicsLayer { rotationZ = plusRot }
                         )
                     }
 
-                    // Center: Telegram Rounded Input Capsule + Embedded Sticker Icon
-                    Row(
-                        Modifier.weight(1f)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(c.fill.copy(alpha = 0.88f))
-                            .border(0.5.dp, c.line.copy(alpha = 0.55f), RoundedCornerShape(20.dp))
-                            .padding(start = 13.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
-                        verticalAlignment = Alignment.Bottom
-                    ) {
-                        BasicTextField(
-                            value = textFieldVal,
-                            onValueChange = { next ->
-                                if (next.text.length <= 12000) {
-                                    textFieldVal = next
-                                    model.setDraft(next.text)
-                                }
-                            },
-                            Modifier.weight(1f)
-                                .heightIn(min = 28.dp, max = 128.dp)
-                                .padding(vertical = 4.dp, horizontal = 2.dp)
-                                .focusRequester(requester)
-                                .semantics { contentDescription = "聊天消息" },
-                            textStyle = TextStyle(color = c.ink, fontSize = 16.sp, lineHeight = 21.sp),
-                            cursorBrush = SolidColor(c.accent),
-                            maxLines = 6,
-                            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                            decorationBox = { inner ->
-                                Box {
-                                    if (s.draft.isEmpty()) Text("消息…", color = c.faint, fontSize = 16.sp, maxLines = 1)
-                                    inner()
-                                }
+                    BasicTextField(
+                        value = textFieldVal,
+                        onValueChange = { next ->
+                            if (next.text.length <= 12000) {
+                                textFieldVal = next
+                                model.setDraft(next.text)
                             }
-                        )
-                        if (enabledPack != null) {
-                            Box(
-                                Modifier.size(34.dp)
-                                    .clip(CircleShape)
-                                    .iosPressScale(0.90f) {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        showStickerDrawer = !showStickerDrawer
-                                    }
-                                    .semantics { contentDescription = "表情贴纸面板" },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                PulseIcon(
-                                    "sticker",
-                                    if (showStickerDrawer) c.accent else c.muted,
-                                    Modifier.size(19.dp)
-                                )
+                        },
+                        Modifier.weight(1f)
+                            .heightIn(min = 38.dp, max = 128.dp)
+                            .padding(vertical = 8.dp, horizontal = 2.dp)
+                            .focusRequester(requester)
+                            .semantics { contentDescription = "聊天消息" },
+                        textStyle = TextStyle(color = c.ink, fontSize = 15.5.sp, lineHeight = 21.sp),
+                        cursorBrush = SolidColor(c.accent),
+                        maxLines = 6,
+                        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                        decorationBox = { inner ->
+                            Box(contentAlignment = Alignment.CenterStart) {
+                                if (s.draft.isEmpty()) Text("给 ${bot.name} 发消息…", color = c.faint, fontSize = 15.5.sp, maxLines = 1)
+                                inner()
                             }
                         }
-                    }
+                    )
 
-                    // Right: Telegram Circular Send / Stop Button with Spring Morph Animation
-                    val showStopOnly = executing && !hasDraft
-                    val buttonEnabled = (!s.uploading && hasDraft) || showStopOnly
-                    val btnScale by animateFloatAsState(
-                        targetValue = if (buttonEnabled) 1f else 0.90f,
-                        animationSpec = iosInteractiveSpring(reduceMotion),
-                        label = "send_btn_scale"
-                    )
-                    val btnColor by animateColorAsState(
-                        targetValue = when {
-                            showStopOnly -> c.warn
-                            buttonEnabled -> c.accent
-                            else -> c.fill
-                        },
-                        animationSpec = if (reduceMotion) snap() else tween(150),
-                        label = "send_btn_color"
-                    )
                     Box(
-                        Modifier.padding(bottom = 1.dp)
-                            .size(40.dp)
+                        Modifier.size(38.dp)
                             .graphicsLayer {
                                 scaleX = btnScale
                                 scaleY = btnScale
                             }
                             .clip(CircleShape)
                             .background(btnColor)
-                            .iosPressScale(0.90f, enabled = buttonEnabled) {
+                            .iosPressScale(0.88f, enabled = buttonEnabled) {
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 if (showStopOnly) model.stop()
                                 else if (s.editingMessage != null) model.editMessageAndResend(s.editingMessage, s.draft)
@@ -629,8 +605,8 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                                 if (reduceMotion) {
                                     fadeIn(tween(100)) togetherWith fadeOut(tween(80))
                                 } else {
-                                    (scaleIn(initialScale = 0.90f, animationSpec = iosInteractiveSpring()) + fadeIn(tween(120))) togetherWith
-                                        (scaleOut(targetScale = 0.90f) + fadeOut(tween(90)))
+                                    (scaleIn(initialScale = 0.86f, animationSpec = iosInteractiveSpring()) + fadeIn(tween(120))) togetherWith
+                                        (scaleOut(targetScale = 0.86f) + fadeOut(tween(90)))
                                 }
                             },
                             label = "send_stop_glyph"
@@ -640,8 +616,8 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                             } else {
                                 PulseIcon(
                                     "send",
-                                    if (buttonEnabled) Color.White else c.faint,
-                                    Modifier.size(17.dp)
+                                    btnGlyphColor,
+                                    Modifier.size(16.dp)
                                 )
                             }
                         }

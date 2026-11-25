@@ -128,14 +128,15 @@ async def try_handle_slash_command(brain, raw_text: str, bot_id: str, src: str, 
         return "\n".join(lines)
 
     if cmd in ("compact", "compack", "summarize"):
-        await brain._set_stream(text="", tool="compact_context", speaker_id=bot_id, speaker_name=bot["name"])
-        lock_ctx = brain.lock if hasattr(brain, "lock") else contextlib.nullcontext()
-        async with lock_ctx:
-            res = await brain._auto_compact_if_needed(bot_id, force=True, source=norm_src)
-        if hasattr(brain, "dsh_adapter"):
-            with contextlib.suppress(Exception):
-                await brain.dsh_adapter.reset_session(bot_id, norm_src)
-        stats = brain.memory_engine.get_context_stats(bot_id, source=norm_src)
+        if hasattr(brain, "run_manual_compaction"):
+            res = await brain.run_manual_compaction(bot_id, source=norm_src)
+        else:
+            lock_ctx = brain.lock if hasattr(brain, "lock") else contextlib.nullcontext()
+            async with lock_ctx:
+                res = await brain._auto_compact_if_needed(bot_id, force=True, source=norm_src, silent=True)
+            if hasattr(brain, "dsh_adapter"):
+                with contextlib.suppress(Exception):
+                    await brain.dsh_adapter.reset_session(bot_id, norm_src)
         await brain.publish({
             "type": "context_compacted",
             "source": norm_src,
@@ -143,25 +144,7 @@ async def try_handle_slash_command(brain, raw_text: str, bot_id: str, src: str, 
             "result": res,
             "context_by_bot": brain.memory_engine.get_all_bots_context_stats(source=norm_src),
         })
-        if isinstance(res, dict) and res.get("already_compacted"):
-            return (
-                f"### 📦 当前上下文已是最新压缩状态 (`/compact`)\n\n"
-                f"- **最近归档笔记**：`{res.get('note_name') or res.get('vault_path') or 'compact_latest.md'}`\n"
-                f"- **说明**：{res.get('message') or '自上次压缩以来新增对话不足 2 条，无需重复压缩。'}"
-            ).strip()
-        if isinstance(res, dict) and res.get("compacted_messages"):
-            return (
-                f"### 📦 上下文压缩完成 (`/compact`)\n\n"
-                f"- **节点与助手**：`{node_label}` · **{bot['name']}**\n"
-                f"- **归档消息数**：`{res.get('compacted_messages')} 条`\n"
-                f"- **Token 变化**：`{res.get('before_tokens', 0):,}` ➔ **`{res.get('after_tokens', 0):,}` tokens** (节省 `~{res.get('saved_tokens', 0):,}` tokens)\n"
-                f"- **记忆库卡片**：`{res.get('vault_path') or '已同步至 SQLite FTS5'}`\n\n"
-                f"{res.get('summary') or ''}"
-            ).strip()
-        return (
-            f"### 📦 上下文已是精简状态 (`/compact`)\n\n"
-            f"- **当前房间 (`{node_label}` · {bot['name']})**：共 `{stats.get('message_count', 0)}` 条消息，估算占用 **`{stats.get('current_tokens', 0):,}` / `{stats.get('threshold_tokens', 200000):,}` tokens**，暂无需压缩归档。"
-        )
+        return ""
 
     if cmd in ("mcp", "mcps", "tools", "skills"):
         ext = brain.harness.extension_registry

@@ -265,14 +265,15 @@ class Harness:
                     name = 'grep_search'
                     if not args.get('query') and args.get('pattern'):
                         args = {**args, 'query': args.get('pattern')}
-            elif name == 'web':
+            elif name in ('web', 'web_search', 'web_fetch'):
                 w_op = str(args.get('op') or args.get('action') or '').strip().lower()
                 if w_op == 'request':
                     return await self.http_request(args)
-                if w_op == 'fetch' or (not w_op and str(args.get('url') or '').strip()):
-                    name = 'web_fetch'
-                else:
-                    name = 'web_search'
+                cloud_cb = self.callbacks.get('cloud') or self.callbacks.get('cloud_desktop')
+                if cloud_cb is not None:
+                    c_op = 'navigate' if (name == 'web_fetch' or w_op == 'fetch' or (not w_op and str(args.get('url') or '').strip())) else 'search'
+                    return await cloud_cb({**args, 'op': c_op, 'screenshot': bool(args.get('screenshot', False))})
+                name = 'web_fetch' if (w_op == 'fetch' or (not w_op and str(args.get('url') or '').strip())) else 'web_search'
             elif name in ('bash', 'run_command'):
                 name = 'run_bash'
             elif name == 'memory':

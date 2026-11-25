@@ -82,11 +82,8 @@ class SchedulerEngine:
 
     @staticmethod
     def fmt_bj(ts: float | None) -> str:
-        if not ts:
-            return ''
-        dt = datetime.fromtimestamp(float(ts), TZ)
-        wk = ('周一', '周二', '周三', '周四', '周五', '周六', '周日')[dt.weekday()]
-        return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} ({wk})"
+        from vault_manager import fmt_compact_ts
+        return fmt_compact_ts(ts, include_time=True)
 
     @staticmethod
     def parse_wall_time(raw: str, now_ts: float | None = None) -> float:

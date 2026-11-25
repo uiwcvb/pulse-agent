@@ -304,7 +304,7 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                                         model.applyContextWindowTokens(tokInt, targetBotId)
                                     }
                                     .padding(vertical = 8.dp),
-                                color = if (selected) Color.White else c.ink,
+                                color = if (selected) c.userInk else c.ink,
                                 fontSize = 11.5.sp,
                                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                                 textAlign = TextAlign.Center,
@@ -324,10 +324,43 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            if (s.compactingContext) "正在浓缩归档对话…" else "立即压缩 ${targetBot.name} 的上下文",
+                            if (s.compactingContext) "正在静默整理上下文…" else "立即静默压缩 ${targetBot.name} 的上下文",
                             color = c.accent,
                             fontSize = 13.5.sp,
                             fontWeight = FontWeight.SemiBold)
+                    }
+                }
+                // 1.5 Pinned Core Memories (Moved from chat top bar into Bot Secondary Page)
+                if (s.pinnedMemories.isNotEmpty()) {
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(c.surface).padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("置顶记忆（${s.pinnedMemories.size}）", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
+                        s.pinnedMemories.forEach { pin ->
+                            val pid = pin.optString("id")
+                            val ptxt = pin.optString("text")
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(c.fill.copy(alpha = 0.55f))
+                                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(ptxt, Modifier.weight(1f), color = c.ink, fontSize = 13.sp, lineHeight = 18.sp)
+                                Text(
+                                    "移除",
+                                    Modifier.padding(start = 8.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(c.surface)
+                                        .iosPressScale(0.94f) { model.removeMemoryPin(pid) }
+                                        .padding(horizontal = 9.dp, vertical = 4.dp),
+                                    color = c.warn,
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
                     }
                 }
                 // 2. Pluggable Sticker Pack Card with Live Thumbnail Strip

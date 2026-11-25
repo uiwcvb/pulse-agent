@@ -1,7 +1,7 @@
-# Proactive Personal Agent · Codebase Map & Variable Registry (`v4.0.39` / Build 127)
+# Proactive Personal Agent · Codebase Map & Variable Registry (`v4.0.46` / Build 134)
 
 > 本文件为全仓单一权威结构图谱 (`scripts/verify_codebase_map.py` 自动化校验 100% 文件覆盖与 0 废弃引用)。
-> 架构已升级为 **Python FastAPI Gateway + 官方 `@deepseek-ai/*` (`0.2.2-rc.1`) Node DSH Brain Sidecar**，全面移除冗余 `Today` 模块并完成默认助手去个性化清理。
+> 架构已升级为 **Python FastAPI Gateway + 官方 `@deepseek-ai/*` (`0.2.2-rc.1`) Node DSH Brain Sidecar** + **14 项精炼正交工具（淘汰 `web` 改由 `cloud` 无图快读+自动释放临时浏览器接管）** + **极简完整时间锚点 (`[26-11-25三22:35]`)** + **全隐藏压缩（主动排队/懒压缩秒停）** + **前后端单调 `client_epoch` 因果栅栏** + **Apple-HIG 黑白大圆角动效优先前端**。
 
 ---
 
@@ -97,7 +97,9 @@ proactive-personal-agent/
 | `DSH_BRAIN_PORT` | `18199` | Node DSH Sidecar 监听端口（严格绑定 `127.0.0.1`） |
 | `DSH_BRAIN_DATA_DIR` | `/opt/proactive-agent/data/dsh_sessions` | DSH `JsonlPersistence` 会话持久化目录 |
 | `DSH_INTERNAL_SECRET` | `hex(32)` / env | Node Sidecar 回调 `POST /internal/dsh/tool` 时校验 `X-Internal-Secret` 密钥 |
-| `CANONICAL_TOOL_NAMES` | **15 tools** (`tuple[str]`) | `read_file, write_file, edit_file, search_files, bash, web, memory, blackboard, schedule, phone, pc, cloud, reply, subtask, admin`（`schedule` 已从 `blackboard` 独立） |
+| `CANONICAL_TOOL_NAMES` | **14 tools** (`tuple[str]`) | `read_file, write_file, edit_file, search_files, bash, memory, blackboard, schedule, phone, pc, cloud, reply, subtask, admin`（`web` 已退役并自动重定向至 `cloud` 无图快读） |
+| `client_epoch` / `max_stop_epoch` | `int` (单调递增因果纪元) | 客户端每条发送/暂停操作递增纪元；前端拦截旧纪元迟到帧防“暂停后回弹加载中”，后端拒绝 `client_epoch <= max_stop_epoch` 的乱序迟到请求 |
+| `fmt_compact_ts` | `str` (`26-11-25三22:35`) | 极简无损时间锚点（含年/月/日/周/时分），固定写于用户消息前缀（0 破 Prefix Cache）与记忆/定时摘要 |
 | `explicit_destroy` | `bool` (`DisplayFrameCodec`) | `FloatingVirtualDisplay` 唯一合法自动销毁信号（聊天停止/暂停阶段绝不关闭悬浮窗） |
 | `dockedAsEdgeBubble` | `bool` (`FloatingVirtualDisplay`) | 顶白条向屏幕左右边缘拖曳松手后进入的 `48dp` 贴边半透明实时预览气泡状态 |
 | `minimizedToPill` | `bool` (`FloatingVirtualDisplay`) | 右下角小方框（`ResizeGripView`）用力向内缩小 `< 0.38f` 后触发的侧边挂起胶囊状态 |
@@ -269,7 +271,8 @@ proactive-personal-agent/
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenChannels.kt` — Multi-API-URL provider channel aggregation section & editor dialog
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenModals.kt` — Action menus & confirmation modals
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenStickers.kt` — Sticker & chat image viewer components
-- `android/app/src/main/java/dev/bubuki/proactive/NativePulseScreen.kt` — Root Compose navigation stage
+- `android/app/src/main/java/dev/bubuki/proactive/NativePulseScreen.kt` — Root Compose navigation stage with fluid spatial transitions & depth-receding secondary panels
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenHomeStage.kt` — Minimalist Apple-HIG Hero Bot Stage (`NativeHome`) with enlarged living blinking avatar, horizontal parallax switcher & shared oval quick composer
 - `android/app/src/main/java/dev/bubuki/proactive/NativePulseIcons.kt` — Custom vector icon set
 - `android/app/src/main/java/dev/bubuki/proactive/BotAvatarView.kt` — Procedural shape bot avatars
 - `android/app/src/main/java/dev/bubuki/proactive/OnboardingApiGate.kt` — First-run zero-server API key gate, pair code gate & non-root Shizuku / Wireless ADB cards

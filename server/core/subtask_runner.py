@@ -52,8 +52,8 @@ _DISALLOWED_SUBTASK_TOOLS = frozenset({
 
 SUBTASK_PRESETS: dict[str, tuple[tuple[str, ...], str]] = {
     'research': (
-        ('read_file', 'search_files', 'web', 'memory'),
-        '你是聚焦调研子单元。优先检索、阅读原文与核对证据，返回结构化事实与来源路径/链接。',
+        ('read_file', 'search_files', 'cloud', 'memory'),
+        '你是聚焦调研子单元。公网检索统一用 cloud(op="search"|"navigate") 无图快读（用完自动释放浏览器），核对原文与证据后返回结构化事实与来源链接。',
     ),
     'code_audit': (
         ('read_file', 'search_files', 'bash'),
