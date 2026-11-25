@@ -250,6 +250,20 @@ class BrainPromptMixin:
             if not isinstance(raw_item, dict):
                 continue
             item = dict(raw_item)
+            if item.get('type') == 'tool' and item.get('tool') == 'reply' and item.get('status') != 'error':
+                t_args = item.get('arguments') if isinstance(item.get('arguments'), dict) else {}
+                if str(t_args.get('op') or t_args.get('action') or '').strip().lower() in ('sticker', 'send_sticker', 'emoji', 'choices', 'present_choices'):
+                    continue
+            if item.get('type') == 'thought':
+                th = str(item.get('text') or '').strip()
+                if not th:
+                    continue
+                if cleaned_items and cleaned_items[-1].get('type') == 'thought':
+                    prev_th = str(cleaned_items[-1].get('text') or '').strip()
+                    if th not in prev_th:
+                        cleaned_items[-1]['text'] = f'{prev_th}\n{th}'.strip()
+                    continue
+                item['text'] = th
             if item.get('type') == 'text':
                 raw_txt = str(item.get('text') or '')
                 txt_clean, _, _, _ = self._extract_all_tags(raw_txt, queue_media=queue_media)

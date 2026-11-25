@@ -109,10 +109,20 @@ class CacheKeepaliveManager:
                         res = await brain._auto_compact_if_needed(bid, force=True, source=src)
                         compacted = bool(isinstance(res, dict) and res.get('compacted'))
                         if compacted:
+                            after_tok = int((res or {}).get('after_tokens') or 0) if isinstance(res, dict) else 0
                             if hasattr(brain, 'last_prompt_tokens') and isinstance(brain.last_prompt_tokens, dict):
-                                brain.last_prompt_tokens[nb_key] = 0
+                                if after_tok > 0:
+                                    brain.last_prompt_tokens[nb_key] = after_tok
+                                    if src == 'phone':
+                                        brain.last_prompt_tokens[bid] = after_tok
+                                elif int(brain.last_prompt_tokens.get(nb_key) or 0) >= prompt_tokens:
+                                    brain.last_prompt_tokens[nb_key] = 0
+                                    if src == 'phone':
+                                        brain.last_prompt_tokens[bid] = 0
+                            if hasattr(brain, 'last_cached_tokens') and isinstance(brain.last_cached_tokens, dict):
+                                brain.last_cached_tokens[nb_key] = 0
                                 if src == 'phone':
-                                    brain.last_prompt_tokens[bid] = 0
+                                    brain.last_cached_tokens[bid] = 0
                             if hasattr(brain, 'dsh_adapter'):
                                 with contextlib.suppress(Exception):
                                     await brain.dsh_adapter.reset_session(bid, src)

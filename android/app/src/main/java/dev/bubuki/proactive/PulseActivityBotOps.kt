@@ -681,7 +681,11 @@ internal fun NativePulseModel.contextStatsFor(botId: String = ui.botId): Triple<
     val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 100000).coerceIn(8000, 1000000)
     val serverTok = ui.contextTokensByBot[botId] ?: 0
     val serverMsgCnt = ui.contextMsgsByBot[botId]
-    val localMsgs by lazy(LazyThreadSafetyMode.NONE) { ui.messages.filter { it.botId == botId } }
+    val localMsgs by lazy(LazyThreadSafetyMode.NONE) {
+        val all = ui.messages.filter { it.botId == botId }
+        val lastComp = all.indexOfLast { it.kind == "compact_summary" }
+        if (lastComp >= 0) all.subList(lastComp, all.size) else all
+    }
     val curTok = if (serverTok > 0) serverTok else 14800 + localMsgs.sumOf { estimateLocalTextTokens(it.text) + 12 }
     val msgCnt = serverMsgCnt ?: localMsgs.size
     return Triple(curTok, thresh, msgCnt)

@@ -589,55 +589,64 @@ class MemoryEngine:
     def get_context_stats(self, bot_id: str = 'companion', sys_tokens: int = 14800, source: str | None = None) -> dict:
         threshold = self.get_threshold_tokens()
         src = normalize_node_source(source) if source else None
+        if src is None:
+            if str(bot_id).startswith('pc_') and int(self.last_prompt_tokens.get(f'pc:{bot_id}', 0) or 0) > 0:
+                src = 'pc'
+            elif int(self.last_prompt_tokens.get(f'phone:{bot_id}', 0) or 0) == 0 and int(self.last_prompt_tokens.get(f'pc:{bot_id}', 0) or 0) > 0:
+                src = 'pc'
         bot_msgs = [
             m for m in self.store.state.get('messages', [])
             if m.get('bot_id', 'companion') == bot_id
             and (src is None or normalize_node_source(m.get('source')) == src)
         ]
         last_comp_idx = -1
+        last_comp_at = 0.0
         for i in range(len(bot_msgs) - 1, -1, -1):
             if bot_msgs[i].get('kind') == 'compact_summary':
                 last_comp_idx = i
+                last_comp_at = float(bot_msgs[i].get('created_at') or 0.0)
                 break
         active_msgs = bot_msgs[last_comp_idx:] if last_comp_idx >= 0 else bot_msgs
         msg_tokens = sum(self.estimate_message_tokens(m) for m in active_msgs)
-        if src == 'pc':
-            nb_key = f'pc:{bot_id}'
-            rep = int(self.last_prompt_tokens.get(nb_key, 0) or 0)
-            cached_tokens = int(self.last_cached_tokens.get(nb_key, 0) or 0)
-            last_m = (self.store.state.get('last_metrics') or {}).get(nb_key) or {}
-        else:
-            nb_key = f'phone:{bot_id}'
+        eff_src = src or 'phone'
+        nb_key = f'{eff_src}:{bot_id}'
+        st_metrics = self.store.state.get('last_metrics') or {}
+        if eff_src == 'phone':
             rep = int(self.last_prompt_tokens.get(nb_key, self.last_prompt_tokens.get(bot_id, 0)) or 0)
             cached_tokens = int(self.last_cached_tokens.get(nb_key, self.last_cached_tokens.get(bot_id, 0)) or 0)
-            st_metrics = self.store.state.get('last_metrics') or {}
             last_m = st_metrics.get(nb_key) or st_metrics.get(bot_id) or {}
-        eff_sys = self._estimate_effective_sys_tokens(bot_id, src or 'phone', fallback=sys_tokens) if sys_tokens == 14800 else sys_tokens
+        else:
+            rep = int(self.last_prompt_tokens.get(nb_key, 0) or 0)
+            cached_tokens = int(self.last_cached_tokens.get(nb_key, 0) or 0)
+            last_m = st_metrics.get(nb_key) or {}
+        if rep <= 0:
+            for m in reversed(active_msgs):
+                if m.get('role') == 'assistant' and m.get('kind') in (None, '', 'chat') and isinstance(m.get('metrics'), dict):
+                    mp = int(m['metrics'].get('prompt_tokens') or 0)
+                    if mp > 0:
+                        rep = mp
+                        cached_tokens = min(int(m['metrics'].get('cached_tokens') or 0), mp)
+                        last_m = last_m or m['metrics']
+                        break
+        eff_sys = self._estimate_effective_sys_tokens(bot_id, eff_src, fallback=sys_tokens) if sys_tokens == 14800 else sys_tokens
         current_tokens = rep if rep > 0 else ((eff_sys + msg_tokens) if active_msgs else eff_sys)
         if cached_tokens > current_tokens:
             cached_tokens = current_tokens
         compacted_blocks = sum(1 for m in bot_msgs if m.get('kind') == 'compact_summary')
         if not last_m:
-            # Fallback to the newest assistant message with metrics for this bot
             for m in reversed(bot_msgs):
                 if m.get('role') == 'assistant' and isinstance(m.get('metrics'), dict):
                     last_m = m['metrics']
                     break
         return {
-            'bot_id': bot_id,
-            'current_tokens': current_tokens,
-            'cached_tokens': cached_tokens,
+            'bot_id': bot_id, 'source': eff_src, 'current_tokens': current_tokens, 'cached_tokens': cached_tokens,
             'cache_hit_ratio': round(cached_tokens / max(1, current_tokens), 4) if current_tokens > 0 else 0.0,
-            'message_tokens': msg_tokens,
-            'reported_tokens': rep,
-            'threshold_tokens': threshold,
-            'message_count': len(bot_msgs),
-            'compacted_count': compacted_blocks,
+            'message_tokens': msg_tokens, 'reported_tokens': rep, 'threshold_tokens': threshold,
+            'message_count': len(bot_msgs), 'compacted_count': compacted_blocks,
+            'last_compaction_at': last_comp_at, 'last_compaction_status': 'ok' if last_comp_at > 0 else 'none',
             'usage_ratio': round(current_tokens / max(1, threshold), 4),
-            'ttft_ms': int(last_m.get('ttft_ms') or 0),
-            'tps': float(last_m.get('tps') or 0.0),
-            'completion_tokens': int(last_m.get('completion_tokens') or 0),
-            'total_ms': int(last_m.get('total_ms') or 0),
+            'ttft_ms': int(last_m.get('ttft_ms') or 0), 'tps': float(last_m.get('tps') or 0.0),
+            'completion_tokens': int(last_m.get('completion_tokens') or 0), 'total_ms': int(last_m.get('total_ms') or 0),
         }
 
     def get_all_bots_context_stats(self, sys_tokens: int = 14800, source: str | None = None) -> dict[str, dict]:

@@ -854,6 +854,7 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
       yield {
         type: 'usage',
         usage: {
+          promptTokens: totalPrompt,
           inputTokens: Math.max(0, totalPrompt - cachedTokens),
           outputTokens,
           ...(lastUsage.total_tokens != null ? { totalTokens: Number(lastUsage.total_tokens) } : {}),

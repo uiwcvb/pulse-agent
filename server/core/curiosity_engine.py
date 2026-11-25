@@ -638,7 +638,12 @@ class CuriosityEngine:
                         await b._poll_and_converge_notifications(timeout=2.5)
                     notif_digest_md = b.notification_hub.build_curiosity_digest(mark_seen=False)
                     raw_imp, missing_imp = b.memory_engine.get_personal_impression()
-                    recent_items = [m for m in self.store.state['messages'] if m.get('bot_id', 'companion') == target_id and normalize_node_source(m.get('source')) == src][-8:]
+                    recent_items = [
+                        m for m in self.store.state['messages']
+                        if m.get('bot_id', 'companion') == target_id
+                        and normalize_node_source(m.get('source')) == src
+                        and m.get('kind') not in ('error', 'notification')
+                    ][-16:]
                     coalesced = self._collect_coalesced_periodic_work(now_ts=now_ts, target_id=target_id)
 
                     plan = self._select_intent(
@@ -672,10 +677,11 @@ class CuriosityEngine:
 
                     recent_digest = [
                         {
+                            'time': b._fmt_bj(float(m.get('created_at') or 0.0)) if m.get('created_at') else '',
                             'role': m.get('role', 'user'),
                             'speaker': '用户' if m.get('role') == 'user' else (m.get('from_bot_name') or bot['name']),
                             'kind': m.get('kind', 'chat'),
-                            'text': (b._get_llm_history_text(m) if m.get('role') == 'assistant' else m.get('text', ''))[:240],
+                            'text': (b._get_llm_history_text(m) if m.get('role') == 'assistant' else m.get('text', ''))[:600],
                         }
                         for m in recent_items
                     ]
@@ -695,23 +701,30 @@ class CuriosityEngine:
                         '- 若没有真正值得告诉用户或温和关心的内容，请立即调用 `reply(op="silent", reason="...", snooze_minutes=0)` 静默结束（或仅输出 `SILENT_OK`），绝不为了凑字数硬聊。\n'
                         '- 若决定开口：控制在 2~4 句，语气真诚自然、不查户口、不复读报错，可按需调用 `reply(op="choices", choices=[...])` 提供贴心选项。\n'
                     )
+                    fact_grounding_rules = (
+                        '\n【实时事实与反幻觉铁律（违反即事故）】：\n'
+                        '1. 下方【近期主对话实录（带精确时间）】是最高权威实时真相；凡主人已在主对话中更正过的账目/域名/地点/计划，一律以主对话最新表述为准，严禁复读旧档案里的过时内容！\n'
+                        '2. 严禁虚构或臆测主人此刻的物理位置、交通工具（如列车/车厢广播/到站提醒）、教室或天气现场旁白；除非最近 2 小时主对话或实时通知里明确写明，否则绝不允许自行编造场景！\n'
+                        '3. 对照当前北京时间，凡日期早于今天的车次、行程、提醒一律视为已过期，禁止当作当前正在发生的事件播报。\n'
+                    )
                     sys_prompt = (
                         b.harness.static_system_instructions(b.memory_engine.build_static_pinned_block()) + '\n\n'
-                        '你的设定：' + b.persona() + '\n\n' + mode_rules
+                        '你的设定：' + b.persona() + '\n\n' + mode_rules + fact_grounding_rules
                     )
                     user_trigger = (
                         '当前时间：' + b._fmt_bj(now_ts) + ' (' + now_iso() + ')\n'
                         + intent_directive + '\n\n'
+                        + '【近期主对话实录（最高优先级实时事实，必须先读再开口，严禁与其中最新更正冲突）】：\n'
+                        + json.dumps(recent_digest, ensure_ascii=False) + '\n\n'
                         + (periodic_awareness + '\n\n' if periodic_awareness else '')
                         + (deltas_block + '\n\n' if deltas_block else '')
                         + '【手机通知栏积攒摘要】：\n' + notif_digest_md + '\n\n'
-                        + '个人印象档案：\n' + raw_imp[:1800] + '\n\n'
+                        + '个人印象档案（历史参考，若与上方主对话冲突以主对话为准）：\n' + raw_imp[:1800] + '\n\n'
                         + '尚未了解的个人印象维度：' + missing_hint + '\n\n'
                         + '课表：\n' + (schedule_md or '（未记录）') + '\n\n'
-                        + '待确认截止事项：\n' + deadlines + '\n\n'
+                        + '待确认截止事项（仅参考未过期条目）：\n' + deadlines + '\n\n'
                         + '常驻例行：\n' + routines_md + '\n\n'
-                        + '待办机会池：\n' + opps + '\n\n'
-                        + '最近对话摘要（仅用于防重复，严禁顺着里面的闲聊或报错继续尬聊）：\n' + json.dumps(recent_digest, ensure_ascii=False)
+                        + '待办机会池：\n' + opps
                     )
 
                     messages: list[dict[str, Any]] = [

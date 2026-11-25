@@ -586,6 +586,24 @@ def test_memory_vector_space_projection_probe_and_sleep_consolidate_sync(tmp_pat
     synced = tables.query_facts(query='脱敏')
     assert synced and any('脱敏' in r['value'] for r in synced)
 
+    # 4. Token stats never cross-wire pc_* bots to phone:0 and sanitize merges sticker-split thoughts
+    me.last_prompt_tokens['pc:pc_engineer'] = 196454
+    me.last_cached_tokens['pc:pc_engineer'] = 195000
+    pc_st = me.get_context_stats('pc_engineer')
+    assert pc_st['current_tokens'] == 196454 and pc_st['source'] == 'pc'
+
+    from core.brain_prompt_mixin import BrainPromptMixin
+    dummy = SimpleNamespace(_extract_all_tags=lambda s, queue_media=False: (s, [], '', ''), strip_trailing_partial_control_tag=lambda s: s)
+    sanitized = BrainPromptMixin._sanitize_timeline_entries(dummy, [
+        {'type': 'thought', 'text': '先发个贴纸卖个萌'},
+        {'type': 'tool', 'tool': 'reply', 'arguments': {'op': 'sticker', 'code': 'cat_hi'}, 'status': 'done'},
+        {'type': 'thought', 'text': '再回答主人的问题'},
+        {'type': 'text', 'text': '主人好呀喵'},
+    ])
+    thoughts = [x for x in sanitized if x.get('type') == 'thought']
+    assert len(thoughts) == 1 and '先发个贴纸卖个萌' in thoughts[0]['text'] and '再回答主人的问题' in thoughts[0]['text']
+    assert not any(x.get('type') == 'tool' for x in sanitized)
+
     tables.close()
     cs.close()
     store.close()

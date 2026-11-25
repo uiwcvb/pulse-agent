@@ -445,7 +445,7 @@ class CloudDesktopControllerMixin:
                 want_frame = bool(args.get('screenshot') or args.get('include_frame'))
                 if args.get('lean') is True:
                     want_frame = False
-                timeout_s = max(5, min(90, int(args.get('timeout') or 25)))
+                timeout_s = max(5, min(600, int(args.get('timeout') or 30)))
                 res = await self.computer.client.call('POST', '/input', body={'kind': 'bash', 'command': cmd, 'is_input': is_input, 'timeout': timeout_s, 'include_frame': want_frame})
                 if isinstance(res, dict) and (res.get('timed_out') or (res.get('exit_code') is not None and int(res['exit_code']) != 0)):
                     res['ok'] = False

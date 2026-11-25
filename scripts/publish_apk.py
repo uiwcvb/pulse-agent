@@ -21,9 +21,9 @@ ver_name = re.search(r"versionName\s+'([^']+)'", gradle_txt).group(1)
 ver_code = int(re.search(r"versionCode\s+(\d+)", gradle_txt).group(1))
 notes = (
     f"v{ver_name} (Build {ver_code}): "
-    "1) 全新「向量记忆空间」交互画布：基于真实 512 维向量 2D PCA 语义投影、余弦相似度稀疏连线、关键词簇联动高亮与实时搜索向量探针，支持事实在线编辑/彻底硬删除、一键整理与时光机回滚（保留原始 Markdown 兜底入口）；"
-    "2) 后台闲置记忆提炼改为默认 8 分钟（480s，设置页可调，错开 9 分钟空闲热压缩），修正过时 45 秒文案，并接通增量写入新 5+1 事实表与向量索引；"
-    "3) 同步公开正式版 Release（含免 Root Shizuku / 无线 ADB 三引擎与 v4.0.42 1:1 子任务对话页）。"
+    "1) 全链路校准 Token 计数：Sidecar 显式透传真实 promptTokens，修复空闲热压缩清零、pc_* 节点串台与主动关心小会话覆盖主对话计数问题，客户端本地估算按最新压缩点截断；"
+    "2) 修复 BUG-2026-11-25-01：主动关心注入带北京时间戳的最近 16 条主对话作为最高权威事实源，严禁编造当下现场位置/车厢旁白及复读过期旧账；"
+    "3) 修复 BUG-2026-11-23-07（贴纸开头多段 thinking 自动合并去重）与云桌面命令 600s 超时兜底。"
 )
 release_meta = {
     'version': ver_name,

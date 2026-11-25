@@ -813,8 +813,8 @@ class DshBrainAdapter:
                                     )
                                 elif et == 'usage' and isinstance(evt.get('usage'), dict):
                                     u = evt['usage']
-                                    in_t = int(u.get('inputTokens') or 0) + int(u.get('cacheReadTokens') or 0)
                                     c_t = int(u.get('cacheReadTokens') or 0)
+                                    in_t = int(u.get('promptTokens') or 0) or (int(u.get('inputTokens') or 0) + c_t)
                                     out_t = int(u.get('outputTokens') or 0)
                                     if out_t > 0:
                                         total_out_tokens += out_t

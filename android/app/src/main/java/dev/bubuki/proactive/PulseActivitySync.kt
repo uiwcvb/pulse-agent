@@ -449,10 +449,11 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                 val sameOrMatchingTurn = turnId.isBlank() || currentTurnId.isBlank() || turnId == currentTurnId || currentTurnId.startsWith("pending-") || msg.kind == "stopped" || msg.kind == "bot_reply"
                 val finishedStreamHere = isFinalAssistantMsg && (ui.streamBotId == msg.botId || ui.workingBot == msg.botId || sendGuardBotId == msg.botId || ui.busyBot == msg.botId) &&
                     sameOrMatchingTurn
-                val updatedTokensByBot = if (msg.role == "assistant" && msg.promptTokens > 0) {
+                val isMainChatMetrics = msg.role == "assistant" && !msg.isSubTurn && msg.kind in setOf("", "chat") && msg.promptTokens > 0
+                val updatedTokensByBot = if (isMainChatMetrics) {
                     ui.contextTokensByBot + (msg.botId to msg.promptTokens)
                 } else ui.contextTokensByBot
-                val updatedCachedByBot = if (msg.role == "assistant" && msg.promptTokens > 0) {
+                val updatedCachedByBot = if (isMainChatMetrics) {
                     ui.contextCachedByBot + (msg.botId to msg.cachedTokens)
                 } else ui.contextCachedByBot
                 val updatedTtftByBot = if (msg.role == "assistant" && msg.ttftMs > 0) {
