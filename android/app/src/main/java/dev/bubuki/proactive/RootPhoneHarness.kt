@@ -17,25 +17,6 @@ import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
-internal data class PhoneApp(val name: String, val component: String)
-internal data class RootPhoneState(
-    val root: Boolean = false, val privileged: Boolean = false, val privilegeMode: String = "none", val uid: Int = -1,
-    val sdk: Int = Build.VERSION.SDK_INT, val display: String = "{}", val image: String = "",
-    val phase: String = "idle", val botId: String? = null, val goal: String = "", val result: String = "", val error: String = "",
-    val trace: String = "[]", val messages: List<PulseMessage> = emptyList(), val apps: List<PhoneApp> = emptyList(), val model: String = "",
-    val modelReady: Boolean = false, val imageInfo: String = "{}", val notifications: Boolean = false,
-    val overlay: Boolean = false, val listener: Boolean = false, val background: Boolean = false,
-    val lastTouchX: Int = -1, val lastTouchY: Int = -1, val lastTouchTime: Long = 0L,
-    val lastTreeSummary: String = ""
-) {
-    val active: Boolean get() = phase in listOf("running", "waiting_user")
-    val displayCreated: Boolean get() = runCatching { JSONObject(display).optBoolean("created") }.getOrDefault(false)
-    val displayId: Int get() = runCatching { JSONObject(display).let { it.optInt("displayId", it.optInt("display_id", -1)) } }.getOrDefault(-1)
-    val currentPackage: String?
-        get() = PulseAccessibilityService.getCachedSnapshot(displayId)?.activePackage?.takeIf { it.isNotBlank() }
-            ?: runCatching { JSONObject(display).optString("package", "").takeIf { it.isNotBlank() } }.getOrNull()
-}
-
 /**
  * [Module] RootPhoneHarness
  * [Responsibility] Root virtual display workspace state machine, lifecycle & power management
@@ -55,7 +36,7 @@ object RootPhoneHarness {
     internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     internal val state = MutableStateFlow(RootPhoneState())
     internal val changes: StateFlow<RootPhoneState> = state.asStateFlow()
-    private var context: Context? = null
+    internal var context: Context? = null
     internal var privilege: PrivilegeManager? = null
     private var initialized = false
     internal var job: Job? = null
@@ -65,6 +46,8 @@ object RootPhoneHarness {
     internal var lastPreviewSequence: Long = -1L
     @Volatile internal var lastActivityElapsed: Long = SystemClock.elapsedRealtime()
     @Volatile internal var lastLiveTouchElapsed: Long = 0L
+    @Volatile internal var lastControlCommandElapsed: Long = 0L
+    @Volatile internal var lastDaemonPokeElapsed: Long = 0L
     private val liveTouchExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "pulse-live-touch").apply { priority = Thread.MAX_PRIORITY; isDaemon = true }
     }
@@ -73,8 +56,6 @@ object RootPhoneHarness {
     private var screenWakeLock: PowerManager.WakeLock? = null
     private val setupLock = Any()
     private val displayLifecycleLock = Any()
-    private const val DESTROYED_DISPLAY_JSON =
-        "{\"created\":false,\"display_active\":false,\"allocated\":false,\"released\":true,\"destroyed\":true,\"explicit_destroy\":true,\"displayId\":-1,\"display_id\":-1}"
     internal val loaded = CompletableDeferred<Unit>()
     internal val submitLock = Mutex()
 
@@ -187,27 +168,46 @@ object RootPhoneHarness {
             }
             initialized = true
         }
+        runCatching {
+            ShizukuController.get(base.applicationContext).setOnPermissionGrantedListener {
+                val cur = state.value
+                if (cur.privileged || cur.root) return@setOnPermissionGrantedListener
+                scope.launch(Dispatchers.IO) {
+                    runCatching { command(base.applicationContext, JSONObject().put("op", "connect")) }
+                }
+            }
+        }
         scope.launch {
             try {
-                val saved = SecurePrefs.read(context!!)
-                val history = saved.optJSONArray("phoneHistory")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }.orEmpty()
+                val baseCtx = context!!
+                isScreenInteractiveNow(baseCtx)
+                val saved = SecurePrefs.read(baseCtx)
+                val phoneSaved = SecurePrefs.readPhoneHistory(baseCtx)
+                val history = phoneSaved.optJSONArray("phoneHistory")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }.orEmpty()
                 val config = modelConfig(saved)
                 val initialSt = runCatching {
                     val st = privilege!!.status()
                     if (st.optBoolean("privileged", st.optBoolean("root"))) st else privilege!!.probe()
                 }.getOrNull()
+                val existingLiveDisplay = if (initialSt?.optBoolean("privileged", initialSt.optBoolean("root")) == true) {
+                    runCatching {
+                        val d = privilege!!.execute(JSONObject().put("op", "status"))
+                        if (d.optBoolean("created", false) && d.optInt("displayId", -1) > 0) shallowCopyWithoutImage(d).toString() else null
+                    }.getOrNull()
+                } else null
                 state.update {
                     it.copy(
                         root = initialSt?.optBoolean("root") == true,
                         privileged = initialSt?.optBoolean("privileged", initialSt.optBoolean("root")) == true,
                         privilegeMode = initialSt?.optString("privilege_mode", "none") ?: "none",
                         uid = initialSt?.optInt("uid", -1) ?: -1,
+                        display = existingLiveDisplay ?: it.display,
                         messages = history,
                         model = config.optString("model"),
                         modelReady = ready(config)
                     )
                 }
-                val interrupted = saved.optJSONObject("phoneTask")
+                val interrupted = phoneSaved.optJSONObject("phoneTask")
                 if (interrupted?.optString("phase") in listOf("running", "waiting_user", "stopping")) {
                     val bot = interrupted!!.optString("botId", "companion")
                     append(message(bot, "assistant", "上次手机任务已中断，工作区不会自动重启。查看记录后可以重新开始。", "phone_stopped"))
@@ -229,19 +229,27 @@ object RootPhoneHarness {
     }
     internal fun ready(config: JSONObject) = config.optString("api_key").isNotBlank() && config.optString("model").isNotBlank() && config.optString("base_url").isNotBlank()
 
-    private fun acquireKeepAwake(base: Context) {
+    internal fun acquireKeepAwake(base: Context) {
         runCatching {
             synchronized(setupLock) {
                 val wl = screenWakeLock ?: base.applicationContext.getSystemService(PowerManager::class.java)
                     .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Pulse:VirtualDisplayCpu")
                     .apply { setReferenceCounted(false) }
                     .also { screenWakeLock = it }
-                wl.acquire(35_000L)
+                wl.acquire(95_000L)
             }
         }
     }
 
-    private fun releaseKeepAwake() {
+    internal fun shouldKeepScreenOn(overlayExpanded: Boolean): Boolean {
+        val liveInteractive = context?.let { isScreenInteractiveNow(it) } ?: screenInteractive
+        return shouldKeepScreenOnDuringControl(
+            liveInteractive, state.value.displayCreated, state.value.active,
+            if (lastControlCommandElapsed == 0L) Long.MAX_VALUE else (SystemClock.elapsedRealtime() - lastControlCommandElapsed), overlayExpanded
+        )
+    }
+
+    internal fun releaseKeepAwake() {
         runCatching {
             synchronized(setupLock) {
                 screenWakeLock?.let { if (it.isHeld) it.release() }
@@ -260,7 +268,9 @@ object RootPhoneHarness {
         screenInteractive = interactive
         autoReleaseJob?.cancel()
         if (!interactive) {
+            lastControlCommandElapsed = 0L
             releaseKeepAwake()
+            FloatingVirtualDisplay.syncKeepScreenOn(base.applicationContext)
             if (!state.value.active) stopLivePreview()
             return
         }
@@ -280,7 +290,7 @@ object RootPhoneHarness {
 
     @JvmStatic fun onPreviewVisibilityChanged(base: Context) {
         val appCtx = base.applicationContext
-        if (screenInteractive && FloatingVirtualDisplay.isAnyPreviewShowing()) {
+        if (isScreenInteractiveNow(appCtx) && FloatingVirtualDisplay.isAnyPreviewShowing()) {
             val cur = state.value
             val curDisp = runCatching { JSONObject(cur.display).optInt("displayId", -1) }.getOrDefault(-1)
             if (cur.displayCreated || curDisp > 0) {
@@ -308,7 +318,7 @@ object RootPhoneHarness {
         runCatching {
             synchronized(setupLock) {
                 val wl = screenWakeLock
-                if (wl != null && wl.isHeld) wl.acquire(35_000L)
+                if (wl != null && wl.isHeld) wl.acquire(95_000L)
             }
         }
     }
@@ -318,7 +328,9 @@ object RootPhoneHarness {
         val now = SystemClock.elapsedRealtime()
         lastActivityElapsed = now
         lastLiveTouchElapsed = now
+        lastControlCommandElapsed = now
         autoReleaseJob?.cancel()
+        syncControlScreenKeepOn(base.applicationContext, pokeDaemon = !FloatingVirtualDisplay.overlayVisible.value)
         startLivePreview(base.applicationContext)
         if (action == "down") {
             val nowWall = System.currentTimeMillis()
@@ -344,7 +356,8 @@ object RootPhoneHarness {
                 delay(5000L)
                 val cur = state.value
                 val disp = runCatching { JSONObject(cur.display) }.getOrNull()
-                if (disp == null || (!disp.optBoolean("created") && !disp.optBoolean("allocated"))) break
+                if (disp == null || (!disp.optBoolean("created") && !disp.optBoolean("allocated"))) { FloatingVirtualDisplay.syncKeepScreenOn(appContext); break }
+                syncControlScreenKeepOn(appContext, pokeDaemon = !FloatingVirtualDisplay.overlayVisible.value)
                 if (cur.active || !screenInteractive) {
                     lastActivityElapsed = SystemClock.elapsedRealtime()
                     continue
@@ -360,6 +373,9 @@ object RootPhoneHarness {
         var status = privilege!!.status()
         if (!status.optBoolean("privileged", status.optBoolean("root"))) {
             status = runCatching { privilege!!.probe() }.getOrDefault(status)
+        }
+        if (status.optBoolean("privileged", status.optBoolean("root")) && !PulseAccessibilityService.isConnected()) {
+            privilege?.ensureAccessibilityBoundAsync()
         }
         val saved = SecurePrefs.readFast(base); val config = modelConfig(saved)
         state.update {
@@ -388,7 +404,7 @@ object RootPhoneHarness {
 
     @JvmStatic fun history(base: Context): JSONObject {
         initialize(base)
-        return JSONObject().put("messages", JSONArray(state.value.messages.map(::json))).put("status", status(base))
+        return JSONObject().put("messages", JSONArray(state.value.messages.map(::pulseMessageToJson))).put("status", status(base))
     }
 
     /** Called on IO threads by the UI, cloud bridge, or tool loop. */
@@ -403,13 +419,19 @@ object RootPhoneHarness {
             "click_node" -> "tap_node"
             "input_node", "set_text" -> "type_node"
             "type" -> if (input.has("ref") || input.has("target") || input.has("id") || input.has("resource_id")) "type_node" else "text"
+            "back", "go_back", "navigate_back" -> { input.put("key", "back"); "key" }
+            "home", "go_home" -> { input.put("key", "home"); "key" }
+            "enter", "submit_key" -> { input.put("key", "enter"); "key" }
+            "keyevent", "key_event", "press", "press_key", "send_key" -> "key"
+            "app", "open_app", "start_app", "launch_app" -> "launch"
+            "state" -> "status"
             "exec", "cmd", "bash" -> "shell"
             "phone_info", "battery" -> "device_info"
             "files" -> "list_files"
             "open_url" -> "open_uri"
             "wait", "sleep" -> "delay"
             "get_notifications", "recent_notifications", "notifs", "notification" -> "notifications"
-            "read_otp", "otp", "sms_code" -> "read_otp"
+            "read_otp", "otp", "sms_code", "sms", "read_sms", "get_sms" -> "read_otp"
             "get_clipboard", "read_clipboard" -> "clipboard_get"
             "set_clipboard", "write_clipboard" -> "clipboard_set"
             else -> rawOp
@@ -472,7 +494,7 @@ object RootPhoneHarness {
                 val shouldDestroy = !keepAlive || input.optBoolean("user_close", false) || input.optBoolean("destroy", false) || input.optBoolean("manual", false)
                 val curDisp = runCatching { JSONObject(state.value.display).optInt("displayId", -1) }.getOrDefault(-1)
                 if (!shouldDestroy) {
-                    releaseKeepAwake()
+                    lastControlCommandElapsed = 0L; releaseKeepAwake(); FloatingVirtualDisplay.syncKeepScreenOn(base.applicationContext)
                     if (state.value.displayCreated || curDisp > 0) {
                         startLivePreview(base.applicationContext)
                     }
@@ -503,6 +525,10 @@ object RootPhoneHarness {
         }
         if (operation != "preview" && operation != "status" && operation != "release") {
             touchActivity()
+            if (operation !in setOf("auto_release", "apps", "connect")) {
+                lastControlCommandElapsed = SystemClock.elapsedRealtime()
+                if (screenInteractive) syncControlScreenKeepOn(base.applicationContext, pokeDaemon = true)
+            }
         }
         if (operation == "connect") {
             val status = privilege!!.probe()
@@ -516,7 +542,7 @@ object RootPhoneHarness {
                     error = ""
                 )
             }
-            if (!privOk) throw Exception(status.optString("diag").ifBlank { "尚未取得 Root 或无线 ADB 授权，请在手机端允许后重试" })
+            if (!privOk) throw Exception(status.optString("diag").ifBlank { "尚未取得 Root、Shizuku 或无线 ADB 授权，请在手机端允许后重试" })
             return status(base)
         }
         if (operation == "status") return status(base)
@@ -541,25 +567,36 @@ object RootPhoneHarness {
                     uid = probed.optInt("uid", -1)
                 )
             }
-            if (!privOk) throw Exception(probed.optString("diag").ifBlank { "尚未取得 Root 或无线 ADB 授权，请在设置中连接" })
+            if (!privOk) throw Exception(probed.optString("diag").ifBlank { "尚未取得 Root、Shizuku 或无线 ADB 授权，请在设置中连接" })
         }
 
         var currentDisplay = JSONObject(state.value.display).let {
             if (it.optBoolean("created", false)) it.optInt("displayId", -1) else -1
         }
         if (operation == "create") {
+            val explicitGeom = input.has("width") || input.has("height") || input.has("dpi")
             val res = synchronized(displayLifecycleLock) {
                 if (!input.optBoolean("recreate", false)) {
                     val liveStatus = runCatching { privilege!!.execute(JSONObject().put("op", "status")) }.getOrNull()
-                    if (liveStatus != null && !liveStatus.optBoolean("created", false) && currentDisplay > 0) {
-                        currentDisplay = -1
+                    if (liveStatus != null && liveStatus.optBoolean("created", false) && liveStatus.optInt("displayId", -1) > 0 && !explicitGeom) {
+                        liveStatus.put("newly_created", false).put("reused_display", true)
+                    } else {
+                        if (liveStatus != null && !liveStatus.optBoolean("created", false) && currentDisplay > 0) {
+                            currentDisplay = -1
+                        }
+                        privilege!!.execute(
+                            JSONObject(input.toString())
+                                .put("op", "create")
+                                .apply { remove("manual") }
+                        )
                     }
+                } else {
+                    privilege!!.execute(
+                        JSONObject(input.toString())
+                            .put("op", "create")
+                            .apply { remove("manual") }
+                    )
                 }
-                privilege!!.execute(
-                    JSONObject(input.toString())
-                        .put("op", "create")
-                        .apply { remove("manual") }
-                )
             }
             val uid = res.optInt("uid", -1)
             if (uid != 0 && uid != 2000) throw Exception("拒绝无特权的手机执行结果 (uid=$uid)")
@@ -593,7 +630,7 @@ object RootPhoneHarness {
         if (!input.optBoolean("manual", false) && operation in interactiveVdOps) {
             val pm = runCatching { base.getSystemService(PowerManager::class.java) }.getOrNull()
             val km = runCatching { base.getSystemService(android.app.KeyguardManager::class.java) }.getOrNull()
-            val offOrLocked = !screenInteractive || (pm != null && !pm.isInteractive) || (km != null && km.isDeviceLocked)
+            val offOrLocked = !isScreenInteractiveNow(base) || (pm != null && !pm.isInteractive) || (km != null && km.isDeviceLocked)
             if (offOrLocked) {
                 return JSONObject()
                     .put("uid", 0)
@@ -638,6 +675,7 @@ object RootPhoneHarness {
             if (input.has("ref") || input.has("target") || input.has("id") || input.has("resource_id")) {
                 return executeTypeNodeAction(input, currentDisplay, dispW, dispH)
             }
+            if (currentDisplay <= 0) throw Exception("虚拟屏尚未启动任何应用 (display_not_created)，请先调用 launch 打开目标应用")
             val txt = input.optString("text", input.optString("value", ""))
             val clear = input.optBoolean("clear", false)
             if (!clear && txt.isEmpty()) {
@@ -683,7 +721,7 @@ object RootPhoneHarness {
             if (resolved.isBlank()) throw Exception("未找到要打开的应用，请先选择或指定有效的包名/组件")
             command.put("component", resolved)
             if (currentDisplay <= 0) {
-                val created = command(base, JSONObject().put("op", "create").put("skip_home", false))
+                val created = command(base, JSONObject().put("op", "create").put("skip_home", true))
                 currentDisplay = created.optInt("displayId", -1)
                 dispInfo = JSONObject(state.value.display.ifBlank { state.value.imageInfo })
                 dispW = dispInfo.optInt("width", 1472).coerceAtLeast(1)
@@ -695,8 +733,12 @@ object RootPhoneHarness {
             val uri = command.optString("uri", command.optString("url", command.optString("text", ""))).trim()
             if (uri.isEmpty()) throw Exception("请提供要打开的 URI/URL")
             if (currentDisplay <= 0) {
-                val created = command(base, JSONObject().put("op", "create").put("skip_home", false))
+                val created = command(base, JSONObject().put("op", "create").put("skip_home", true))
                 currentDisplay = created.optInt("displayId", -1)
+                dispInfo = JSONObject(state.value.display.ifBlank { state.value.imageInfo })
+                dispW = dispInfo.optInt("width", 1472).coerceAtLeast(1)
+                dispH = dispInfo.optInt("height", 3232).coerceAtLeast(1)
+                dispDpi = dispInfo.optInt("densityDpi", 480).coerceAtLeast(160)
             }
             lastCaptureRotation = null
         } else if (operation in listOf("create", "release")) {
@@ -777,9 +819,8 @@ object RootPhoneHarness {
                     .put("layout_signature", launchTree.optString("layout_signature", ""))
                     .put("ui_tree", summary)
             } else if ((operation == "launch" || operation == "open_uri") && currentDisplay > 0 && skipTree) {
-                try { Thread.sleep(320L) } catch (ignored: InterruptedException) {}
-                val pkg = runCatching { DisplayInputHelper.topPackageOnDisplay(currentDisplay) }.getOrDefault("")
-                result.put("launched", pkg.isNotBlank()).put("package", pkg.ifBlank { "unknown" })
+                val pkg = result.optString("package", "").trim()
+                result.put("launched", pkg.isNotBlank() && pkg != "unknown").put("package", pkg.ifBlank { "unknown" })
             } else if (operation == "capture" && currentDisplay > 0 && input.optBoolean("include_tree", false) && !input.optBoolean("manual", false)) {
                 val afterTree = readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true, waitMs = 280L)
                 val summary = afterTree.optString("summary", "")
@@ -887,7 +928,7 @@ object RootPhoneHarness {
                     privileged = privilege?.isPrivilegedReady() == true,
                     privilegeMode = privilege?.getPrivilegeMode() ?: "none",
                     uid = privilege?.getGrantedUid() ?: -1,
-                    error = MainActivity.safeError(error)
+                    error = PulseErrors.safeError(error)
                 )
             }
             throw error
@@ -896,11 +937,13 @@ object RootPhoneHarness {
 
     internal fun markDisplayDestroyed(base: Context, alreadyReleased: Boolean = false): JSONObject {
         val appCtx = base.applicationContext
+        val oldDisplayId = state.value.displayId
         autoReleaseJob?.cancel()
         idleWatchJob?.cancel()
         stopLivePreview()
-        releaseKeepAwake()
+        lastControlCommandElapsed = 0L; releaseKeepAwake(); FloatingVirtualDisplay.syncKeepScreenOn(appCtx)
         lastCaptureRotation = null
+        if (oldDisplayId > 0) PulseAccessibilityService.clearSnapshot(oldDisplayId)
         state.update {
             it.copy(
                 root = privilege?.isRootGrantedFast() == true,
@@ -948,29 +991,4 @@ object RootPhoneHarness {
     @JvmStatic @JvmOverloads fun stop(base: Context, closeDisplay: Boolean = false) = stopTaskImpl(base, closeDisplay)
 
     @JvmStatic fun resume(base: Context) = resumeTaskImpl(base)
-
-    internal fun message(bot: String, role: String, text: String, kind: String, trace: String = "[]") =
-        PulseMessage("phone-" + UUID.randomUUID(), bot, role, text, kind, "root-phone", System.currentTimeMillis() / 1000.0, "", trace)
-    internal fun append(message: PulseMessage) {
-        state.update { cur ->
-            val cleanTxt = message.text.trim()
-            val lastSameBot = cur.messages.lastOrNull { it.botId == message.botId && it.role == message.role }
-            if (lastSameBot != null && lastSameBot.text.trim() == cleanTxt && kotlin.math.abs(message.created - lastSameBot.created) < 30.0) {
-                cur
-            } else {
-                cur.copy(messages = (cur.messages + message).takeLast(600))
-            }
-        }
-        broadcast()
-    }
-    private fun json(message: PulseMessage) = JSONObject().put("id", message.id).put("bot_id", message.botId).put("role", message.role).put("text", message.text).put("kind", message.kind).put("engine", message.engine).put("created_at", message.created).put("decision", message.decision).put("trace", JSONArray(message.trace))
-    internal fun persist() {
-        val base = context ?: return; val snapshot = state.value
-        synchronized(SecurePrefs::class.java) {
-            val current = SecurePrefs.read(base)
-            current.put("phoneHistory", JSONArray(snapshot.messages.map(::json))).put("phoneTask", JSONObject().put("phase", snapshot.phase).put("botId", snapshot.botId).put("goal", snapshot.goal))
-            SecurePrefs.save(base, current)
-        }
-    }
-    internal fun broadcast() { context?.let { it.sendBroadcast(Intent(it.packageName + ".UPDATE").setPackage(it.packageName)) } }
 }

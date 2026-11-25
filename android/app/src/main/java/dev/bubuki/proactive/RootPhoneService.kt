@@ -12,6 +12,12 @@ import org.json.JSONObject
 
 /** Keeps a user-started phone task OR live desktop virtual-display floating window alive across backgrounding. */
 class RootPhoneService : Service() {
+    companion object {
+        const val ACTION_VIRTUAL_HOME_LAUNCH = "dev.bubuki.proactive.action.VIRTUAL_HOME_LAUNCH"
+        const val EXTRA_COMPONENT = "component"
+        const val EXTRA_DISPLAY_ID = "display_id"
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var awake: PowerManager.WakeLock? = null
     override fun onCreate() {
@@ -27,7 +33,7 @@ class RootPhoneService : Service() {
                         state.phase == "running" || state.phase == "waiting_user"
                     if (shouldKeepAlive) seenAlive = true
                     if (seenAlive && !shouldKeepAlive) {
-                        if (awake?.isHeld == true) awake?.release()
+                        runCatching { if (awake?.isHeld == true) awake?.release() }
                         awake = null
                         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
                         stopSelf()
@@ -39,10 +45,22 @@ class RootPhoneService : Service() {
                             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:phone-task")
                             .apply { acquire(45 * 60 * 1000L) }
                     } else if (state.phase != "running") {
-                        if (awake?.isHeld == true) awake?.release()
+                        runCatching { if (awake?.isHeld == true) awake?.release() }
                         awake = null
                     }
                 }
+        }
+        scope.launch {
+            delay(15_000L)
+            val st = RootPhoneHarness.changes.value
+            val ov = FloatingVirtualDisplay.overlayVisible.value
+            val stillAlive = st.active || st.displayCreated || ov || st.phase == "running" || st.phase == "waiting_user"
+            if (!stillAlive) {
+                runCatching { if (awake?.isHeld == true) awake?.release() }
+                awake = null
+                runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                stopSelf()
+            }
         }
     }
     private fun promoteToForeground() {
@@ -79,6 +97,23 @@ class RootPhoneService : Service() {
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         promoteToForeground()
+        if (intent?.action == ACTION_VIRTUAL_HOME_LAUNCH) {
+            val component = intent.getStringExtra(EXTRA_COMPONENT).orEmpty().trim()
+            val displayId = intent.getIntExtra(EXTRA_DISPLAY_ID, -1)
+            if (component.isNotEmpty()) {
+                scope.launch(Dispatchers.IO) {
+                    runCatching { RootPhoneHarness.launchFromVirtualHome(applicationContext, displayId, component) }
+                    val st = RootPhoneHarness.changes.value
+                    if (!st.displayCreated && !FloatingVirtualDisplay.overlayVisible.value && !st.active) {
+                        withContext(Dispatchers.Main) {
+                            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                            stopSelf()
+                        }
+                    }
+                }
+            }
+            return START_NOT_STICKY
+        }
         if (intent?.action == "stop") {
             FloatingVirtualDisplay.hide()
             if (RootPhoneHarness.changes.value.active) {
@@ -102,7 +137,7 @@ class RootPhoneService : Service() {
     }
     override fun onDestroy() {
         scope.cancel()
-        if (awake?.isHeld == true) awake?.release()
+        runCatching { if (awake?.isHeld == true) awake?.release() }
         awake = null
         if (RootPhoneHarness.changes.value.active) RootPhoneHarness.stop(this)
         super.onDestroy()

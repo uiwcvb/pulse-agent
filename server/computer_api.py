@@ -17,7 +17,7 @@ class ComputerCoordinator:
         self.store = store
         self.brain = brain
         self.publish = publish
-        self.client = client or ComputerClient(config_getter=lambda: store.config, data_dir=getattr(store, 'data_dir', None))
+        self.client = client or ComputerClient(config_getter=lambda: store.config, data_dir=getattr(store, 'root', None))
         self.monitor = None
         self.run_lock = asyncio.Lock()
 
@@ -28,9 +28,12 @@ class ComputerCoordinator:
             except ValueError as error:
                 raise HTTPException(404, str(error)) from None
             cfg = self.store.config
-            base_url = cfg.effective_base_url()
-            api_key = cfg.effective_api_key(big=True) or cfg.effective_api_key(big=False)
-            model_name = cfg.effective_model(bot_model=bot.get('model', ''), big=True) or cfg.effective_model(bot_model=bot.get('model', ''), big=False)
+            if hasattr(cfg, 'resolve_route'):
+                base_url, api_key, model_name, _cid = cfg.resolve_route(bot_model=bot.get('model', ''), big=True)
+            else:
+                base_url = cfg.effective_base_url()
+                api_key = cfg.effective_api_key(big=True) or cfg.effective_api_key(big=False)
+                model_name = cfg.effective_model(bot_model=bot.get('model', ''), big=True) or cfg.effective_model(bot_model=bot.get('model', ''), big=False)
             if not api_key or not model_name:
                 raise HTTPException(409, '先配置执行模型，或接管云电脑自己操作')
             previous = self.store.state.get('computer_job')
@@ -209,7 +212,9 @@ def install_computer_routes(app, auth, coordinator):
 
     @router.post('/navigate')
     async def navigate(data: NavigateInput):
-        return _with_frame_aliases(await forward('POST', '/navigate', data.model_dump()))
+        body = data.model_dump()
+        body['actor'] = 'user'
+        return _with_frame_aliases(await forward('POST', '/navigate', body))
 
     @router.post('/search')
     async def search_web_desktop(payload: dict[str, Any]):
@@ -217,7 +222,7 @@ def install_computer_routes(app, auth, coordinator):
         q = str(raw.get('query') or raw.get('text') or '').strip()
         if not q:
             raise HTTPException(422, '搜索词不能为空')
-        res = await forward('POST', '/search', {'query': q, 'engine': str(raw.get('engine') or 'bing'), 'include_frame': bool(raw.get('include_frame', True))})
+        res = await forward('POST', '/search', {'query': q, 'engine': str(raw.get('engine') or 'bing'), 'include_frame': bool(raw.get('include_frame', True)), 'actor': 'user'})
         return _with_frame_aliases(res)
 
     @router.post('/input')
@@ -250,6 +255,7 @@ def install_computer_routes(app, auth, coordinator):
         if 'submit' in raw:
             raw['submit'] = bool(raw['submit'])
         raw.setdefault('include_frame', True)
+        raw['actor'] = 'user'
         try:
             data = InputAction.model_validate(raw)
         except ValidationError as exc:

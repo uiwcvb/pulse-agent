@@ -1,12 +1,43 @@
-"""Read-only Blackboard peer snapshot helper (`peek_bots_snapshot`)."""
+"""Read-only Blackboard peer & subtask snapshot helper (`peek_bots_snapshot`)."""
 from __future__ import annotations
+
+import json
+from typing import Any
 
 from assistants import resolve_bot_for_source
 from storage import node_display_name, normalize_node_source
 
 
+def _format_trace_step(step: dict[str, Any]) -> dict[str, Any]:
+    tool_name = str(step.get('tool') or '').strip()
+    raw_args = step.get('args')
+    args_s = json.dumps(raw_args, ensure_ascii=False)[:160] if isinstance(raw_args, (dict, list)) else str(raw_args or '')[:160]
+    raw_res = step.get('result')
+    err = ''
+    res_s = ''
+    ok = True
+    if isinstance(raw_res, dict):
+        err = str(raw_res.get('error') or '').strip()[:260]
+        ok = bool(raw_res.get('ok', not bool(err)))
+        if not err:
+            res_s = json.dumps(raw_res, ensure_ascii=False)[:200]
+    elif raw_res is not None:
+        res_s = str(raw_res)[:200]
+    if str(step.get('status') or '').lower() == 'error':
+        ok = False
+        if not err:
+            err = res_s or 'tool_error'
+    return {
+        'tool': tool_name,
+        'args': args_s,
+        'ok': ok,
+        'result': res_s,
+        'error': err,
+    }
+
+
 def peek_bots_snapshot(engine, args: dict | None = None) -> dict:
-    """Stateless, lock-free read-only snapshot of all Bots' live progress, recent messages, and active Blackboard items."""
+    """Stateless, lock-free read-only snapshot of Bots AND async Subtasks (latest 3 steps + output + errors)."""
     args = args or {}
     q = str(args.get('target') or args.get('bot_id') or 'all').strip().lstrip('@')
     limit = max(1, min(15, int(args.get('limit') or 5)))
@@ -33,6 +64,7 @@ def peek_bots_snapshot(engine, args: dict | None = None) -> dict:
         cur_steps = 0
         stream_snippet = ''
         thought_snippet = ''
+        live_trace: list[dict[str, Any]] = []
         for nk in ('phone', 'pc', 'phone2', 'pc2'):
             nb = f'{nk}:{bid}'
             ex = engine.brain.executions_by_node_bot.get(nb)
@@ -41,7 +73,10 @@ def peek_bots_snapshot(engine, args: dict | None = None) -> dict:
                 running_nodes.append(nk)
                 if isinstance(ex, dict):
                     cur_tool = cur_tool or str(ex.get('tool') or '')
-                    cur_steps = max(cur_steps, len(ex.get('trace') or []))
+                    tr = ex.get('trace') or []
+                    cur_steps = max(cur_steps, len(tr))
+                    if tr and not live_trace:
+                        live_trace = [t for t in tr if isinstance(t, dict)]
                 if isinstance(st, dict):
                     stream_snippet = stream_snippet or str(st.get('text') or '')[:260]
                     thought_snippet = thought_snippet or str(st.get('thought') or '')[-220:]
@@ -51,6 +86,14 @@ def peek_bots_snapshot(engine, args: dict | None = None) -> dict:
             if isinstance(m, dict) and m.get('bot_id', 'companion') == bid and m.get('role') in ('user', 'assistant')
         ][:limit]
         bot_msgs.reverse()
+        if not live_trace:
+            for m in reversed(bot_msgs):
+                if m.get('role') == 'assistant' and isinstance(m.get('trace'), list) and m['trace']:
+                    live_trace = [t for t in m['trace'] if isinstance(t, dict)]
+                    break
+        recent_steps = [_format_trace_step(t) for t in live_trace[-3:]]
+        last_err = next((s['error'] for s in reversed(recent_steps) if s.get('error')), '')
+
         recent_summary = [{
             'role': m.get('role'),
             'source': normalize_node_source(m.get('source')),
@@ -80,16 +123,61 @@ def peek_bots_snapshot(engine, args: dict | None = None) -> dict:
             'running_nodes': running_nodes,
             'current_tool': cur_tool or None,
             'steps_executed': cur_steps,
+            'recent_steps': recent_steps,
+            'last_error': last_err,
             'live_stream_snippet': stream_snippet,
             'live_thought_snippet': thought_snippet,
             'model': eff_bot.get('model') or engine.store.config.effective_model(big=b.get('engine') == 'big'),
             'recent_messages': recent_summary,
             'open_blackboard_items': open_items,
         })
+
+    # Unified same-source subtask snapshots (latest 3 steps + output + thought + errors)
+    subtask_snaps: list[dict[str, Any]] = []
+    sub_store = getattr(engine.brain, 'subtask_store', None)
+    if sub_store is not None:
+        try:
+            runs = sub_store.list_runs(limit=12, recent_steps_limit=3)
+            if q and q.lower() not in ('all', 'everyone', '*', '全部', '全体'):
+                q_low = q.lower()
+                runs = [
+                    r for r in runs
+                    if q_low in str(r.get('task_id') or '').lower()
+                    or q_low in str(r.get('title') or '').lower()
+                    or q_low == str(r.get('parent_bot_id') or '').lower()
+                ]
+            for r in runs:
+                subtask_snaps.append({
+                    'task_id': r['task_id'],
+                    'title': r['title'],
+                    'preset': r['preset'],
+                    'parent_bot_id': r['parent_bot_id'],
+                    'parent_source': r['parent_source'],
+                    'status': r['status'],
+                    'elapsed_sec': r['elapsed_sec'],
+                    'progress_pct': r['progress_pct'],
+                    'stage_idx': r['stage_idx'],
+                    'stage_total': r['stage_total'],
+                    'stage_label': r['stage_label'],
+                    'sub_done': r['sub_done'],
+                    'sub_total': r['sub_total'],
+                    'steps_executed': r['steps_executed'],
+                    'max_steps': r['max_steps'],
+                    'recent_steps': r['recent_steps'][-3:],
+                    'last_output': r['last_output'][:2000],
+                    'live_thought': r['live_thought'][-1000:],
+                    'last_error': r['last_error'][:1000],
+                    'backup_id': r['backup_id'],
+                })
+        except Exception:
+            pass
+
     return {
         'ok': True,
         'count': len(snapshots),
         'bots': snapshots,
+        'subtasks_count': len(subtask_snaps),
+        'subtasks': subtask_snaps,
         'pc_dsh_online': bool(engine.brain.is_dsh_online()) if hasattr(engine.brain, 'is_dsh_online') else False,
         'pc_dsh_sessions': engine.brain._get_dsh_sessions_list()[:8] if hasattr(engine.brain, '_get_dsh_sessions_list') else [],
     }

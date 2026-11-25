@@ -1,9 +1,22 @@
 package dev.bubuki.proactive
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.BufferedReader
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class VirtualDisplayRegressionTest {
 
@@ -217,5 +230,101 @@ class VirtualDisplayRegressionTest {
 
         val legacy = PulseMessage.from(org.json.JSONObject("""{"id": "m-legacy", "text": "hi"}"""))
         assertEquals("[]", legacy.timeline)
+    }
+
+    @Test
+    fun privilegeManager_teardownDoesNotDeadlockWhileReaderBlockedInReadLine() {
+        val pipeOut = PipedOutputStream()
+        val pipeIn = PipedInputStream(pipeOut)
+        val childStdin = ByteArrayOutputStream()
+        val readerEntered = CountDownLatch(1)
+        val readerExited = CountDownLatch(1)
+        val killedFirst = AtomicBoolean(false)
+
+        val fakeProc = object : Process() {
+            override fun getOutputStream(): OutputStream = childStdin
+            override fun getInputStream(): InputStream = pipeIn
+            override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+            override fun waitFor(): Int = 0
+            override fun exitValue(): Int = 0
+            override fun destroy() { destroyForcibly() }
+            override fun destroyForcibly(): Process {
+                killedFirst.set(true)
+                runCatching { pipeOut.close() }
+                return this
+            }
+        }
+
+        val reader = BufferedReader(InputStreamReader(pipeIn))
+        val t = Thread {
+            try {
+                readerEntered.countDown()
+                reader.readLine()
+            } catch (_: Throwable) {
+            } finally {
+                readerExited.countDown()
+            }
+        }
+        t.isDaemon = true
+        t.start()
+
+        assertTrue(readerEntered.await(1, TimeUnit.SECONDS))
+        Thread.sleep(60)
+        PrivilegeManager.destroyProcessBeforeStreams(fakeProc, pipeIn, childStdin)
+
+        assertTrue(killedFirst.get())
+        assertTrue("Reader blocked in readLine() should wake and exit without deadlock", readerExited.await(2, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun privilegeManager_probeModeOrderPrioritizesCachedMode() {
+        assertArrayEquals(intArrayOf(2, 0, 1, 3, 4), PrivilegeManager.probeModeOrder(2))
+        assertArrayEquals(intArrayOf(0, 1, 2, 3, 4), PrivilegeManager.probeModeOrder(0))
+        assertArrayEquals(intArrayOf(0, 1, 2, 3, 4), PrivilegeManager.probeModeOrder(-1))
+        assertArrayEquals(intArrayOf(0, 1, 2, 3, 4), PrivilegeManager.probeModeOrder(9))
+    }
+
+    @Test
+    fun displayInputHelper_launchFlagsIncludeNoAnimationAndIsolation() {
+        assertEquals("0x14010000", DisplayInputHelper.launchFlagsHex(true, false))
+        assertEquals("0x18010000", DisplayInputHelper.launchFlagsHex(false, true))
+        assertEquals("0x10210000", DisplayInputHelper.launchFlagsHex(false, false))
+    }
+
+    @Test
+    fun keepScreenOnPolicy_activeDuringControlAndReleasesWhenIdleOrScreenOff() {
+        // Active task keeps screen on only when screen is already interactive and display exists
+        assertTrue(shouldKeepScreenOnDuringControl(screenInteractive = true, displayCreated = true, taskActive = true, sinceLastControlMs = 200_000L, overlayExpanded = false))
+        assertFalse(shouldKeepScreenOnDuringControl(screenInteractive = false, displayCreated = true, taskActive = true, sinceLastControlMs = 0L, overlayExpanded = true))
+        assertFalse(shouldKeepScreenOnDuringControl(screenInteractive = true, displayCreated = false, taskActive = true, sinceLastControlMs = 0L, overlayExpanded = true))
+
+        // Within 90s control window keeps screen on even in mini overlay; releases past 90s when collapsed
+        assertTrue(shouldKeepScreenOnDuringControl(screenInteractive = true, displayCreated = true, taskActive = false, sinceLastControlMs = 89_000L, overlayExpanded = false))
+        assertFalse(shouldKeepScreenOnDuringControl(screenInteractive = true, displayCreated = true, taskActive = false, sinceLastControlMs = 91_000L, overlayExpanded = false))
+
+        // Expanded interactive preview allows up to 180s window before auto-releasing
+        assertTrue(shouldKeepScreenOnDuringControl(screenInteractive = true, displayCreated = true, taskActive = false, sinceLastControlMs = 150_000L, overlayExpanded = true))
+        assertFalse(shouldKeepScreenOnDuringControl(screenInteractive = true, displayCreated = true, taskActive = false, sinceLastControlMs = 181_000L, overlayExpanded = true))
+    }
+
+    @Test
+    fun displayInputHelper_userActivityOnlyPokesWhenInteractive() {
+        val calls = mutableListOf<Int>()
+        val sleepingPm = object {
+            var interactive = false
+            fun isInteractive(): Boolean = interactive
+            @Suppress("UNUSED_PARAMETER")
+            fun userActivity(displayId: Int, eventTime: Long, event: Int, flags: Int) {
+                calls.add(displayId)
+            }
+        }
+        val m = sleepingPm.javaClass.getMethod("userActivity", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+
+        assertFalse(DisplayInputHelper.invokeUserActivityIfInteractive(sleepingPm, m, 7, 1000L))
+        assertTrue(calls.isEmpty())
+
+        sleepingPm.interactive = true
+        assertTrue(DisplayInputHelper.invokeUserActivityIfInteractive(sleepingPm, m, 7, 2000L))
+        assertEquals(listOf(0, 7), calls)
     }
 }

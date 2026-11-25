@@ -1,15 +1,15 @@
 {
-  "version": "4.0.22",
-  "version_name": "4.0.22",
-  "versionName": "4.0.22",
-  "tag_name": "v4.0.22",
-  "version_code": 110,
-  "versionCode": 110,
-  "build": 110,
-  "published_at": "2026-11-18T23:29:15.882735+08:00",
-  "apk_size": 32379388,
-  "sha256": "196d97703880769a2dcd4c39be03bc0bb4b0f49916c2eacee16ecb46f35416fb",
+  "version": "4.0.42",
+  "version_name": "4.0.42",
+  "versionName": "4.0.42",
+  "tag_name": "v4.0.42",
+  "version_code": 130,
+  "versionCode": 130,
+  "build": 130,
+  "published_at": "2026-11-25T15:34:15.500717+08:00",
+  "apk_size": 33266266,
+  "sha256": "0da4570fb9554bac496bd9807b10e76793178fdaaf59e888b4959e28254f954c",
   "download_url": "/proactive-agent/download/proactive-agent.apk",
-  "notes": "v4.0.22 (Build 110): 1) 苹果级「纯享正文阅读体 + 顶部唯一过程眉标 + 左滑 1:1 线性拉出工程遥测（缓存命中/TTFT/TPS/轮次）」极简美学 UI（桌面/手机全统一，过程 0 跳动不回弹）；2) 根治 Node DSH Sidecar 中途意外中断（`python_tools_plugin` 全面告别 Node 22 undici 改走原生 `http`，增加 4 图滑动折叠防 256MB 堆 OOM，提升内存配额）；3) 全局统一 0..1000 归一化坐标系（去黑边零偏移、DOM 不混发像素、支持 Alipay/收银台二维码智能框选与截图回看确认）；4) Prompt 与 Tool Schema 瘦身降噪 + 静态前缀锁死 Prefix Cache + 原生 choices 快捷按钮回归。",
-  "body": "v4.0.22 (Build 110): 1) 苹果级「纯享正文阅读体 + 顶部唯一过程眉标 + 左滑 1:1 线性拉出工程遥测（缓存命中/TTFT/TPS/轮次）」极简美学 UI（桌面/手机全统一，过程 0 跳动不回弹）；2) 根治 Node DSH Sidecar 中途意外中断（`python_tools_plugin` 全面告别 Node 22 undici 改走原生 `http`，增加 4 图滑动折叠防 256MB 堆 OOM，提升内存配额）；3) 全局统一 0..1000 归一化坐标系（去黑边零偏移、DOM 不混发像素、支持 Alipay/收银台二维码智能框选与截图回看确认）；4) Prompt 与 Tool Schema 瘦身降噪 + 静态前缀锁死 Prefix Cache + 原生 choices 快捷按钮回归。"
+  "notes": "v4.0.42 (Build 130): 1) 子任务二级界面 1:1 复刻主聊天室（复用同款气泡与思考/工具折叠手风琴），彻底删除假进度条、运维方框与顶部切换条；2) 支持在子任务对话界面底部实时插话纠偏或结束后原地追问续跑；3) 放宽子任务与记忆整理全部兜底上限（默认 200 步、单次超时 600s、30K 完整结论返回不截断、单簇 6 条彻底解决超时报错）。",
+  "body": "v4.0.42 (Build 130): 1) 子任务二级界面 1:1 复刻主聊天室（复用同款气泡与思考/工具折叠手风琴），彻底删除假进度条、运维方框与顶部切换条；2) 支持在子任务对话界面底部实时插话纠偏或结束后原地追问续跑；3) 放宽子任务与记忆整理全部兜底上限（默认 200 步、单次超时 600s、30K 完整结论返回不截断、单簇 6 条彻底解决超时报错）。"
 }

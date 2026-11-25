@@ -217,7 +217,7 @@ final class DisplayTaskContainment {
                 }
                 if (++inspected >= 3 || !isManagedEscape) break;
             }
-            if (movedAny || baselineMainTaskId > 0) {
+            if (movedAny && baselineMainTaskId > 0) {
                 restoreMainDisplayForegroundIfNeeded(atm, baselineMainTaskId, baselineMainPkg, "");
             }
             evictAccidentalFreeformFromVirtualDisplay(displayId, managedVirtualPackages);
@@ -390,7 +390,7 @@ final class DisplayTaskContainment {
 
     static boolean isHomeOrLauncherPackage(String pkg) {
         if (pkg == null) return true;
-        String low = pkg.trim().toLowerCase();
+        String low = pkg.trim().toLowerCase(java.util.Locale.ROOT);
         return low.isEmpty() || low.contains("launcher") || low.contains("home") || "com.android.systemui".equals(low) || "android".equals(low);
     }
 
@@ -505,6 +505,25 @@ final class DisplayTaskContainment {
             } catch (Throwable ignored) {}
         }
         Bundle opts = buildDisplayActivityOptions(targetDisplayId);
+        if (targetDisplayId == Display.DEFAULT_DISPLAY) {
+            try {
+                for (Method m : atm.getClass().getMethods()) {
+                    if (m.getName().equals("moveTaskToFront") && m.getParameterTypes().length == 5) {
+                        m.invoke(atm, null, DisplayInputHelper.SHELL_PACKAGE, taskId, 0, null);
+                        return true;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            try {
+                for (Method m : atm.getClass().getMethods()) {
+                    if (m.getName().equals("startActivityFromRecents") && m.getParameterTypes().length == 2) {
+                        m.invoke(atm, taskId, opts);
+                        return true;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            return false;
+        }
         try {
             for (Method m : atm.getClass().getMethods()) {
                 if (m.getName().equals("startActivityFromRecents") && m.getParameterTypes().length == 2) {
@@ -599,7 +618,7 @@ final class DisplayTaskContainment {
                     }
                     idx++;
                 }
-                if (movedAny || mainBeforeTaskId > 0) {
+                if (movedAny && mainBeforeTaskId > 0) {
                     restoreMainDisplayForegroundIfNeeded(atm, mainBeforeTaskId, mainBeforePkg, targetPkg);
                 }
                 boolean mainHealthy = mainBeforeTaskId <= 0 || isHomeOrLauncherPackage(mainBeforePkg)

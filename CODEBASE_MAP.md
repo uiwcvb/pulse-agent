@@ -1,4 +1,4 @@
-# Proactive Personal Agent · Codebase Map & Variable Registry (`v4.0.15` / Build 103)
+# Proactive Personal Agent · Codebase Map & Variable Registry (`v4.0.39` / Build 127)
 
 > 本文件为全仓单一权威结构图谱 (`scripts/verify_codebase_map.py` 自动化校验 100% 文件覆盖与 0 废弃引用)。
 > 架构已升级为 **Python FastAPI Gateway + 官方 `@deepseek-ai/*` (`0.2.2-rc.1`) Node DSH Brain Sidecar**，全面移除冗余 `Today` 模块并完成默认助手去个性化清理。
@@ -97,7 +97,7 @@ proactive-personal-agent/
 | `DSH_BRAIN_PORT` | `18199` | Node DSH Sidecar 监听端口（严格绑定 `127.0.0.1`） |
 | `DSH_BRAIN_DATA_DIR` | `/opt/proactive-agent/data/dsh_sessions` | DSH `JsonlPersistence` 会话持久化目录 |
 | `DSH_INTERNAL_SECRET` | `hex(32)` / env | Node Sidecar 回调 `POST /internal/dsh/tool` 时校验 `X-Internal-Secret` 密钥 |
-| `CANONICAL_TOOL_NAMES` | **14 tools** (`tuple[str]`) | `read_file, write_file, edit_file, search_files, bash, web, memory, blackboard, phone, pc, cloud, reply, subtask, admin`（已移除 `today`） |
+| `CANONICAL_TOOL_NAMES` | **15 tools** (`tuple[str]`) | `read_file, write_file, edit_file, search_files, bash, web, memory, blackboard, schedule, phone, pc, cloud, reply, subtask, admin`（`schedule` 已从 `blackboard` 独立） |
 | `explicit_destroy` | `bool` (`DisplayFrameCodec`) | `FloatingVirtualDisplay` 唯一合法自动销毁信号（聊天停止/暂停阶段绝不关闭悬浮窗） |
 | `dockedAsEdgeBubble` | `bool` (`FloatingVirtualDisplay`) | 顶白条向屏幕左右边缘拖曳松手后进入的 `48dp` 贴边半透明实时预览气泡状态 |
 | `minimizedToPill` | `bool` (`FloatingVirtualDisplay`) | 右下角小方框（`ResizeGripView`）用力向内缩小 `< 0.38f` 后触发的侧边挂起胶囊状态 |
@@ -125,12 +125,14 @@ proactive-personal-agent/
 - `server/core/blackboard_peek.py` — Peer progress inspection helpers (`peek_bots`)
 - `server/core/blackboard_scheduler_helpers.py` — Cron/delay scheduling helpers for blackboard engine
 - `server/core/bot_archive.py` — `export_bot_bundle` / `import_bot_bundle` portable bot archive serialization
+- `server/core/bootstrap_routes.py` — `install_bootstrap_routes` public `/bootstrap/pc-skill.md` and `/bootstrap/quickstart-skill.md` read-only Skill endpoints
 - `server/core/brain_proactive_mixin.py` — `BrainProactiveMixin` curiosity & sleep consolidation scheduler loop
 - `server/core/brain_prompt_mixin.py` — `BrainPromptMixin` KV-cache-friendly system prompt & tool list builder
 - `server/core/brain_tools_mixin.py` — `BrainToolsMixin._chat` DSH Sidecar delegation, legacy loop fallback, `final_message` handoff
 - `server/core/brain_turn_ops_mixin.py` — `BrainTurnOpsMixin` edit-and-rerun, reroll, preemption, DSH session reset
-- `server/core/bridge_routes.py` — `register_bridge_routes` desktop DSH sentinel WS & local bridge RPC endpoints
-- `server/core/canonical_tool_handlers.py` — Unified 14 canonical tool execution handlers, weak/strong notification routing & PC FS RPC staging
+- `server/core/bridge_routes.py` — `register_bridge_routes` desktop DSH sentinel WS, memory reorganize/status API & local bridge RPC endpoints
+- `server/core/cache_keepalive.py` — `CacheKeepaliveManager` bounded 260s KV prefix keepalive & 9m idle hot-compaction with 0 overnight burn
+- `server/core/canonical_tool_handlers.py` — Unified 15 canonical tool execution handlers, 4-table memory ops, weak/strong notification routing & PC FS RPC staging
 - `server/core/clock_wheel.py` — `UnifiedClockWheel` 1Hz background timer/deadline/watchdog wheel
 - `server/core/cloud_computer_deployer.py` — Automated VPS cloud computer provisioning helpers
 - `server/core/cloud_desktop_controller.py` — `CloudDesktopControllerMixin` cloud desktop viewport/control coordination
@@ -141,15 +143,21 @@ proactive-personal-agent/
 - `server/core/curiosity_coalesce_helpers.py` — Periodic routine/blackboard coalescing helpers shared with `CuriosityEngine`
 - `server/core/curiosity_engine.py` — `CuriosityEngine` idle inspection & sleep memory consolidation
 - `server/core/desktop_controller.py` — `DesktopControllerMixin` unified desktop action dispatcher
-- `server/core/dsh_brain_adapter.py` — `DshBrainAdapter` HTTP NDJSON client, `/internal/dsh/tool` executor, `step_text` demotion bridge
+- `server/core/doc_extractor.py` — Zero-dependency `.pdf` / `.docx` / `.xlsx` text extractor for `read_file`
+- `server/core/dsh_brain_adapter.py` — `DshBrainAdapter` HTTP NDJSON client, `/internal/dsh/tool` executor, `compaction_checkpoint` / `ephemeral_recall` envelope & `step_text` demotion bridge
 - `server/core/dsh_bridge_mixin.py` — `DshBridgeMixin` Windows DSH WebSocket RPC helpers
+- `server/core/embedding_engine.py` — `EmbeddingEngine` multi-tier local INT8 ONNX (`gte-small-zh`/`bge-small-zh`/`Dmeta-zh-small`/`gte-base-zh`) + idle unload + optional API
 - `server/core/external_profile_db.py` — `ExternalProfileDB` isolated SQLite profile store & zero-context AI prompt builder
 - `server/core/interconnect_router.py` — `InterconnectRouterMixin` cross-bot `send_message` wakeup router
 - `server/core/interfaces.py` — Internal protocol & typing interfaces
 - `server/core/llm_client.py` — `LLMClient` SSE streaming & fallback client
-- `server/core/memory_engine.py` — `MemoryEngine` pins, user impression profiles, token stats
+- `server/core/memory_engine.py` — `MemoryEngine` pins, user impression profiles, token stats, 4-table & embedding accessors
+- `server/core/memory_migrator.py` — One-click legacy memory backup/reorganization (`reorganize_legacy_memory`) & weekly anti-rot `run_memory_gardener`
+- `server/core/memory_tables.py` — `MemoryTablesStore` 4-table SQLite schema (`core_blocks`, `entity_facts` 4-way reconciliation, `episodes`, `memory_vectors`) + ledger export
+- `server/core/memory_vector_space.py` — 2D PCA vector semantic projection, sparse cosine-similarity graph, keyword cluster centroids & live query vector probe
 - `server/core/notification_hub.py` — `NotificationHub` mobile notification ingestion
 - `server/core/observation_masker.py` — `maybe_mask_room_observations` pruning stale GUI trees from context
+- `server/core/channel_router.py` — Multi-provider API channel aggregation, concurrent `/models` discovery & `/api/channels` CRUD/test routes
 - `server/core/onboarding_service.py` — Provider endpoint inference (`infer_provider_defaults`) & neutral welcome flow
 - `server/core/pc_desktop_controller.py` — `PcDesktopControllerMixin` Windows CUA action wrapper
 - `server/core/phone_controller.py` — `PhoneControllerMixin` Android VirtualDisplay remote RPC controller
@@ -166,13 +174,15 @@ proactive-personal-agent/
 - `server/core/sqlite_state.py` — `SqliteStateDB` WAL schema & ACID transactions
 - `server/core/storage_hygiene.py` — Periodic SQLite vacuum & artifact cleanup
 - `server/core/stream_publisher_mixin.py` — `StreamPublisherMixin` live stream publisher & domain concurrency resolver
-- `server/core/subtask_runner.py` — Isolated read-only subagent runner (`subtask` tool)
+- `server/core/subtask_runner.py` — Fire-and-forget async subtask harness (`subtask` tool, parent-only callback, `memory_reorganize` driver)
+- `server/core/subtask_store.py` — Persistent `subtask_runs` SQLite store & auto-GC recycler shared by UI & `peek`
 - `server/core/sync_engine.py` — `SyncEngine` cursor (`order_seq`) & monotonic state version coordinator
 - `server/core/task_continuity.py` — `TaskContinuityManager` goal mode contract & foreground chain continuity
 - `server/core/tool_handlers.py` — `ToolHandlersMixin` domain tool adapter methods
-- `server/core/tool_schemas.py` — `CANONICAL_TOOL_NAMES` (14 tools) & schema registry
+- `server/core/tool_schemas.py` — `CANONICAL_TOOL_NAMES` (15 tools) & enum-enforced schema registry
 - `server/core/turn_history.py` — `build_compact_turn_step`, `append_turn_step`, `expand_stored_turn_steps`
 - `server/core/turn_ledger.py` — `TurnLedgerManager` persistent turn journal & interrupt recovery
+- `server/core/unified_recall.py` — 4-source hybrid cross-compaction recall engine (LTM + Vault notes + archived messages + entity boosting + RRF)
 - `server/core/vfs_router.py` — `PerNodePhoneRegistry` multi-node phone state tracker
 - `server/core/vision_engine.py` — `VisionEngine` multimodal image inspection
 - `server/core/xml_tool_parser.py` — XML tool tag fallback parser
@@ -223,7 +233,6 @@ proactive-personal-agent/
 - `desktop/dsh-plugin/cua-bridge.mjs` — Bridge from sentinel RPC to Win32 CUA engine
 - `desktop/dsh-plugin/cua/index.mjs` — CUA action router
 - `desktop/dsh-plugin/cua/win32-engine.mjs` — Windows UIA & native screenshot/input engine
-- `desktop/dsh-plugin/cua/tree-utils.mjs` — Windows Accessibility UI tree serializer
 - `desktop/dsh-plugin/cua/hud-overlay.mjs` — Windows floating CUA status HUD overlay
 - `desktop/dsh-plugin/cua/README.md` — CUA subsystem documentation
 - `desktop/dsh-plugin/client.js` — Main split-pane UI controller & direct CSS Grid drawer toggle
@@ -234,30 +243,38 @@ proactive-personal-agent/
 ### 4.5 Android Kotlin/Java Client (`android/app/src/main/java/dev/bubuki/proactive/`)
 - `android/app/src/main/assets/transport.json` — Bundled non-secret transport endpoint template
 - `android/app/src/main/java/dev/bubuki/proactive/PulseApplication.java` — Application bootstrap
-- `android/app/src/main/java/dev/bubuki/proactive/LauncherActivity.java` — Launcher entry activity
-- `android/app/src/main/java/dev/bubuki/proactive/MainActivity.java` — Legacy WebView/settings container & safe error formatting
-- `android/app/src/main/java/dev/bubuki/proactive/NativePulseActivity.kt` — Primary Jetpack Compose host & `NativePulseModel` chat actions (`send`, `stop`, `editMessageAndResend`)
+- `android/app/src/main/java/dev/bubuki/proactive/PulseErrors.java` — Shared safe error sanitizer & formatting helpers
+- `android/app/src/main/java/dev/bubuki/proactive/LauncherActivity.java` — Launcher & ShareSheet entry activity
+- `android/app/src/main/java/dev/bubuki/proactive/NativePulseActivity.kt` — Primary Jetpack Compose host & `NativePulseModel` core messaging/send actions
+- `android/app/src/main/java/dev/bubuki/proactive/PulseChatActions.kt` — Edit-and-resend, reroll, and variant-switching chat actions
 - `android/app/src/main/java/dev/bubuki/proactive/NativePhoneActivity.kt` — Root/ADB Phone diagnostic activity
 - `android/app/src/main/java/dev/bubuki/proactive/PulseActivitySync.kt` — `onRealtimeEvent`, atomic `mergeHandoffMessage`, `refresh`, `refreshStreamOnly`
 - `android/app/src/main/java/dev/bubuki/proactive/PulseActivityBotOps.kt` — Bot CRUD, memory vault ops, settings & model listing
 - `android/app/src/main/java/dev/bubuki/proactive/PulseActivityMedia.kt` — Attachments, cloud desktop streaming, permission launchers
-- `android/app/src/main/java/dev/bubuki/proactive/PulseDeltaEngine.kt` — `buildSyncQuery` (`since_seq = maxOrderSeq`), `deduplicateAssistantList` (`isEphemeralMsgId`), `handleStateSyncEvent`
+- `android/app/src/main/java/dev/bubuki/proactive/PulseMediaCache.kt` — Byte-bounded in-memory & SHA-256 disk LRU image/sticker cache
+- `android/app/src/main/java/dev/bubuki/proactive/PulseDeltaEngine.kt` — `buildSyncQuery` (`since_seq = confirmedSyncSeq`), `deduplicateAssistantList` (`isEphemeralMsgId`), `handleStateSyncEvent`
 - `android/app/src/main/java/dev/bubuki/proactive/PulseModels.kt` — `PulseBot`, `PulseMessage` (`turnSteps`), `NativePulseState` (`streamStepText`, `streamTurnSteps`)
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenChat.kt` — Room header, message list & composer layout
-- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenChatItems.kt` — `NativeMessage` rendering unified `NativeTurnProcessCard`
-- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenPanels.kt` — `NativeLiveStreamBubble` (unified `NativeTurnProcessCard`), Vault & Schedule panels
-- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenToolTrace.kt` — `NativeTurnProcessCard` full-width vertical spring process card
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenChatItems.kt` — `NativeMessage` rendering unified `UnifiedTimelineBubbleContent` process accordions
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenPanels.kt` — `NativeLiveStreamBubble` (unified `UnifiedTimelineBubbleContent`), Vault & Schedule panels
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenToolTrace.kt` — `UnifiedTimelineBubbleContent` full-width vertical spring process accordion
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenBotEditor.kt` — Bot editor sheet UI
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenCloudPanel.kt` — Cloud computer viewer & interactive control panel
-- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenComposer.kt` — Bottom composer bar & slash menu
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenSubtaskPanel.kt` — 1:1 chat-room clone secondary screen for independent subtasks with live steer input
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenMemorySpace.kt` — Interactive 2D vector semantic space canvas, cosine-similarity links, keyword anchors, live query probe & fact CRUD
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenComposer.kt` — Bottom composer bar, sticker picker & slash menu
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenComposerExtras.kt` — Composer attachment source buttons, thumbnail strips & retry badges
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenFormatting.kt` — Humanized tool names & wiki-link formatters
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenHelpers.kt` — Shared UI composition helpers
+- `android/app/src/main/java/dev/bubuki/proactive/PulseScreenChannels.kt` — Multi-API-URL provider channel aggregation section & editor dialog
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenModals.kt` — Action menus & confirmation modals
 - `android/app/src/main/java/dev/bubuki/proactive/PulseScreenStickers.kt` — Sticker & chat image viewer components
 - `android/app/src/main/java/dev/bubuki/proactive/NativePulseScreen.kt` — Root Compose navigation stage
 - `android/app/src/main/java/dev/bubuki/proactive/NativePulseIcons.kt` — Custom vector icon set
 - `android/app/src/main/java/dev/bubuki/proactive/BotAvatarView.kt` — Procedural shape bot avatars
-- `android/app/src/main/java/dev/bubuki/proactive/OnboardingApiGate.kt` — First-run API key & endpoint onboarding gate
+- `android/app/src/main/java/dev/bubuki/proactive/OnboardingApiGate.kt` — First-run zero-server API key gate, pair code gate & non-root Shizuku / Wireless ADB cards
+- `android/app/src/main/java/dev/bubuki/proactive/OnboardingBootstrapSheet.kt` — Local direct-LLM setup wizard & secure SSH VPS + Cloud Desktop deploy sheet
+- `android/app/src/main/java/dev/bubuki/proactive/VpsBootstrapEngine.kt` — Direct OpenAI-compatible bootstrap chat, pair-code parser & JSch SSH VPS/cloud-desktop provisioner
 - `android/app/src/main/java/dev/bubuki/proactive/PulseAppleDesign.kt` — Apple HIG spring specs & press feedback modifiers
 - `android/app/src/main/java/dev/bubuki/proactive/PulseMotionAndPower.kt` — Lifecycle/battery-aware animation gating
 - `android/app/src/main/java/dev/bubuki/proactive/PulseTheme.kt` — Light/Dark semantic color palette
@@ -266,7 +283,9 @@ proactive-personal-agent/
 - `android/app/src/main/java/dev/bubuki/proactive/markdown/MarkdownModel.kt` — CommonMark AST model
 - `android/app/src/main/java/dev/bubuki/proactive/markdown/MarkdownText.kt` — Compose Markdown + code + math renderer
 - `android/app/src/main/java/dev/bubuki/proactive/markdown/StreamingMarkdown.kt` — Incremental Markdown closure helpers
-- `android/app/src/main/java/dev/bubuki/proactive/FloatingVirtualDisplay.kt` — System overlay lifecycle (`shouldAutoCloseVirtualDisplay`, `dockToEdgeBubble`, `minimizeToSidePill`)
+- `android/app/src/main/java/dev/bubuki/proactive/FloatingOverlayStateMachine.kt` — Deterministic overlay state transitions (`OverlayMode`, `OverlayDrawer`, `reduceOverlayTransition`)
+- `android/app/src/main/java/dev/bubuki/proactive/FloatingVirtualDisplay.kt` — System overlay lifecycle (`dockToEdgeBubble`, `minimizeToSidePill`, coalesced frame decode)
+- `android/app/src/main/java/dev/bubuki/proactive/FloatingVirtualDisplayViews.kt` — Pearl-white WindowManager overlay View hierarchy builder
 - `android/app/src/main/java/dev/bubuki/proactive/FloatingVirtualDisplayChrome.kt` — Pearl bezels, `createTopGrabberHandle`, `createPearlEdgeBubbleView`, `createPearlDockedPillView`
 - `android/app/src/main/java/dev/bubuki/proactive/FloatingVirtualDisplayControls.kt` — `PipSpringPhysics`, square `ResizeGripView`, corner shrink-to-suspend, edge bubble drag
 - `android/app/src/main/java/dev/bubuki/proactive/FloatingVirtualDisplayCompose.kt` — In-app PiP fallback widget
@@ -277,11 +296,15 @@ proactive-personal-agent/
 - `android/app/src/main/java/dev/bubuki/proactive/AgentNotificationListener.java` — Optional Android notification listener service
 - `android/app/src/main/java/dev/bubuki/proactive/BootReceiver.java` — Device boot service starter
 - `android/app/src/main/java/dev/bubuki/proactive/OverlayController.java` — Display-0 strong-notification floating modal card with open-chat/ack/snooze actions
-- `android/app/src/main/java/dev/bubuki/proactive/PrivilegeManager.java` — Root `su` & wireless ADB privilege IPC manager
+- `android/app/src/main/java/dev/bubuki/proactive/PrivilegeManager.java` — Root `su`, non-root wireless Shizuku, & wireless ADB privilege IPC manager
+- `android/app/src/main/java/dev/bubuki/proactive/ShizukuController.java` — Shizuku v13 UserService, permission & dual-pipe RPC session controller
+- `android/app/src/main/java/dev/bubuki/proactive/ShizukuDisplayUserService.java` — Privileged Shizuku UserService hosting DisplayRuntime over anonymous pipes
+- `android/app/src/main/aidl/dev/bubuki/proactive/IPulseShizukuService.aidl` — Shizuku UserService Binder AIDL interface (`attachPipe` / `getUid` / `destroy`)
 - `android/app/src/main/java/dev/bubuki/proactive/AdbKeyPairStore.java` — Wireless ADB RSA keypair storage
 - `android/app/src/main/java/dev/bubuki/proactive/WirelessAdbController.java` — Android native ADB TLS pairing & connection
 - `android/app/src/main/java/dev/bubuki/proactive/WirelessAdbPairingReceiver.java` — Pairing notification input handler
-- `android/app/src/main/java/dev/bubuki/proactive/DisplayRuntime.java` — SurfaceFlinger / ImageReader virtual display daemon
+- `android/app/src/main/java/dev/bubuki/proactive/DisplayRuntime.java` — SurfaceFlinger / virtual display lifecycle & privileged RPC daemon
+- `android/app/src/main/java/dev/bubuki/proactive/DisplayFramePipeline.java` — VirtualDisplay `ImageReader` listener, GL/Software frame scaling & latest-frame cache
 - `android/app/src/main/java/dev/bubuki/proactive/DisplayFrameCodec.java` — VirtualDisplay state JSON & WebP/JPEG frame encoder
 - `android/app/src/main/java/dev/bubuki/proactive/DisplayInputHelper.java` — Injected touch/key/text input event dispatcher
 - `android/app/src/main/java/dev/bubuki/proactive/DisplayTaskContainment.java` — Isolated task stack containment for VirtualDisplay
@@ -291,6 +314,8 @@ proactive-personal-agent/
 - `android/app/src/main/java/dev/bubuki/proactive/RootClipboard.java` — Privileged clipboard reader/writer
 - `android/app/src/main/java/dev/bubuki/proactive/RootClipboardBroker.java` — Clipboard IPC broker
 - `android/app/src/main/java/dev/bubuki/proactive/PulseAccessibilityService.kt` — Multi-display accessibility tree inspector & node actions
+- `android/app/src/main/java/dev/bubuki/proactive/RootPhoneState.kt` — Immutable `RootPhoneState`, `PhoneApp`, `PulseMessage` model projections for workspace UI
+- `android/app/src/main/java/dev/bubuki/proactive/RootPhoneStore.kt` — Encrypted `phoneHistory` persistence & workspace update broadcasts
 - `android/app/src/main/java/dev/bubuki/proactive/RootPhoneHarness.kt` — VirtualDisplay coordinator (`command`, `status`, `markDisplayDestroyed`)
 - `android/app/src/main/java/dev/bubuki/proactive/RootPhoneHarnessActions.kt` — Pure UI node tap/type action execution
 - `android/app/src/main/java/dev/bubuki/proactive/RootPhoneHarnessLoop.kt` — Live preview poller & local autonomous phone task loop
@@ -300,7 +325,6 @@ proactive-personal-agent/
 - `android/app/src/main/java/dev/bubuki/proactive/RootPhoneScreen.kt` — Diagnostic VirtualDisplay Compose screen
 - `android/app/src/main/java/dev/bubuki/proactive/RootPhoneService.kt` — Foreground keep-alive service for active phone tasks and background floating virtual display overlay
 - `android/app/src/main/java/dev/bubuki/proactive/CloudFiles.java` — Android file upload/download helpers
-- `android/app/src/main/java/dev/bubuki/proactive/AvatarImages.java` — Local avatar image decoder/cache
 - `android/app/src/main/java/dev/bubuki/proactive/Io.java` — Low-level stream I/O helpers
 - `android/app/src/main/java/dev/bubuki/proactive/SecurePrefs.java` — EncryptedSharedPreferences wrapper
 - `android/app/src/main/java/dev/bubuki/proactive/SecureTransport.java` — X25519 + AES-GCM OkHttp & WebSocket client

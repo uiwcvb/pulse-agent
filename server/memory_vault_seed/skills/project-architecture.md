@@ -17,7 +17,7 @@
      - 采用与原生 `ds-bot`（Grok 风格交互体验）完全一致的侧边栏分组、顶栏、消息流与输入框样式。
      - 严禁在输入框上方展示冗余胶囊栏；支持拖拽上传、剪贴板粘贴图片与文件，统一走原生附件卡片体验。
 - **看不见的地方做加法（强大的底层能力按需无缝唤醒）**：
-  - 当用户提出需求时，AI 通过 14 个正交工具（`read_file`, `write_file`, `edit_file`, `search_files`, `bash`, `web`, `memory`, `blackboard`, `phone`, `pc`, `cloud`, `reply`, `subtask`, `admin`）配合按需加载的模块化 Skill 库（`memory_vault/skills/*.md`）静默完成跨端操控、分级通知与手机主屏悬浮窗推送（弱通知走通知栏，强通知直接在物理主屏 `Display 0` 弹出全局悬浮窗）、事件黑板协同、文件流转与记忆沉淀。
+  - 当用户提出需求时，AI 通过 15 个正交工具（`read_file`, `write_file`, `edit_file`, `search_files`, `bash`, `web`, `memory`, `blackboard`, `schedule`, `phone`, `pc`, `cloud`, `reply`, `subtask`, `admin`）配合按需加载的模块化 Skill 库（`memory_vault/skills/*.md`）静默完成跨端操控、分级通知与手机主屏悬浮窗推送（弱通知走通知栏，强通知直接在物理主屏 `Display 0` 弹出全局悬浮窗）、事件黑板协同、文件流转与三层跨压缩记忆沉淀。
   - **平时零打扰、零后台耗电**：不使用虚拟屏时不创建 `VirtualDisplay`；虚拟屏开启期间由 `RootPhoneService` 维持前台保活，App 退回桌面后悬浮小窗仍持久化显示在系统桌面上。
 
 ### 1.2 模型多模态铁律（严禁区分「文本模型 vs 视觉模型」或二次转发 OCR）
@@ -152,19 +152,24 @@
 
 ---
 
-## 第四章：原生 Agent 工具历史、98%~99% 静态前缀缓存与满 100K 分段局部压缩
+## 第四章：原生 Agent 工具历史、98%+ 静态前缀缓存、保活/空闲热压缩与长期四表向量记忆
 
-1. **原生 `assistant(tool_calls)` + `role: "tool"` 历史回放**：
-   - 严格保持大模型原生 Agent 训练格式回放真实工具调用与返回，跨轮自动剥离旧 `reasoning_content`，杜绝伪造旁白导致的工具调用报错。
-2. **小于 `100K` 免压缩 + 满 `100K`「告一段落」分段局部压缩**：
-   - 上下文 `< 100K` Tokens 时 0 压缩纯追加（Append-Only），配合底部 `inject_memory_deltas()` 保持 98%~99% Prefix Cache 命中率。
-   - 满 `100K` Tokens 时仅压缩前序「已告一段落」的旧对话段并原地替换为结构化摘要，完整保留近期活跃的 30K~40K 原生上下文。
+1. **原生 `assistant(tool_calls)` + `role: "tool"` 严格 Append-Only 历史**：
+   - 保持大模型原生 Agent 格式回放工具调用与返回；日常非压缩轮严禁就地改写旧观察输出；`ephemeral_recall` 永远挂在当轮 `user_text` 末尾而不污染静态 `systemPrompt`，彻底根治前缀破缓存。
+2. **极简 2+1 模型分工 + 260s 保活 / 9 分钟空闲热压缩**：
+   - 主模型负责对话、满血 15 工具、200K 窗口与趁热压缩（复用热缓存，不另设压缩模型槽位）；便宜 `worker_model` 负责 `subtask`、记忆抽取整理与园丁巡检；本地 ONNX 向量（默认 `gte-small-zh` INT8，~100MB 活跃 / 闲置 5 分钟卸载归 0MB）负责语义召回。
+   - 上下文 ≥40K 时默认 260s 发 1 次 `max_tokens=1` 零落库保活；静默满 9 分钟趁热压缩并立刻休眠，0 整晚烧钱。
+3. **3–5 年 5+1 防腐记忆 + 瞬发异步 `subtask` Harness**：
+   - 统一落地 `context_index.db` 的 5 张记忆表 + 1 张子任务表：`core_blocks`（≤1800 tokens 静态核心块）、`entity_facts`（5 级分类 + 访问热度强化 + 4 选 1 归并 + 显式真删 `delete_fact`）、`entity_relations`（轻量 1-hop 关联图）、`episodes`（4 级时间金字塔 `0-30d / 30-90d / 90d-1y / >1y` + `delete_episode`）、`memory_vectors`（`model_id` 版本隔离 int8 向量）、`subtask_runs`（统一持久化并发子任务 + 自动 GC 回收防堆叠）。
+   - 所有 `subtask` 默认瞬发异步（`<50ms` 返回），严格绑定发任务的父 Bot（唯一出口只回报父 Bot），每个子任务拥有独立二级监控界面（以任务名作标题），且 `blackboard(action="peek")` 与二级页同源可见最新 3 步工具执行、输出与报错；`/memory reorganize` 作为内置 8 阶段全自动子任务运行，零人工审批、Staging 隔离、Critic 防误删与 `/memory rollback` 一键回滚。
 
 ---
 
-## 第五章：服务端模块化与 Skill 架构 (`server/` 去石山化规范)
+## 第五章：服务端模块化、15 正交工具零打架分工与 Skill 架构 (`server/` 去石山化规范)
 
-服务端按职责单一原则拆分，并与渐进式按需 Skill 体系（`memory_vault/skills/*.md`）协同：
+服务端按职责单一原则拆分（全仓严守单文件 `< 1000` 行），并与渐进式按需 Skill 体系（`memory_vault/skills/*.md`）协同：
+
+- **协作防冲突铁律**：`subtask`（当前节点同轮聚焦轻子单元，硬禁 `blackboard`/`schedule`/`reply`/`admin`）专职查证与整理防上下文膨胀；`blackboard` 专职跨端/跨 Bot 异步协同留痕；`schedule` 专职定时/闹钟/例程，三者职责完全正交零打架。
 
 - **核心中枢与协议路由**：
   - `server/main.py`：FastAPI 路由、WebSocket 加密网关、多端同步与 `/api/messages/variant` 多版本切换。

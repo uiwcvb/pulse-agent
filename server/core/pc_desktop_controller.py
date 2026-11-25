@@ -159,7 +159,7 @@ class PcDesktopControllerMixin:
                     'op': 'cua_desktop',
                     'action': 'send_screenshot',
                     'chat_image_url': media_url,
-                    'cropped': bool(crop_b),
+                    'cropped': bool(box_xyxy),
                     'note': f'已将电脑真机干净无标尺实时截图直接挂载到本轮聊天回复气泡上（{media_url}）！',
                 }
 

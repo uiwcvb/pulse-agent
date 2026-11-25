@@ -29,7 +29,14 @@ public final class LauncherActivity extends Activity {
                 next.setClipData(src.getClipData());
                 next.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             } else if (Intent.ACTION_SEND.equals(act)) {
-                android.net.Uri streamUri = src.getParcelableExtra(Intent.EXTRA_STREAM);
+                android.net.Uri streamUri;
+                if (android.os.Build.VERSION.SDK_INT >= 33) {
+                    streamUri = src.getParcelableExtra(Intent.EXTRA_STREAM, android.net.Uri.class);
+                } else {
+                    @SuppressWarnings("deprecation")
+                    android.net.Uri legacy = src.getParcelableExtra(Intent.EXTRA_STREAM);
+                    streamUri = legacy;
+                }
                 if (streamUri != null) {
                     next.setClipData(android.content.ClipData.newRawUri("share", streamUri));
                     next.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);

@@ -59,10 +59,10 @@ public final class RootDisplayServer {
         if (args.length == 1 && args[0].equals("--verify")) {
             try {
                 rpcOut.println(runtime.execute("{\"op\":\"create\"}"));
-                org.json.JSONObject guard = new org.json.JSONObject(runtime.execute("{\"op\":\"launch\",\"component\":\"dev.bubuki.proactive/.MainActivity\"}"));
-                boolean refused = guard.optString("error").contains("前台");
+                org.json.JSONObject guard = new org.json.JSONObject(runtime.execute("{\"op\":\"launch\",\"component\":\"dev.bubuki.proactive/.NativePulseActivity\"}"));
+                boolean refused = guard.optString("error").contains("禁止将本客户端主界面移入虚拟屏");
                 rpcOut.println(new org.json.JSONObject().put("foreground_guard_refused", refused));
-                if (!refused) throw new IllegalStateException("Foreground protection check failed; start MainActivity on display 0 before --verify");
+                if (!refused) throw new IllegalStateException("Foreground protection check failed; NativePulseActivity should be blocked from virtual display");
                 rpcOut.println(runtime.execute("{\"op\":\"launch\",\"component\":\"dev.bubuki.proactive/.DisplayTestActivity\"}"));
                 Thread.sleep(2500);
                 org.json.JSONObject shot = new org.json.JSONObject(runtime.execute("{\"op\":\"capture\"}"));

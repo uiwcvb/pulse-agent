@@ -501,9 +501,10 @@ class DesktopBrowserMixin:
         self.last_dom_snapshot = snap
         return snap
 
-    async def search(self, query: str, engine: str = 'auto', include_frame: bool = True):
-        self._auto_takeover_for_interactive()
-        if getattr(self, 'user_takeover_locked', False):
+    async def search(self, query: str, engine: str = 'auto', include_frame: bool = True, actor: str = 'agent'):
+        if actor != 'user':
+            self._auto_takeover_for_interactive()
+        if getattr(self, 'user_takeover_locked', False) and actor != 'user':
             return {'ok': False, 'error': '当前云电脑正由用户人工接管中（user_takeover_locked=True），操作已被锁定', 'control': 'user', 'user_takeover_locked': True}
         q = (query or '').strip()
         if not q:
@@ -532,9 +533,10 @@ class DesktopBrowserMixin:
             res.update(await asyncio.to_thread(self.frame, 88))
         return res
 
-    async def navigate(self, url: str, include_frame: bool = True):
-        self._auto_takeover_for_interactive()
-        if getattr(self, 'user_takeover_locked', False):
+    async def navigate(self, url: str, include_frame: bool = True, actor: str = 'agent'):
+        if actor != 'user':
+            self._auto_takeover_for_interactive()
+        if getattr(self, 'user_takeover_locked', False) and actor != 'user':
             return {'ok': False, 'error': '当前云电脑正由用户人工接管中（user_takeover_locked=True），操作已被锁定', 'control': 'user', 'user_takeover_locked': True}
         from cloud_os.agent_browser import _validate_http_url
         target_url = _validate_http_url(url)
@@ -593,7 +595,7 @@ class DesktopBrowserMixin:
         app_key = (app_name or '').strip().lower()
         env = self._proxy_env()
         arg_clean = (arg_text or '').strip()
-        if app_key in ('browser', 'edge', 'chrome', 'chromium', 'google-chrome', '浏览器'):
+        if app_key in ('browser', 'lite_browser', 'edge', 'chrome', 'chromium', 'google-chrome', '浏览器'):
             from cloud_os.agent_browser import _validate_http_url
             low_arg = arg_clean.lower()
             has_scheme = '://' in low_arg or bool(re.match(r'^[a-z][a-z0-9+.-]*:', low_arg) and not re.match(r'^[^/:]+:\d+(?:[/?#]|$)', low_arg))

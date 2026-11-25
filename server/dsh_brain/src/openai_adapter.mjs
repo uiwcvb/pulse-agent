@@ -102,6 +102,13 @@ function nodeHttpStreamFetch(rawUrl, init = {}) {
     }
 
     let settled = false;
+    let onReqAbort = null;
+    const cleanupReqAbort = () => {
+      if (onReqAbort && init.signal) {
+        try { init.signal.removeEventListener('abort', onReqAbort); } catch {}
+        onReqAbort = null;
+      }
+    };
     const req = mod.request(
       {
         protocol: parsed.protocol,
@@ -113,6 +120,7 @@ function nodeHttpStreamFetch(rawUrl, init = {}) {
         agent: isHttps ? _httpsKeepAliveAgent : _httpKeepAliveAgent,
       },
       (res) => {
+        cleanupReqAbort();
         if (settled) return;
         settled = true;
         const status = Number(res.statusCode || 500);
@@ -141,6 +149,7 @@ function nodeHttpStreamFetch(rawUrl, init = {}) {
                 controller.enqueue(new Uint8Array(chunk));
               } catch {
                 closed = true;
+                cleanupAbort();
                 try { res.destroy(); } catch {}
               }
             });
@@ -158,6 +167,7 @@ function nodeHttpStreamFetch(rawUrl, init = {}) {
             });
             if (init.signal) {
               onAbortListener = () => {
+                cleanupAbort();
                 if (closed) return;
                 closed = true;
                 const reason = init.signal.reason || new Error('Aborted');
@@ -202,7 +212,17 @@ function nodeHttpStreamFetch(rawUrl, init = {}) {
       },
     );
 
+    const timeoutMs = Number(init.timeoutMs || 120000);
+    if (timeoutMs > 0) {
+      req.setTimeout(timeoutMs, () => {
+        const err = new Error(`Upstream HTTP request timed out after ${timeoutMs}ms`);
+        err.code = 'ETIMEDOUT';
+        req.destroy(err);
+      });
+    }
+
     req.on('error', (err) => {
+      cleanupReqAbort();
       if (!settled) {
         settled = true;
         reject(err);
@@ -217,14 +237,16 @@ function nodeHttpStreamFetch(rawUrl, init = {}) {
         reject(reason);
         return;
       }
-      init.signal.addEventListener('abort', () => {
+      onReqAbort = () => {
+        cleanupReqAbort();
         const reason = init.signal.reason || new Error('Aborted');
         req.destroy(reason);
         if (!settled) {
           settled = true;
           reject(reason);
         }
-      }, { once: true });
+      };
+      init.signal.addEventListener('abort', onReqAbort, { once: true });
     }
 
     if (bodyText) {
@@ -249,6 +271,8 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
     this.fetchImpl = defaults.fetchImpl || nodeHttpStreamFetch;
     /** @type {Map<string, { baseUrl: string, apiKey: string, model: string, maxTokens?: number, timeoutMs?: number }>} */
     this.sessionRoutes = new Map();
+    /** @type {Map<string, { model: string, system?: string, messages: any[], tools?: any[], updatedAt: number }>} */
+    this.lastWireSnapshots = new Map();
     this.defaultRoute = {
       baseUrl: (defaults.defaultBaseUrl || process.env.OPENAI_BASE_URL || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
       apiKey: defaults.defaultApiKey || process.env.DEEPSEEK_API_KEY || '',
@@ -284,6 +308,74 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
       return this.sessionRoutes.get(String(sessionId));
     }
     return this.defaultRoute;
+  }
+
+  /** @param {string | undefined} sessionId */
+  deleteRoute(sessionId) {
+    if (sessionId) {
+      this.sessionRoutes.delete(String(sessionId));
+      this.lastWireSnapshots.delete(String(sessionId));
+    }
+  }
+
+  /**
+   * Send a zero-persistence 1-token keepalive ping reusing the exact last serialized prefix
+   * so upstream KV Prefix Cache TTL refreshes without mutating session history.
+   * @param {string} sessionId
+   * @param {AbortSignal | undefined} [signal]
+   */
+  async pingPrefixKeepalive(sessionId, signal) {
+    const sid = String(sessionId || '');
+    const snap = this.lastWireSnapshots.get(sid);
+    if (!snap || !Array.isArray(snap.messages) || snap.messages.length === 0) {
+      return { ok: true, skipped: true, reason: 'no_warm_snapshot' };
+    }
+    const route = this.getRoute(sid);
+    if (!route?.baseUrl) {
+      return { ok: false, skipped: true, reason: 'missing_route' };
+    }
+    const url = route.baseUrl.endsWith('/chat/completions')
+      ? route.baseUrl
+      : `${route.baseUrl}/chat/completions`;
+    const body = {
+      model: snap.model || route.model || 'deepseek-chat',
+      messages: snap.messages,
+      max_tokens: 1,
+      temperature: 0,
+      stream: false,
+    };
+    if (snap.tools && snap.tools.length > 0) {
+      body.tools = snap.tools;
+    }
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(route.apiKey ? { Authorization: `Bearer ${route.apiKey}` } : {}),
+      ...attributionHeaders(),
+    };
+    const res = await this.fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal,
+      timeoutMs: Math.min(30000, route.timeoutMs || 30000),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      return { ok: false, status: res.status, error: String(errText || '').slice(0, 200) };
+    }
+    let parsed = null;
+    try {
+      parsed = await res.json();
+    } catch {
+      parsed = null;
+    }
+    const u = parsed?.usage || {};
+    return {
+      ok: true,
+      kept_alive: true,
+      prompt_tokens: Number(u.prompt_tokens || 0),
+      cached_tokens: Number(u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? 0),
+    };
   }
 
   providerInfo(provider) {
@@ -354,7 +446,7 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
    * @param {AbortSignal | undefined} signal
    */
   async _serializeMessages(dshMessages, systemOverride, signal) {
-    const MAX_IMAGES_IN_CONTEXT = 4;
+    const MAX_IMAGES_IN_CONTEXT = 3;
     const allImageCoords = [];
     const msgList = dshMessages || [];
     for (let mi = 0; mi < msgList.length; mi++) {
@@ -542,6 +634,14 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
     if (typeof options.temperature === 'number') body.temperature = options.temperature;
     if (Array.isArray(options.stop) && options.stop.length > 0) body.stop = options.stop;
     if (tools) body.tools = tools;
+    if (options.sessionId) {
+      this.lastWireSnapshots.set(String(options.sessionId), {
+        model: modelId,
+        messages,
+        tools,
+        updatedAt: Date.now(),
+      });
+    }
 
     const headers = {
       'Content-Type': 'application/json',
@@ -556,6 +656,7 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
         headers,
         body: JSON.stringify(body),
         signal: options.signal,
+        timeoutMs: route.timeoutMs || 120000,
       });
     } catch (err) {
       if (options.signal?.aborted) throw err;
@@ -598,6 +699,9 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
     const decoder = new TextDecoder('utf-8');
     let lineBuf = '';
     let sawDone = false;
+    let finishReason = '';
+    let nextFallbackToolIdx = 0;
+    const fallbackSlotById = new Map();
 
     try {
       while (!sawDone) {
@@ -640,6 +744,7 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
 
           const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
           if (!choice) continue;
+          if (choice.finish_reason) finishReason = String(choice.finish_reason);
           const delta = choice.delta || {};
 
           const rChunk = typeof delta.reasoning_content === 'string'
@@ -669,7 +774,16 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
             yield* closeReasoning();
             yield* closeText();
             for (const tc of delta.tool_calls) {
-              const slotIdx = Number(tc.index ?? 0);
+              let slotIdx;
+              if (tc.index != null && Number.isFinite(Number(tc.index))) {
+                slotIdx = Number(tc.index);
+              } else if (tc.id && fallbackSlotById.has(String(tc.id))) {
+                slotIdx = fallbackSlotById.get(String(tc.id));
+              } else {
+                while (toolAcc.has(nextFallbackToolIdx)) nextFallbackToolIdx++;
+                slotIdx = nextFallbackToolIdx++;
+                if (tc.id) fallbackSlotById.set(String(tc.id), slotIdx);
+              }
               let entry = toolAcc.get(slotIdx);
               if (!entry) {
                 const blockIndex = nextBlockIndex++;
@@ -699,6 +813,9 @@ export class OpenAiCompatibleDshAdapter extends LlmAdapter {
             }
           }
         }
+      }
+      if (!sawDone && !finishReason && !options.signal?.aborted) {
+        throw _classifyTransportError(new Error('Upstream SSE stream ended prematurely before [DONE] or finish_reason'));
       }
     } finally {
       try {

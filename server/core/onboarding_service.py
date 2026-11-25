@@ -173,6 +173,7 @@ async def handle_system_config_tool(brain: Any, args: dict[str, Any]) -> dict[st
     """Conversational configuration tool invoked by Whale-chan during onboarding or later adjustments."""
     store = brain.store
     action = str(args.get('action') or args.get('op') or 'status').strip().lower()
+    non_user_ctx = bool(hasattr(brain, '_is_non_user_execution_context') and brain._is_non_user_execution_context())
 
     if action in ('get', 'status', 'inspect'):
         return _status_payload(brain)
@@ -184,18 +185,30 @@ async def handle_system_config_tool(brain: Any, args: dict[str, Any]) -> dict[st
         return {'ok': True, 'onboarding_completed': True, 'config': updated}
 
     if action == 'pc_connect_guide':
+        if non_user_ctx:
+            return {'ok': False, 'error': '权限锁定：仅允许用户在直接对话中查看包含配对凭证的电脑连接指令'}
         base_url, tok = _read_server_url_and_token(brain)
         pair_code = f'DSCLAW1:{base_url}|{tok}'
+        skill_url = f'{base_url}/bootstrap/pc-skill.md'
+        ai_agent_prompt = (
+            f'请读取 {skill_url}（或仓库内的 .agents/skills/pulse-pc-bootstrap/SKILL.md），'
+            f'严格按其中的步骤把这台电脑接入我的 Pulse Agent，配对码：{pair_code}'
+        )
         return {
             'ok': True,
             'server_url': base_url,
             'pair_code': pair_code,
-            'powershell_cmd': f'python desktop/desktop_agent.py --server "{base_url}" --token "{tok}"',
-            'bash_cmd': f'python3 desktop/desktop_agent.py --server "{base_url}" --token "{tok}"',
+            'skill_url': skill_url,
+            'ai_agent_prompt': ai_agent_prompt,
+            'setup_mjs_cmd': f'node desktop/dsh-plugin/setup.mjs --pair-code "{pair_code}"',
+            'python_agent_cmd': f'python desktop/desktop_agent.py --pair-code "{pair_code}" --save',
+            'python_check_cmd': f'python desktop/desktop_agent.py --pair-code "{pair_code}" --save --check',
+            'powershell_cmd': f'python desktop/desktop_agent.py --pair-code "{pair_code}" --save',
+            'bash_cmd': f'python3 desktop/desktop_agent.py --pair-code "{pair_code}" --save',
             'steps': [
-                '1. 在 Windows 电脑上拉取或打开本项目 desktop/desktop_agent.py（需要 Python 3.10+）',
-                '2. 运行上方一键连接命令，或打开 DeepSeek Harness 客户端粘贴 pair_code 配对码',
-                '3. 连接成功后即可召唤 Windows 首席工程师 @司工 操作本机终端与桌面 GUI',
+                '1. 最省心（把下面 ai_agent_prompt 发给你电脑上的 Claude Code / Codex / Antigravity / Cursor）：AI 会自动读取启动 Skill 识别系统环境并把电脑接入配对！',
+                '2. 或手工一行搞定：有 DSH 桌面端运行 setup_mjs_cmd；跨平台通用直接运行 python_check_cmd 校验并启动 python_agent_cmd。',
+                '3. 连接成功后即可在手机端直接指挥本机终端与桌面 GUI。',
             ],
         }
 
@@ -203,12 +216,11 @@ async def handle_system_config_tool(brain: Any, args: dict[str, Any]) -> dict[st
         return {
             'ok': True,
             'phone_online': bool(brain.is_phone_online()),
-            'supported_modes': ['root (uid=0)', 'wireless_adb (uid=2000)', 'shizuku (uid=2000)'],
+            'supported_modes': ['root (uid=0)', 'shizuku (uid=2000)', 'wireless_adb (uid=2000)'],
             'steps': [
-                '1. 在手机 打开【设置 → 开发者选项 → 无线调试】总开关',
-                '2. 在本 App【设置 → 手机虚拟屏与权限】点击「开启无线调试配对监听」，会在顶部弹出通知栏输入框',
-                '3. 点击系统【使用配对码配对设备】，不用离开系统设置页，直接下拉通知栏输入 6 位配对码即可自动连接 uid=2000 后台隔离虚拟屏！',
-                '4. 若已 Root 则全自动直连 uid=0；未连接前系统绝不会回退操控主屏 Display 0，保障绝对安全。',
+                '1. 推荐方式（Shizuku 无线启动，关掉 Wi-Fi 切 5G 流量不断连）：先打开系统【无线调试】，在 Shizuku App 点击「通过无线调试启动」，再到本 App【设置 → 手机工作区 → Shizuku 无线授权】点「一键授权 Shizuku」即可自动连接 uid=2000 后台虚拟屏。',
+                '2. 备用方式（免装额外 App · 内置无线 ADB）：在本 App【设置 → 手机工作区】点击「开始无线配对通知」，去系统【使用配对码配对设备】直接下拉通知栏填 6 位码配对。',
+                '3. 若设备已 Root 则全自动直连 uid=0；未授权前系统绝不会回退操控主屏 Display 0。',
             ],
         }
 
@@ -228,9 +240,60 @@ async def handle_system_config_tool(brain: Any, args: dict[str, Any]) -> dict[st
         except Exception as exc:
             return {'ok': False, 'error': str(exc)}
 
+    if action == 'list_channels':
+        return {'ok': True, 'channels': store.config.public().get('channels', [])}
+
+    if action in ('add_channel', 'update_channel', 'upsert_channel'):
+        if non_user_ctx:
+            return {'ok': False, 'error': '权限锁定：仅允许用户在直接对话中增改 API 渠道'}
+        from core.channel_router import fetch_channel_models_once, upsert_channel_in_store
+        ch_payload = dict(args.get('channel') if isinstance(args.get('channel'), dict) else args)
+        try:
+            pub_ch, pub_cfg = upsert_channel_in_store(store, ch_payload, source_tag='admin_tool_channel')
+        except ValueError as exc:
+            return {'ok': False, 'error': str(exc)}
+        test_res = None
+        if ch_payload.get('auto_fetch') and pub_ch.get('id'):
+            raw_ch = next((c for c in store.config.channels if c.id == pub_ch['id']), None)
+            if raw_ch and raw_ch.base_url and raw_ch.api_key:
+                test_res = await fetch_channel_models_once(raw_ch.base_url, raw_ch.api_key)
+                if test_res.get('ok') and test_res.get('models'):
+                    pub_ch, pub_cfg = upsert_channel_in_store(store, {'id': raw_ch.id, 'models': test_res['models']}, source_tag='admin_tool_channel')
+        if callable(getattr(brain, 'publish', None)):
+            await brain.publish({'type': 'config_updated', 'channels': pub_cfg.get('channels', [])})
+        return {'ok': True, 'channel': pub_ch, 'channels': pub_cfg.get('channels', []), 'test': test_res}
+
+    if action == 'delete_channel':
+        if non_user_ctx:
+            return {'ok': False, 'error': '权限锁定：仅允许用户在直接对话中删除 API 渠道'}
+        from core.channel_router import delete_channel_in_store
+        cid = str(args.get('channel_id') or args.get('id') or '').strip()
+        deleted, pub_cfg = delete_channel_in_store(store, cid, source_tag='admin_tool_channel')
+        if not deleted:
+            return {'ok': False, 'error': f'未找到渠道: {cid}'}
+        if callable(getattr(brain, 'publish', None)):
+            await brain.publish({'type': 'config_updated', 'channels': pub_cfg.get('channels', [])})
+        return {'ok': True, 'deleted': True, 'id': cid, 'channels': pub_cfg.get('channels', [])}
+
+    if action == 'test_channel':
+        from core.channel_router import fetch_channel_models_once, upsert_channel_in_store
+        cid = str(args.get('channel_id') or args.get('id') or '').strip()
+        raw_ch = next((c for c in (store.config.channels or []) if c.id == cid), None)
+        if raw_ch is None:
+            return {'ok': False, 'error': f'未找到渠道: {cid}'}
+        res = await fetch_channel_models_once(raw_ch.base_url, raw_ch.api_key, timeout=15.0)
+        if res.get('ok') and res.get('models'):
+            upsert_channel_in_store(store, {'id': raw_ch.id, 'models': res['models']}, source_tag='admin_tool_channel_test')
+        return {'ok': bool(res.get('ok')), 'id': raw_ch.id, 'name': raw_ch.name or raw_ch.id, 'latency_ms': res.get('latency_ms', 0), 'count': len(res.get('models') or []), 'models_sample': list((res.get('models') or [])[:20]), 'error': res.get('error', '')}
+
     if action == 'update':
+        if non_user_ctx:
+            return {'ok': False, 'error': '权限锁定：仅允许用户在直接对话中修改系统配置与凭证（禁止后台/子任务/同伴越权改配）'}
         allowed_keys = {
-            'api_base_url', 'api_key', 'default_model', 'provider',
+            'api_base_url', 'api_key', 'default_model', 'worker_model',
+            'embedding_tier', 'embedding_api_base_url', 'embedding_api_key', 'embedding_api_model',
+            'cache_keepalive_enabled', 'cache_keepalive_interval_sec', 'cache_keepalive_max_pings', 'idle_compact_minutes',
+            'provider', 'channels',
             'fallback_enabled', 'fallback_base_url', 'fallback_api_key', 'fallback_model',
             'small_brain', 'big_brain', 'smtp', 'enabled',
             'curiosity_interval_minutes', 'idle_research_minutes',
@@ -241,16 +304,22 @@ async def handle_system_config_tool(brain: Any, args: dict[str, Any]) -> dict[st
             'cloud_computer_ssh_key', 'cloud_computer_url', 'cloud_computer_status',
         }
         patch: dict[str, Any] = {}
+        alias_map = {'base_url': 'api_base_url', 'model': 'default_model'}
         raw_settings = args.get('settings')
         if isinstance(raw_settings, dict):
             for k, v in raw_settings.items():
-                if k in allowed_keys and v is not None:
-                    patch[k] = v
+                mk = alias_map.get(k, k)
+                if mk in allowed_keys and v is not None:
+                    patch[mk] = v
         for k, v in args.items():
-            if k in allowed_keys and v is not None:
-                patch[k] = v
+            mk = alias_map.get(k, k)
+            if mk in allowed_keys and v is not None:
+                patch[mk] = v
+        kv_key = alias_map.get(str(args.get('key') or '').strip(), str(args.get('key') or '').strip())
+        if kv_key in allowed_keys and args.get('value') is not None:
+            patch[kv_key] = args.get('value')
         if not patch:
-            return {'ok': False, 'error': '未提供任何可修改的系统配置字段'}
+            return {'ok': False, 'error': f'未提供任何可修改的系统配置字段（支持：{", ".join(sorted(allowed_keys)[:12])} 等）'}
 
         inferred = infer_provider_defaults(patch, store.config)
         updated = store.update_config(inferred, source_tag='tool:system_config')
@@ -311,8 +380,8 @@ async def maybe_trigger_whalechan_onboarding(
         '接下来我直接陪你用聊天把剩下几项全部配齐，**不用去翻复杂的设置菜单**（我先给你标好了最省心的推荐默认值）：\n'
         f'1. **上下文分段局部压缩阈值**：当前 `{cur_compact // 1000}K` Tokens（推荐 `100K`：低于阈值不压缩，前缀缓存命中 98%+，满额只压缩已完结旧话题）。\n'
         f'2. **主动陪伴与夜间免打扰**：推荐每 `{cur_curiosity}` 分钟轻声关照一次，`00:00–08:00` 夜间静音。\n'
-        '3. **手机后台隔离虚拟屏**：已 Root 自动直连；无 Root 可用安卓无线调试（`uid=2000`）实现后台隔离控屏，绝不乱动你的主屏幕。\n'
-        '4. **连接 Windows 电脑 & 闲置 VPS 云电脑**：如果你有空闲的 Linux VPS，直接把 **IP、端口、用户名和密码/私钥** 原文发给我，我直接连上去帮你把云桌面 + 浏览器全套自动装好！\n\n'
+        '3. **手机后台隔离虚拟屏**：已 Root 自动直连；无 Root 推荐使用 **Shizuku 无线启动（切 5G 流量不断线）**，或用 App 内置无线调试 (`uid=2000`) 实现后台隔离控屏。\n'
+        '4. **连接电脑端 & 闲置 VPS 云电脑**：如果有空闲 Linux VPS，可直接走加密云端部署一键搭出 24/7 云桌面；电脑端则能直接复制启动 Skill 指令发给电脑上的 AI 自动接入。\n\n'
         '你想先从哪一项开始，还是先一键套用推荐设置？'
     )
     choices = [

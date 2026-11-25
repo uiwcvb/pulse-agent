@@ -38,6 +38,7 @@ from computer_api import ComputerCoordinator, install_computer_routes
 from computer_files import WorkspaceFiles, install_file_routes, mirror_upload_across_nodes
 
 from core.bridge_routes import register_bridge_routes, slim_dsh_peers as _slim_dsh_peers, slim_dsh_status as _slim_dsh_status
+from core.bootstrap_routes import install_bootstrap_routes
 from core.profile_share_routes import register_profile_share_routes
 from core.sync_engine import SyncEngine
 
@@ -150,7 +151,17 @@ def create_app(data_dir=None, scheduler=True):
                     continue
             if q.full():
                 with contextlib.suppress(asyncio.QueueEmpty): q.get_nowait()
-            q.put_nowait(event)
+            if ev_type=='bots_changed' and isinstance(event,dict):
+                c_src=normalize_node_source(info.get('source','phone'))
+                ev_out={
+                    **event,
+                    'bots':resolve_bots_for_source(store.state.get('assistants',[]),c_src),
+                    'bots_ver':sync_engine.bots_ver(c_src) if sync_engine is not None else event.get('bots_ver',''),
+                    'primary_bot_id':primary_bot_id_for_source(store,c_src),
+                }
+                q.put_nowait(ev_out)
+            else:
+                q.put_nowait(event)
         se=sync_engine
         if se is not None and isinstance(event,dict):
             et=event.get('type')
@@ -221,11 +232,21 @@ def create_app(data_dir=None, scheduler=True):
                 if c:
                     with contextlib.suppress(Exception): await c.aclose()
             await computer.close()
-            for obj, meth in ((getattr(brain,'llm',None),'aclose'),(getattr(brain,'context_search',None),'close')):
+            me = getattr(brain, 'memory_engine', None)
+            for obj, meth in (
+                (getattr(brain,'llm',None),'aclose'),
+                (getattr(brain,'subtask_store',None),'close'),
+                (getattr(me,'_memory_tables',None),'close'),
+                (getattr(me,'long_term_memory',None),'close'),
+                (getattr(brain,'context_search',None),'close'),
+            ):
                 if obj and hasattr(obj,meth):
                     with contextlib.suppress(Exception):
                         res=getattr(obj,meth)()
                         if asyncio.iscoroutine(res): await res
+            if hasattr(brain, 'shutdown_background_tasks'):
+                with contextlib.suppress(Exception):
+                    await brain.shutdown_background_tasks()
             for t in (gc_task,clock_task,task):
                 if t:
                     t.cancel()
@@ -250,9 +271,16 @@ def create_app(data_dir=None, scheduler=True):
 
     @app.middleware('http')
     async def size_limit(request:Request,call_next):
-        if int(request.headers.get('content-length','0'))>6_000_000:
-            from fastapi.responses import JSONResponse
-            return JSONResponse({'detail':'请求过大'},status_code=413)
+        raw_cl = request.headers.get('content-length')
+        if raw_cl is not None:
+            try:
+                cl_val = int(raw_cl)
+            except (ValueError, TypeError):
+                from fastapi.responses import JSONResponse
+                return JSONResponse({'detail':'无效 Content-Length'},status_code=400)
+            if cl_val > 6_000_000:
+                from fastapi.responses import JSONResponse
+                return JSONResponse({'detail':'请求过大'},status_code=413)
         try:
             response=await call_next(request)
         except RuntimeError as exc:
@@ -309,14 +337,29 @@ def create_app(data_dir=None, scheduler=True):
 
     @app.post('/api/secure')
     async def secure(request:Request):
+        from urllib.parse import parse_qsl, unquote
         try:
             key,data=crypto.open(await request.json())
             if not hmac.compare_digest(str(data.get('token','')),token):
                 return crypto.seal(key,{'status':401,'body':{'detail':'设备配对码不正确'}})
-            path=str(data['path'] or '')
-            if not path.startswith('/api/') or path in ('/api/secure','/api/transport') or '?' in path or '#' in path or '..' in path or '//' in path:
+            method = str(data.get('method') or '').strip().upper()
+            if method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE'):
+                raise ValueError('不支持的 HTTP 方法')
+            raw_path=str(data['path'] or '')
+            if '#' in raw_path or '\\' in raw_path:
                 raise ValueError('非法 API 路径')
-            response=await _call_internal(data['method'],path,query=data.get('query'),body=data.get('body'))
+            raw_base, sep, raw_qs = raw_path.partition('?')
+            path=unquote(raw_base)
+            if not path.startswith('/api/') or not raw_base.startswith('/api/') or path in ('/api/secure','/api/transport') or '?' in path or '#' in path or '..' in path or '//' in path or '\\' in path:
+                raise ValueError('非法 API 路径')
+            merged_query: dict[str, Any] = {}
+            if sep and raw_qs:
+                for k, v in parse_qsl(raw_qs, keep_blank_values=True):
+                    merged_query[k] = v
+            raw_query = data.get('query')
+            if isinstance(raw_query, dict):
+                merged_query.update(raw_query)
+            response=await _call_internal(method,raw_base,query=(merged_query or None),body=data.get('body'))
             try:
                 resp_body=response.json()
             except Exception:
@@ -444,6 +487,8 @@ def create_app(data_dir=None, scheduler=True):
                             c_res=await brain._auto_compact_if_needed(bid,force=False,source=src_node)
                             if isinstance(c_res,dict) and c_res.get('compacted'):
                                 compacted_bots.append(f'{src_node}:{bid}')
+                                if hasattr(brain,'dsh_adapter'):
+                                    with contextlib.suppress(Exception): await brain.dsh_adapter.reset_session(bid,src_node)
                         except Exception:
                             c_res=None
                         if not (isinstance(c_res,dict) and c_res.get('compacted')) and est_tok<=new_window:
@@ -466,29 +511,10 @@ def create_app(data_dir=None, scheduler=True):
 
     @app.post('/api/models',dependencies=[Depends(auth)])
     async def fetch_models(data:ModelsInput|None=None):
-        base_url=(data.base_url.strip() if data and data.base_url else '') or store.config.effective_base_url()
-        api_key=(data.api_key.strip() if data and data.api_key else '') or store.config.effective_api_key(big=True) or store.config.effective_api_key(big=False)
-        fb_url,fb_key,fb_model=store.config.effective_fallback(big=True) if hasattr(store.config,'effective_fallback') else ('','','')
-        models:list[str]=[]
-        for u,k in [(base_url,api_key),(fb_url,fb_key)]:
-            if not u or not k:
-                continue
-            try:
-                async with httpx.AsyncClient(timeout=15,trust_env=False) as client:
-                    r=await client.get(u.rstrip('/')+'/models',headers={'Authorization':'Bearer '+k})
-                if r.status_code<400:
-                    body=r.json()
-                    raw_list=body.get('data') if isinstance(body,dict) else (body if isinstance(body,list) else [])
-                    for item in (raw_list or []):
-                        mid=str(item['id']) if isinstance(item,dict) and item.get('id') else str(item or '')
-                        if mid and mid not in models:
-                            models.append(mid)
-            except Exception:
-                pass
-        for builtin_m in [fb_model,'commandcode/deepseek/deepseek-v4.1-flash','commandcode/deepseek/deepseek-v4-flash','commandcode/deepseek/deepseek-v4-pro','deepseek-v4.1-flash-eco']:
-            if builtin_m and builtin_m not in models:
-                models.append(builtin_m)
-        return {'models':models,'base_url':base_url.rstrip('/')}
+        from core.channel_router import fetch_aggregated_models
+        ov_url=data.base_url.strip() if data and data.base_url else ''
+        ov_key=data.api_key.strip() if data and data.api_key else ''
+        return await fetch_aggregated_models(store,override_base_url=ov_url,override_api_key=ov_key)
 
     @app.get('/api/messages',dependencies=[Depends(auth)])
     async def messages(bot_id:str|None=None,after_id:str|None=None,limit:int=120,source:str|None=None,messages_epoch:int|None=None):
@@ -657,12 +683,13 @@ def create_app(data_dir=None, scheduler=True):
         except ValueError as e: raise HTTPException(404,str(e))
 
     @app.delete('/api/bots/{bot_id}',dependencies=[Depends(auth)])
-    async def delete_bot(bot_id:str):
+    async def delete_bot(request:Request,bot_id:str,source:str|None=None):
+        req_src=normalize_node_source(source or request.headers.get('X-Node-Source'))
         if len(store.state['assistants'])<=1: raise HTTPException(400,'至少保留一位 Bot')
         try: target=get_assistant(store,bot_id)
         except ValueError: raise HTTPException(404,'助手不存在')
         canonical_id=target['id']
-        if canonical_id==store.state.get('primary_bot_id'): raise HTTPException(400,'不能删除当前主助理，请先切换主助理')
+        if canonical_id in (store.state.get('primary_bot_id'), store.state.get('pc_primary_bot_id')): raise HTTPException(400,'不能删除当前主助理，请先切换主助理')
         deleted_list=store.state.setdefault('deleted_bot_ids',[])
         if canonical_id not in deleted_list: deleted_list.append(canonical_id)
         store.state['assistants']=[b for b in store.state['assistants'] if b['id']!=canonical_id]
@@ -672,8 +699,8 @@ def create_app(data_dir=None, scheduler=True):
         ids={m['id'] for m in store.state['messages'] if m.get('bot_id','companion')==canonical_id}
         if ids: await escalation.ack([mid for mid in list(store.state['pending']) if mid in ids])
         store.save()
-        await sync_engine.notify_bots_changed(deleted_bot_id=canonical_id,force=True)
-        return {'deleted':True,'bot_id':canonical_id,'bots':store.state['assistants'],'primary_bot_id':store.state['primary_bot_id']}
+        await sync_engine.notify_bots_changed(deleted_bot_id=canonical_id,source=req_src,force=True)
+        return {'deleted':True,'bot_id':canonical_id,'bots':resolve_bots_for_source(store.state['assistants'],req_src),'primary_bot_id':primary_bot_id_for_source(store,req_src)}
 
     @app.get('/api/tools',dependencies=[Depends(auth)])
     async def tools(): return {'tools':[{'id':t['function']['name'],'description':t['function']['description'],'parameters':t['function']['parameters'],'location':'cloud'} for t in TOOLS]}
@@ -874,6 +901,8 @@ def create_app(data_dir=None, scheduler=True):
                 elif event.get('type')=='ping':
                     if event.get('source') or event.get('node_id'):
                         clients[client_id]['source']=normalize_node_source(event.get('source') or event.get('node_id'))
+                    if queue.full():
+                        with contextlib.suppress(asyncio.QueueEmpty): queue.get_nowait()
                     queue.put_nowait({'type':'pong','time':time.time(),'dsh_online':_is_dsh_online(),'dsh_peers':_get_dsh_peers()})
                 elif event.get('type')=='phone_workspace_result':
                     ev_res=event.get('result') if isinstance(event.get('result'),dict) else {}
@@ -914,6 +943,9 @@ def create_app(data_dir=None, scheduler=True):
 
     register_bridge_routes(app,auth,store,vault,brain,{'harness':harness,'crypto':crypto,'token':token,'clients':clients,'dsh_clients':dsh_clients,'phone_read_cache':phone_read_cache,'publish':publish,'_is_dsh_online':_is_dsh_online,'_get_dsh_peers':_get_dsh_peers,'sync_engine':sync_engine})
     register_profile_share_routes(app,auth,store,vault)
+    install_bootstrap_routes(app)
+    from core.channel_router import install_channel_routes
+    install_channel_routes(app,auth,store,brain,sync_engine,publish)
     return app
 
 app=create_app()

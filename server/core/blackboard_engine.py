@@ -85,9 +85,9 @@ class BlackboardEngine:
     def _extract_mentions(self, args: dict, text: str) -> list[str]:
         return extract_mentions(args, text)
 
-    def _resolve_targets(self, mentions: list[str], author_bot_id: str, author_src: str) -> list[tuple[str, str, str]]:
+    def _resolve_targets(self, mentions: list[str], author_bot_id: str, author_src: str, *, allow_self_explicit: bool = False) -> list[tuple[str, str, str]]:
         """Resolve `@mention` tokens into `[(bot_id, bot_name, target_source)]`."""
-        return resolve_targets(self.store, mentions, author_bot_id, author_src)
+        return resolve_targets(self.store, mentions, author_bot_id, author_src, allow_self_explicit=allow_self_explicit)
 
     def _parse_due_timestamp(self, args: dict, now: float) -> tuple[float, dict]:
         """Parse optional timer/alarm scheduling fields."""
@@ -109,6 +109,7 @@ class BlackboardEngine:
         sender_bot_id: str | None = None,
         sender_name: str | None = None,
         snippet_text: str | None = None,
+        bypass_hop_limit: bool = False,
     ) -> list[str]:
         if bool(self.store.state.get('blackboard_muted', False)):
             return []
@@ -116,7 +117,8 @@ class BlackboardEngine:
             int(self.brain.hop_depth.get() or 0) if hasattr(self.brain, 'hop_depth') else 0,
             int(self.brain.wake_hop_context.get() or 0) if hasattr(self.brain, 'wake_hop_context') else 0,
         )
-        if cur_hop >= self.MAX_BLACKBOARD_HOP_DEPTH:
+        is_system_callback = bypass_hop_limit or reason_label in ('黑板闹钟到期', '黑板监视命中', '黑板任务结项回执')
+        if not is_system_callback and cur_hop >= self.MAX_BLACKBOARD_HOP_DEPTH:
             return []
         woken: list[str] = []
         post_id = str(post.get('post_id') or '')
@@ -224,7 +226,6 @@ class BlackboardEngine:
                     source=norm_src,
                 )
                 self.brain.stream_seq += 1
-                m['seq'] = self.brain.stream_seq
                 m['turn_id'] = turn_id
                 self.store.save()
                 await self.brain.publish({'type': 'message', 'source': norm_src, 'message': m, 'seq': self.brain.stream_seq})
@@ -271,6 +272,9 @@ class BlackboardEngine:
     async def execute(self, args: dict) -> dict:
         t0 = time.perf_counter()
         action = str(args.get('action') or 'list').strip().lower()
+        if action == 'alarm':
+            args = {**args, 'alarm': True}
+            action = 'schedule'
         caller_bot_id = str(args.get('_caller_bot_id') or self.brain.bot_context.get() or 'companion').strip()
         caller_room_id = str(self.brain.room_context.get() or caller_bot_id).strip()
         caller_src = normalize_node_source(args.get('_caller_source') or self.brain.source_context.get())
@@ -344,10 +348,24 @@ class BlackboardEngine:
 
         # 2. Event Blackboard `post` (tasks, @mentions, timers/alarms, zero-token watchpoints)
         if action in ('post', 'publish', 'schedule', 'watch'):
-            text = str(args.get('text') or args.get('value') or args.get('content') or args.get('goal') or '').strip()
-            title = str(args.get('title') or args.get('summary') or '').strip()[:140]
+            text = str(
+                args.get('text')
+                or args.get('prompt')
+                or args.get('content')
+                or args.get('value')
+                or args.get('goal')
+                or args.get('message')
+                or ''
+            ).strip()
+            title = str(args.get('title') or args.get('label') or args.get('summary') or '').strip()[:140]
             if not text and not title:
-                return {'ok': False, 'error': 'post 需要提供 text（或 title/value）'}
+                is_sched_req = action == 'schedule' or bool(args.get('alarm') or args.get('ring_alarm'))
+                err_msg = (
+                    'alarm/schedule 需要提供 text 或 prompt（提醒内容）及 title（可选标题）'
+                    if is_sched_req
+                    else 'post 需要提供 text（或 title/content/value）'
+                )
+                return {'ok': False, 'error': err_msg}
             if not text:
                 text = title
             mentions = self._extract_mentions(args, f'{title} {text}')
@@ -355,13 +373,42 @@ class BlackboardEngine:
                 due_at, sched_meta = self._parse_due_timestamp(args, now)
             except ValueError as exc:
                 return {'ok': False, 'error': str(exc)}
-            watch_cfg = args.get('watch') if isinstance(args.get('watch'), dict) else None
-            if action == 'watch' and not watch_cfg and args.get('target'):
+            raw_watch = args.get('watch')
+            watch_cfg = dict(raw_watch) if isinstance(raw_watch, dict) else None
+            if watch_cfg is None and isinstance(raw_watch, str) and raw_watch.strip():
+                w_target = raw_watch.strip()
+                w_expect = str(args.get('trigger_value') or args.get('expect') or '').strip()
+                w_interval = max(3, int(args.get('watch_interval_sec') or args.get('interval_sec') or 30))
+                w_kind = str(args.get('watch_kind') or '').strip().lower()
+                if not w_kind:
+                    if w_target.startswith(('http://', 'https://')):
+                        w_kind = 'http_status'
+                    elif w_expect:
+                        w_kind = 'cmd_contains'
+                    else:
+                        w_kind = 'cmd_exit'
+                watch_cfg = {'kind': w_kind, 'target': w_target, 'expect': w_expect, 'interval_sec': w_interval}
+            elif watch_cfg is not None:
+                if not watch_cfg.get('expect') and args.get('trigger_value'):
+                    watch_cfg['expect'] = str(args.get('trigger_value')).strip()
+                if not watch_cfg.get('interval_sec') and (args.get('watch_interval_sec') or args.get('interval_sec')):
+                    watch_cfg['interval_sec'] = max(3, int(args.get('watch_interval_sec') or args.get('interval_sec') or 30))
+            elif action == 'watch' and args.get('target'):
                 watch_cfg = {
                     'kind': str(args.get('watch_kind') or 'file_exists'),
                     'target': str(args.get('target') or ''),
-                    'expect': str(args.get('expect') or ''),
-                    'interval_sec': max(3, int(args.get('interval_sec') or 10)),
+                    'expect': str(args.get('trigger_value') or args.get('expect') or ''),
+                    'interval_sec': max(3, int(args.get('watch_interval_sec') or args.get('interval_sec') or 10)),
+                }
+            if (action == 'watch' or raw_watch not in (None, '', False)) and (not isinstance(watch_cfg, dict) or not str(watch_cfg.get('target') or '').strip()):
+                return {
+                    'ok': False,
+                    'error': 'watch 条件挂载失败：请提供有效的 watch 命令/URL/文件路径（如 watch="curl -s ...", trigger_value="...", watch_interval_sec=60）',
+                }
+            if (action == 'schedule' or bool(args.get('alarm') or args.get('ring_alarm'))) and due_at <= now and not watch_cfg:
+                return {
+                    'ok': False,
+                    'error': '定时任务/闹钟必须提供有效的未来时间参数（when / run_at / delay_minutes / delay_seconds / at_time / daily_time / cron_expr），且必须晚于当前时间',
                 }
             exec_action = str(args.get('exec_action') or '').strip().lower()
             if not exec_action and (args.get('ring_alarm') or args.get('alarm')):
@@ -378,7 +425,9 @@ class BlackboardEngine:
             if not review_by and bool(args.get('require_review', False)):
                 review_by = '@contrarian' if caller_src in ('phone', 'phone2') else '@pc_reviewer'
 
-            targets = self._resolve_targets(mentions, caller_bot_id, caller_src)
+            targets = self._resolve_targets(mentions, caller_bot_id, caller_src, allow_self_explicit=is_deferred)
+            if is_deferred and not targets:
+                targets = self._resolve_targets(['@self'], caller_bot_id, caller_src, allow_self_explicit=True)
             priority = str(args.get('priority') or 'normal').strip().lower()
             deadline_sec = max(0, int(args.get('deadline_seconds') or 0))
             on_late = str(args.get('on_late') or 'run_with_notice').strip().lower()
@@ -389,6 +438,20 @@ class BlackboardEngine:
                 dup = cw.find_cross_pool_duplicate(caller_bot_id, due_at, f'{title} {text}', kind='blackboard')
                 if dup is not None:
                     ex = dup['item']
+                    do_overwrite = bool(args.get('overwrite'))
+                    if do_overwrite:
+                        if dup['pool'] == 'blackboard':
+                            if title:
+                                ex['title'] = title
+                            ex['text'] = text[:8000]
+                            ex['due_at'] = round(due_at, 3)
+                            ex['due_iso'] = dt.datetime.fromtimestamp(due_at, TZ).isoformat(timespec='seconds')
+                            if sched_meta:
+                                ex['schedule'] = sched_meta
+                            ex['updated_at'] = now
+                        else:
+                            ex['goal'] = text[:2000]
+                            ex['due_at'] = round(due_at, 3)
                     if exec_action == 'ring_alarm':
                         ex['exec_action'] = 'ring_alarm'
                     elif exec_action == 'notify_user' and not ex.get('exec_action'):
@@ -397,10 +460,13 @@ class BlackboardEngine:
                     return {
                         'ok': True,
                         'deduplicated': True,
+                        'updated': do_overwrite,
+                        'warning': '' if do_overwrite else '命中同时间/同主题去重，原内容未覆盖；如需覆盖更新请传 overwrite=true 或先 cancel 旧任务',
                         'duplicate_pool': dup['pool'],
                         'duplicate_id': dup['id'],
                         'post_id': dup['id'] if dup['pool'] == 'blackboard' else None,
                         'topic_id': dup['id'] if dup['pool'] == 'blackboard' else None,
+                        'scheduled_due_iso': ex.get('due_iso') or ex.get('due_at_bj') or '',
                         'post': ex if dup['pool'] == 'blackboard' else None,
                         'timer': ex if dup['pool'] == 'timer' else None,
                     }
@@ -468,7 +534,7 @@ class BlackboardEngine:
             if not text:
                 return {'ok': False, 'error': 'reply 内容 text 不能为空'}
             mentions = self._extract_mentions(args, text)
-            targets = self._resolve_targets(mentions, caller_bot_id, caller_src)
+            targets = self._resolve_targets(mentions, caller_bot_id, caller_src, allow_self_explicit=False)
             art = str(args.get('artifact_path') or '').strip()
             if art:
                 post['artifact_path'] = art
@@ -676,7 +742,38 @@ class BlackboardEngine:
                     await se.notify_schedules_changed(kind='blackboard', task_id=post['post_id'], force=True)
             return {'ok': True, 'post_id': post['post_id'], 'post': post, 'topic': post, 'status': 'cancelled'}
 
-        # 7. `read`: read single post, legacy KV key, OR smart inbox digest for calling Bot when called with no args!
+        def _compact_post_view(p: dict, include_replies: bool = False) -> dict:
+            reps = p.get('replies') if isinstance(p.get('replies'), list) else []
+            item = {
+                'post_id': p.get('post_id', ''),
+                'title': str(p.get('title') or '')[:140],
+                'text': str(p.get('text') or '')[:320],
+                'status': p.get('status', 'open'),
+                'author_bot_id': p.get('author_bot_id', ''),
+                'author_name': p.get('author_name', ''),
+                'mentions': p.get('mentions') or [],
+                'due_iso': p.get('due_iso') or '',
+                'scheduled_due_iso': p.get('due_iso') or None,
+                'watch_active': bool(p.get('watch')),
+                'reply_count': len(reps),
+                'updated_at': p.get('updated_at', 0),
+            }
+            if reps:
+                last_r = reps[-1] if isinstance(reps[-1], dict) else {}
+                item['last_reply_preview'] = f"{last_r.get('author_name', '')}: {str(last_r.get('text') or '')[:140]}"
+            if include_replies:
+                item['replies'] = [
+                    {
+                        'author_name': r.get('author_name', ''),
+                        'text': str(r.get('text') or '')[:400],
+                        'created_iso': r.get('created_iso', ''),
+                    }
+                    for r in reps[-6:]
+                    if isinstance(r, dict)
+                ]
+            return item
+
+        # 7. `read`: read single post, legacy KV key, OR compact smart inbox digest (bounded size, no 300KB bloat)
         if action == 'read':
             raw_pid = str(args.get('post_id') or args.get('topic_id') or '').strip()
             raw_key = str(args.get('key') or '').strip()
@@ -688,10 +785,15 @@ class BlackboardEngine:
                 if caller_bot_id in (post.get('unread_by') or []):
                     post['unread_by'] = [u for u in post['unread_by'] if u != caller_bot_id]
                     self.store.save()
-                return {'ok': True, 'post': post, 'topic': post}
+                full_view = dict(post)
+                if isinstance(full_view.get('replies'), list) and len(full_view['replies']) > 20:
+                    full_view['replies_truncated'] = len(full_view['replies']) - 20
+                    full_view['replies'] = full_view['replies'][-20:]
+                return {'ok': True, 'post': full_view, 'topic': full_view}
             if raw_key:
                 return self.brain.context_search.blackboard_read(raw_key)
-            # Smart scan: unread mentions for caller_bot_id + active open/claimed/scheduled posts
+            read_limit = max(1, min(30, int(args.get('limit') or 12)))
+            inc_replies = bool(args.get('include_replies', False))
             posts = self._posts()
             unread_posts = []
             open_posts = []
@@ -700,11 +802,12 @@ class BlackboardEngine:
                 if not isinstance(p, dict):
                     continue
                 if caller_bot_id in (p.get('unread_by') or []):
-                    unread_posts.append(dict(p))
+                    if len(unread_posts) < read_limit:
+                        unread_posts.append(_compact_post_view(p, include_replies=inc_replies))
                     p['unread_by'] = [u for u in p['unread_by'] if u != caller_bot_id]
                     dirty = True
-                elif p.get('status') in ('open', 'claimed', 'review_required', 'scheduled') and len(open_posts) < 15:
-                    open_posts.append(dict(p))
+                elif p.get('status') in ('open', 'claimed', 'review_required', 'scheduled') and len(open_posts) < read_limit:
+                    open_posts.append(_compact_post_view(p, include_replies=inc_replies))
             if dirty:
                 self.store.save()
             kv_res = self.brain.context_search.blackboard_list()
@@ -713,53 +816,104 @@ class BlackboardEngine:
                 'caller_bot_id': caller_bot_id,
                 'unread_mentions': unread_posts,
                 'active_posts': open_posts,
-                'kv_entries': kv_res.get('entries', []),
+                'kv_entries': (kv_res.get('items', kv_res.get('entries', [])) or [])[:20],
+                'note': '列表模式已裁剪回复以节省上下文；查看单帖全文请传 post_id="bb-xxx"。',
             }
 
-        # 8. Default `list`
-        status_filter = str(args.get('status') or '').strip().lower()
-        posts = [
-            p for p in reversed(self._posts())
-            if isinstance(p, dict) and (not status_filter or p.get('status') == status_filter)
-        ][:30]
-        kv_res = self.brain.context_search.blackboard_list()
+        if action == 'clear_done':
+            before_n = len(self._posts())
+            self.store.state['blackboard_posts'] = [
+                p for p in self._posts()
+                if isinstance(p, dict) and p.get('status') not in ('done', 'cancelled')
+            ]
+            removed_n = before_n - len(self._posts())
+            if removed_n > 0:
+                self.store.save()
+                await self.brain.publish({'type': 'blackboard_updated', 'op': 'clear_done', 'removed': removed_n})
+            return {'ok': True, 'cleared': removed_n, 'remaining': len(self._posts())}
+
+        # 8. Explicit `list`
+        if action in ('list', ''):
+            status_filter = str(args.get('status') or '').strip().lower()
+            list_limit = max(1, min(30, int(args.get('limit') or 15)))
+            inc_replies = bool(args.get('include_replies', False))
+            posts = []
+            for p in reversed(self._posts()):
+                if isinstance(p, dict) and (not status_filter or p.get('status') == status_filter):
+                    posts.append(_compact_post_view(p, include_replies=inc_replies))
+                    if len(posts) >= list_limit:
+                        break
+            kv_res = self.brain.context_search.blackboard_list()
+            return {
+                'ok': True,
+                'posts': posts,
+                'total_posts': len(self._posts()),
+                'entries': (kv_res.get('items', kv_res.get('entries', [])) or [])[:20],
+            }
+
         return {
-            'ok': True,
-            'posts': posts,
-            'total_posts': len(self._posts()),
-            'entries': kv_res.get('entries', []),
+            'ok': False,
+            'error': (
+                f'未知 blackboard action: {action}'
+                '（支持 post/read/reply/peek/claim/complete/deliver/review/approve/reject/'
+                'schedule/alarm/watch/cancel/list/add_routine/update_routine/remove_routine/list_routines/clear_done/mute/unmute）'
+            ),
         }
 
     async def tick(self) -> int:
         """Zero-LLM-token background tick for Blackboard timers, alarms, and watchpoints."""
         now = time.time()
         fired_count = 0
+        watch_probes: list[tuple[str, dict]] = []
         async with self._post_lock:
             dirty = self._expire_stale_leases(now)
             posts = list(self._posts())
-            due_batch: list[tuple[dict, str]] = []
+            active_pids = {str(p.get('post_id') or '') for p in posts if isinstance(p, dict)}
+            for old_pid in [k for k in self._watch_last_check if k not in active_pids]:
+                self._watch_last_check.pop(old_pid, None)
+            if len(self._recent_wakeups) > 128:
+                cutoff_w = now - 900.0
+                self._recent_wakeups = {k: v for k, v in self._recent_wakeups.items() if v > cutoff_w}
+                if len(self._recent_wakeups) > 256:
+                    for wk in sorted(self._recent_wakeups, key=lambda k: self._recent_wakeups[k])[:len(self._recent_wakeups) - 256]:
+                        self._recent_wakeups.pop(wk, None)
             for post in posts:
                 if not isinstance(post, dict) or post.get('status') != 'scheduled':
                     continue
                 pid = str(post.get('post_id') or '')
-                due_at = float(post.get('due_at') or post.get('trigger_at') or 0.0)
                 watch = post.get('watch') if isinstance(post.get('watch'), dict) else None
-                matched_watch_evidence = ''
-                is_ready = False
                 if watch:
                     interval = max(3.0, float(watch.get('interval_sec') or 10.0))
-                    if now - self._watch_last_check.get(pid, 0.0) < interval:
-                        continue
-                    self._watch_last_check[pid] = now
-                    ok_w, ev_w = await self._check_watchpoint(watch)
-                    if ok_w:
-                        is_ready, matched_watch_evidence = True, ev_w
-                elif due_at > 0 and now >= due_at:
+                    if now - self._watch_last_check.get(pid, 0.0) >= interval:
+                        self._watch_last_check[pid] = now
+                        watch_probes.append((pid, dict(watch)))
+
+        # Run slow watchpoint I/O outside `_post_lock` so concurrent post/read/reply never stalls
+        watch_hits: dict[str, str] = {}
+        for pid, w_cfg in watch_probes:
+            try:
+                ok_w, ev_w = await self._check_watchpoint(w_cfg)
+                if ok_w:
+                    watch_hits[pid] = ev_w
+            except Exception:
+                pass
+
+        async with self._post_lock:
+            due_batch: list[tuple[dict, str]] = []
+            for post in list(self._posts()):
+                if not isinstance(post, dict) or post.get('status') != 'scheduled':
+                    continue
+                pid = str(post.get('post_id') or '')
+                due_at = float(post.get('due_at') or post.get('trigger_at') or 0.0)
+                matched_watch_evidence = watch_hits.get(pid, '')
+                is_ready = bool(matched_watch_evidence)
+                if not is_ready and due_at > 0 and now >= due_at:
                     from core.curiosity_engine import (
                         curiosity_will_coalesce_soon,
                         is_coalesceable_blackboard_for_curiosity,
                     )
-                    p_bot = str(post.get('target_bot_id') or post.get('author_bot_id') or 'companion')
+                    t_ids = post.get('target_bot_ids') if isinstance(post.get('target_bot_ids'), list) else []
+                    p_bot = str((t_ids[0] if t_ids else None) or post.get('target_bot_id') or post.get('author_bot_id') or 'companion')
                     if (
                         is_coalesceable_blackboard_for_curiosity(post)
                         and (now - due_at) <= 180.0

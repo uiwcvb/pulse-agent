@@ -38,14 +38,15 @@ import kotlin.math.roundToInt
  * [Module] PulseScreenChatItems
  * [Responsibility]
  * 消息氣泡與富媒體卡片渲染領域模塊：負責單條消息氣泡渲染、思考折疊塊、多代理委派卡片、性能指標膠囊 (NativeMessage)、
- * 工具調用軌跡折疊組 (NativeToolTraceGroup)、貼紙表情包縮略圖與大圖渲染 (PulseStickerThumb, PulseStickerImage)，
- * 以及快捷動作膠囊 (TelegramActionChip)。
+ * 貼紙表情包縮略圖與大圖渲染 (PulseStickerThumb, PulseStickerImage)，以及快捷動作膠囊 (TelegramActionChip)。
  *
  * [Public API]
  * - NativeMessage(...)
- * - NativeToolTraceGroup(model: NativePulseModel, messageId: String, trace: List<org.json.JSONObject>)
- * - PulseStickerThumb(...), PulseStickerImage(...), TelegramActionChip(...)
  */
+
+private val RE_PURE_STICKER_TAG = Regex("""^\[(sticker|表情|贴纸)\s*[:：][^\]]+\]$""", RegexOption.IGNORE_CASE)
+private val RE_INLINE_MD_IMAGE = Regex("""!\[[^\]]*\]\(([^)\s]+)\)""")
+private val RE_ITEM_MULTI_NL = Regex("""\n{3,}""")
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -87,6 +88,7 @@ internal fun NativeMessage(
         val ctxId = meta?.optString("ctx_id", "").orEmpty()
         val modeLabel = (meta?.optString("mode", "上下文压缩归档") ?: "").ifBlank { "上下文压缩归档" }
         var summaryExpanded by rememberSaveable(message.id) { mutableStateOf(false) }
+        val summaryReduceMotion = rememberReducedMotion()
 
         Column(
             Modifier.fillMaxWidth()
@@ -135,17 +137,23 @@ internal fun NativeMessage(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Text(
-                        "查看归档记忆 ›",
-                        Modifier.padding(start = 6.dp)
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(c.accent.copy(alpha = 0.14f))
-                            .clickable { model.openVault(vaultPath) }
-                            .padding(horizontal = 7.dp, vertical = 3.dp),
-                        color = c.accent,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    Box(
+                        Modifier.padding(start = 4.dp)
+                            .heightIn(min = 40.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .iosPressScale(0.95f) { model.openVault(vaultPath) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "查看归档记忆 ›",
+                            Modifier.clip(RoundedCornerShape(6.dp))
+                                .background(c.accent.copy(alpha = 0.14f))
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            color = c.accent,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
                 Text(
                     "2. 时间线与检索库：memory_vault/timeline · SQLite FTS5" + (if (ctxId.isNotBlank()) " ($ctxId)" else ""),
@@ -155,11 +163,12 @@ internal fun NativeMessage(
             }
             Row(
                 Modifier.fillMaxWidth()
-                    .clickable {
+                    .heightIn(min = 40.dp)
+                    .iosPressScale(0.98f) {
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         summaryExpanded = !summaryExpanded
                     }
-                    .padding(top = 2.dp),
+                    .padding(vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
@@ -171,8 +180,8 @@ internal fun NativeMessage(
             }
             AnimatedVisibility(
                 visible = summaryExpanded,
-                enter = expandVertically(spring(dampingRatio = 0.80f, stiffness = 400f)) + fadeIn(),
-                exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 450f)) + fadeOut()
+                enter = if (summaryReduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                exit = if (summaryReduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
             ) {
                 SelectionContainer {
                     MarkdownText(
@@ -188,7 +197,7 @@ internal fun NativeMessage(
     }
 
     // One-shot settle entrance only for newly arrived latest messages (< 2s old)
-    val reduceMotion = LocalReduceMotion.current
+    val reduceMotion = rememberReducedMotion()
     val isBrandNew = remember(message.id) {
         isLatestMessage && !reduceMotion && message.created > 0.0 &&
             ((System.currentTimeMillis() / 1000.0) - message.created) in -5.0..2.0
@@ -223,7 +232,7 @@ internal fun NativeMessage(
             onDragEnd = {
                 val triggered = abs(swipeOffset.value) >= replyTriggerPx
                 msgScope.launch {
-                    swipeOffset.animateTo(0f, spring(dampingRatio = 0.70f, stiffness = 480f))
+                    if (reduceMotion) swipeOffset.snapTo(0f) else swipeOffset.animateTo(0f, spring(dampingRatio = 0.74f, stiffness = 480f))
                 }
                 if (triggered) {
                     model.reply(message)
@@ -231,17 +240,19 @@ internal fun NativeMessage(
             },
             onDragCancel = {
                 msgScope.launch {
-                    swipeOffset.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 460f))
+                    if (reduceMotion) swipeOffset.snapTo(0f) else swipeOffset.animateTo(0f, spring(dampingRatio = 0.78f, stiffness = 460f))
                 }
             }
         )
     }
 
-    val swipeRevealFraction = (abs(swipeOffset.value) / revealWidthPx).coerceIn(0f, 1f)
-    val replyIconFraction = (abs(swipeOffset.value) / replyTriggerPx).coerceIn(0f, 1.2f)
-    val replyIconScale by animateFloatAsState(
-        targetValue = if (abs(swipeOffset.value) >= replyTriggerPx) 1.12f else (0.5f + 0.5f * replyIconFraction.coerceAtMost(1f)),
-        animationSpec = tween(durationMillis = 120, easing = LinearEasing),
+    val showSwipeReveal by remember(message.id) { derivedStateOf { swipeOffset.value < -1.5f } }
+    val showUserSwipeIcon by remember(message.id) { derivedStateOf { swipeOffset.value < -2f } }
+    val showReplyCueIcon by remember(message.id, replyTriggerPx) { derivedStateOf { abs(swipeOffset.value) >= replyTriggerPx * 0.65f } }
+    val replyTriggered by remember(message.id, replyTriggerPx) { derivedStateOf { abs(swipeOffset.value) >= replyTriggerPx } }
+    val replyCueTargetScale by animateFloatAsState(
+        targetValue = if (replyTriggered) 1.12f else 0.90f,
+        animationSpec = if (reduceMotion) snap() else iosInteractiveSpring(),
         label = "reply_icon_scale"
     )
 
@@ -276,14 +287,16 @@ internal fun NativeMessage(
             contentAlignment = Alignment.CenterEnd
         ) {
             // Emerging Reply Arrow Icon on Right during Left-Swipe
-            if (swipeOffset.value < -2f) {
+            if (showUserSwipeIcon) {
                 Box(
                     Modifier.padding(end = 8.dp)
                         .size(30.dp)
                         .graphicsLayer {
-                            alpha = replyIconFraction.coerceIn(0f, 1f)
-                            scaleX = replyIconScale
-                            scaleY = replyIconScale
+                            val iconFrac = (abs(swipeOffset.value) / replyTriggerPx).coerceIn(0f, 1.2f)
+                            val sc = if (replyTriggered) replyCueTargetScale else (0.5f + 0.5f * iconFrac.coerceAtMost(1f))
+                            alpha = iconFrac.coerceIn(0f, 1f)
+                            scaleX = sc
+                            scaleY = sc
                         }
                         .clip(CircleShape)
                         .background(c.surface.copy(alpha = 0.90f)),
@@ -307,6 +320,13 @@ internal fun NativeMessage(
                 horizontalAlignment = Alignment.End,
                 verticalArrangement = Arrangement.spacedBy(5.dp)
             ) {
+                val hasUserSticker = message.sticker.contains("/stickers/")
+                val isPureUserStickerText = hasUserSticker &&
+                    RE_PURE_STICKER_TAG.matches(bodyPart.trim())
+                val effectiveUserBody = if (isPureUserStickerText) "" else bodyPart
+                if (hasUserSticker) {
+                    PulseStickerImage(model, message.sticker)
+                }
                 if (userImagePaths.isNotEmpty()) {
                     PulseUserMediaGrid(model = model, paths = userImagePaths, alignEnd = true)
                 }
@@ -320,16 +340,13 @@ internal fun NativeMessage(
                     )
                 }
 
-                val hasTextOrQuoteBubble = bodyPart.isNotBlank() || quotePart.isNotBlank() || combinedPaths.isEmpty()
+                val hasTextOrQuoteBubble = effectiveUserBody.isNotBlank() || quotePart.isNotBlank() || (combinedPaths.isEmpty() && !hasUserSticker)
                 if (hasTextOrQuoteBubble) {
                     Column(
                         Modifier.clip(userBubbleShape)
                             .background(c.userBubble)
                             .combinedClickable(
-                                onClick = {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    showActions = !showActions
-                                },
+                                onClick = {},
                                 onDoubleClick = {
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                     model.reply(message)
@@ -366,8 +383,8 @@ internal fun NativeMessage(
                                 }
                             }
                         }
-                        if (bodyPart.isNotBlank()) {
-                            Text(bodyPart, color = c.userInk, fontSize = 16.sp, lineHeight = 21.5.sp)
+                        if (effectiveUserBody.isNotBlank()) {
+                            Text(effectiveUserBody, color = c.userInk, fontSize = 16.sp, lineHeight = 21.5.sp)
                         }
                         Row(
                             Modifier.align(Alignment.End).padding(top = 2.dp),
@@ -392,10 +409,7 @@ internal fun NativeMessage(
                         Modifier
                             .clip(RoundedCornerShape(10.dp))
                             .combinedClickable(
-                                onClick = {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    showActions = !showActions
-                                },
+                                onClick = {},
                                 onDoubleClick = {
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                     model.reply(message)
@@ -423,32 +437,20 @@ internal fun NativeMessage(
                     }
                 }
 
-                // Spring-Animated Telegram Action Pill Menu
-                AnimatedVisibility(
-                    visible = showActions,
-                    enter = expandVertically(spring(dampingRatio = 0.75f, stiffness = 440f)) +
-                        scaleIn(spring(dampingRatio = 0.75f, stiffness = 440f), initialScale = 0.88f) +
-                        fadeIn(tween(140)),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 480f)) +
-                        scaleOut(targetScale = 0.90f) +
-                        fadeOut(tween(110))
-                ) {
-                    Row(
-                        Modifier.padding(top = 5.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(c.surface)
-                            .border(0.5.dp, c.line.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
-                            .padding(horizontal = 12.dp, vertical = 7.dp),
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        TelegramActionChip("copy", "复制", c.ink) { model.copy(bodyPart.ifBlank { cleanBody.ifBlank { rawText } }); showActions = false }
-                        TelegramActionChip("reply", "引用", c.ink) { model.reply(message); showActions = false }
-                        TelegramActionChip("edit", "编辑", c.accent) { model.startEditingMessage(message); showActions = false }
-                        TelegramActionChip("spark", "重发", c.muted) { model.retryMessage(message); showActions = false }
-                    }
-                }
             }
+            val userPreviewText = bodyPart.ifBlank { cleanBody.ifBlank { rawText } }.trim()
+            AppleMessageContextOverlay(
+                visible = showActions,
+                previewText = userPreviewText,
+                telemetry = if (message.optimistic) "正在发送" else model.time(message.created),
+                actions = listOf(
+                    MessageContextAction("copy", "复制内容", c.ink) { model.copy(userPreviewText); showActions = false },
+                    MessageContextAction("reply", "引用回复", c.ink) { model.reply(message); showActions = false },
+                    MessageContextAction("edit", "编辑重发", c.accent) { model.startEditingMessage(message); showActions = false },
+                    MessageContextAction("refresh", "重新发送", c.muted) { model.retryMessage(message); showActions = false }
+                ),
+                onDismiss = { showActions = false }
+            )
         }
         return
     }
@@ -489,14 +491,15 @@ internal fun NativeMessage(
         contentAlignment = Alignment.CenterStart
     ) {
         // 1:1 linear iMessage-style right reveal (telemetry + quote reply cue) on left-swipe
-        if (swipeOffset.value < -1.5f) {
-            val slideShiftPx = with(density) { 14.dp.toPx() } * (1f - swipeRevealFraction)
+        if (showSwipeReveal) {
+            val baseSlidePx = with(density) { 14.dp.toPx() }
             Row(
                 Modifier.align(Alignment.CenterEnd)
                     .padding(end = 4.dp)
                     .graphicsLayer {
-                        alpha = swipeRevealFraction
-                        translationX = slideShiftPx
+                        val frac = (abs(swipeOffset.value) / revealWidthPx).coerceIn(0f, 1f)
+                        alpha = frac
+                        translationX = baseSlidePx * (1f - frac)
                     },
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -519,12 +522,14 @@ internal fun NativeMessage(
                         )
                     }
                 }
-                if (abs(swipeOffset.value) >= replyTriggerPx * 0.65f) {
+                if (showReplyCueIcon) {
                     Box(
                         Modifier.size(26.dp)
                             .graphicsLayer {
-                                scaleX = replyIconScale
-                                scaleY = replyIconScale
+                                val iconFrac = (abs(swipeOffset.value) / replyTriggerPx).coerceIn(0f, 1.2f)
+                                val sc = if (replyTriggered) replyCueTargetScale else (0.5f + 0.5f * iconFrac.coerceAtMost(1f))
+                                scaleX = sc
+                                scaleY = sc
                             }
                             .clip(CircleShape)
                             .background(c.surface.copy(alpha = 0.92f)),
@@ -556,7 +561,7 @@ internal fun NativeMessage(
                 PulseStickerImage(model, message.sticker)
             }
             val inlineMdImages = remember(message.text) {
-                Regex("""!\[[^\]]*\]\(([^)\s]+)\)""")
+                RE_INLINE_MD_IMAGE
                     .findAll(message.text)
                     .map { it.groupValues[1].trim() }
                     .filter { u ->
@@ -584,11 +589,11 @@ internal fun NativeMessage(
             val aiCleanText = remember(message.text, inlineMdImages) {
                 if (inlineMdImages.isEmpty()) message.text
                 else message.text
-                    .replace(Regex("""!\[[^\]]*\]\(([^)\s]+)\)""")) { m ->
+                    .replace(RE_INLINE_MD_IMAGE) { m ->
                         val target = m.groupValues[1].trim()
                         if (target in inlineMdImages) "" else m.value
                     }
-                    .replace(Regex("""\n{3,}"""), "\n\n")
+                    .replace(RE_ITEM_MULTI_NL, "\n\n")
                     .trim()
             }
             val hasBubbleContent = aiCleanText.isNotBlank() || isError || timelineItems.isNotEmpty() || trace.isNotEmpty() || cleanThought.isNotBlank()
@@ -601,17 +606,14 @@ internal fun NativeMessage(
                 val bubbleBorder = when {
                     isCollabBubble -> collabPurple.copy(alpha = 0.38f)
                     isError -> c.warn.copy(alpha = 0.42f)
-                    else -> if (s.dark) Color(0x28FFFFFF) else Color(0x1E000000)
+                    else -> c.line.copy(alpha = 0.72f)
                 }
                 Column(
                     Modifier.clip(aiBubbleShape)
                         .background(containerBg)
-                        .border(0.8.dp, bubbleBorder, aiBubbleShape)
+                        .border(0.5.dp, bubbleBorder, aiBubbleShape)
                         .combinedClickable(
-                            onClick = {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                showActions = !showActions
-                            },
+                            onClick = {},
                             onDoubleClick = {
                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                 model.reply(message)
@@ -627,24 +629,26 @@ internal fun NativeMessage(
                     if (isCollabBubble || ((isOtherBot || isNotification || message.kind == "curiosity") && !groupedWithPrev)) {
                         val headerTitle = when {
                             isBotToBotIn && message.direction == "outbound" ->
-                                "🟣 委派给 ${message.toBotName.ifBlank { speakerBot.name }} · 协作派单"
+                                "委派给 ${message.toBotName.ifBlank { speakerBot.name }} · 协作派单"
                             isBotToBotIn ->
-                                "🟣 来自 ${message.fromBotName.ifBlank { speakerBot.name }} · 协作委托"
+                                "来自 ${message.fromBotName.ifBlank { speakerBot.name }} · 协作委托"
                             isBotToBotReply && message.direction == "outbound" ->
-                                "🟣 回复 ${message.toBotName.ifBlank { "主助理" }} · 协作结论"
+                                "回复 ${message.toBotName.ifBlank { "主助理" }} · 协作结论"
                             isBotToBotReply ->
-                                "🟣 来自 ${message.fromBotName.ifBlank { speakerBot.name }} · 协作回信"
+                                "来自 ${message.fromBotName.ifBlank { speakerBot.name }} · 协作回信"
                             else ->
                                 message.fromBotName.ifBlank { speakerBot.name }
                         }
                         if (isCollabBubble) {
                             Row(
                                 Modifier.clip(RoundedCornerShape(8.dp))
-                                    .background(collabPurple.copy(alpha = 0.16f))
-                                    .border(0.6.dp, collabPurple.copy(alpha = 0.38f), RoundedCornerShape(8.dp))
-                                    .padding(horizontal = 8.dp, vertical = 3.5.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                    .background(collabPurple.copy(alpha = 0.14f))
+                                    .border(0.5.dp, collabPurple.copy(alpha = 0.34f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
+                                PulseIcon("share", collabPurple, Modifier.size(12.5.dp))
                                 Text(
                                     headerTitle,
                                     fontSize = 12.sp,
@@ -666,7 +670,6 @@ internal fun NativeMessage(
                             }
                         }
                     }
-                    val isTypingThis = s.activeTypewriterMsgId == message.id && s.activeTypewriterChars < aiCleanText.length
                     UnifiedTimelineBubbleContent(
                         model = model,
                         cardKey = message.id,
@@ -676,8 +679,8 @@ internal fun NativeMessage(
                         thought = cleanThought,
                         isLive = false,
                         isError = isError,
-                        typewriterCharBudget = if (isTypingThis) s.activeTypewriterChars else Int.MAX_VALUE,
-                        inlineStripRegex = Regex("""!\[[^\]]*\]\(([^)\s]+)\)"""),
+                        turnId = message.turnId,
+                        inlineStripRegex = RE_INLINE_MD_IMAGE,
                         inlineStripSet = inlineMdImages,
                     )
                     Row(
@@ -686,17 +689,35 @@ internal fun NativeMessage(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         if (trace.any {
+                                val tn = it.optString("tool")
+                                tn == "cloud" || tn == "cloud_desktop" || tn == "cloud_computer"
+                            }
+                        ) {
+                            Box(
+                                Modifier.heightIn(min = 34.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(c.accent.copy(alpha = 0.12f))
+                                    .iosPressScale(0.95f) { model.openCloudDesktop() }
+                                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("查看电脑 ›", color = c.accent, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                        if (trace.any {
                                 it.optString("tool").startsWith("phone") &&
                                     it.optJSONObject("arguments")?.optString("op") !in listOf("notifications", "get_notifications", "recent_notifications", "notifs", "notification")
                             }
                         ) {
-                            Text(
-                                "虚拟屏 ›",
-                                Modifier.clickable { model.launchFloatingVirtualDisplay() },
-                                color = c.accent,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Medium
-                            )
+                            Box(
+                                Modifier.heightIn(min = 36.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .iosPressScale(0.95f) { model.launchFloatingVirtualDisplay() }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("虚拟屏 ›", color = c.accent, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            }
                         }
                         Text(
                             model.time(message.created),
@@ -737,6 +758,7 @@ internal fun NativeMessage(
                     message.choices.forEach { choice ->
                         Box(
                             Modifier.fillMaxWidth()
+                                .heightIn(min = 40.dp)
                                 .clip(RoundedCornerShape(11.dp))
                                 .background(c.surface.copy(alpha = 0.90f))
                                 .iosPressScale(0.97f) {
@@ -748,11 +770,14 @@ internal fun NativeMessage(
                         ) {
                             Text(
                                 "✦ ${choice.label}",
-                                modifier = Modifier.fillMaxWidth().basicMarquee(iterations = Int.MAX_VALUE),
+                                modifier = Modifier.fillMaxWidth().then(
+                                    if (reduceMotion) Modifier else Modifier.basicMarquee(iterations = 2)
+                                ),
                                 color = c.accent,
                                 fontSize = 13.5.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 textAlign = TextAlign.Center
                             )
                         }
@@ -770,36 +795,52 @@ internal fun NativeMessage(
                         .clip(RoundedCornerShape(10.dp))
                         .background(c.surface.copy(alpha = 0.85f))
                         .border(0.5.dp, c.line.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
-                        .padding(horizontal = 6.dp, vertical = 3.dp),
+                        .padding(horizontal = 2.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    Text(
-                        "‹",
-                        Modifier.clip(RoundedCornerShape(6.dp))
-                            .clickable { model.switchMessageVariant(message, prevV) }
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        color = c.muted,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Box(
+                        Modifier.defaultMinSize(minWidth = 44.dp, minHeight = 44.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .iosPressScale(0.92f) {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                model.switchMessageVariant(message, prevV)
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "‹",
+                            color = c.muted,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                     if (totalV <= 6) {
                         for (vIdx in 0 until totalV) {
                             val isSel = vIdx == curV
                             Box(
-                                Modifier.clip(RoundedCornerShape(6.dp))
-                                    .background(if (isSel) c.accent else Color.Transparent)
-                                    .clickable { if (!isSel) model.switchMessageVariant(message, vIdx) }
-                                    .padding(horizontal = 7.dp, vertical = 2.dp),
+                                Modifier.defaultMinSize(minWidth = 44.dp, minHeight = 44.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .iosPressScale(0.92f, enabled = !isSel) {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        model.switchMessageVariant(message, vIdx)
+                                    },
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text(
-                                    "${vIdx + 1}",
-                                    color = if (isSel) Color.White else c.muted,
-                                    fontSize = 11.5.sp,
-                                    fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
-                                    style = TextStyle(fontFeatureSettings = "tnum")
-                                )
+                                Box(
+                                    Modifier.clip(RoundedCornerShape(6.dp))
+                                        .background(if (isSel) c.accent else Color.Transparent)
+                                        .padding(horizontal = 9.dp, vertical = 3.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        "${vIdx + 1}",
+                                        color = if (isSel) Color.White else c.muted,
+                                        fontSize = 11.5.sp,
+                                        fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                                        style = TextStyle(fontFeatureSettings = "tnum")
+                                    )
+                                }
                             }
                         }
                     } else {
@@ -812,66 +853,47 @@ internal fun NativeMessage(
                             style = TextStyle(fontFeatureSettings = "tnum")
                         )
                     }
-                    Text(
-                        "›",
-                        Modifier.clip(RoundedCornerShape(6.dp))
-                            .clickable { model.switchMessageVariant(message, nextV) }
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        color = c.muted,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Box(
+                        Modifier.defaultMinSize(minWidth = 44.dp, minHeight = 44.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .iosPressScale(0.92f) { model.switchMessageVariant(message, nextV) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "›",
+                            color = c.muted,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
 
-            // 6. Linear-Animated Floating Action Pill Menu + Detailed Telemetry Inset
-            AnimatedVisibility(
+            val fullTelemetry = listOfNotNull(
+                message.engine.takeIf { it.isNotBlank() },
+                telemetryRow1.takeIf { it.isNotBlank() },
+                telemetryRow2.takeIf { it.isNotBlank() }
+            ).joinToString(" · ")
+            AppleMessageContextOverlay(
                 visible = showActions,
-                enter = expandVertically(tween(200, easing = LinearOutSlowInEasing)) +
-                    scaleIn(tween(180, easing = LinearEasing), initialScale = 0.94f) +
-                    fadeIn(tween(150, easing = LinearEasing)),
-                exit = shrinkVertically(tween(150, easing = FastOutLinearInEasing)) +
-                    scaleOut(tween(130, easing = LinearEasing), targetScale = 0.94f) +
-                    fadeOut(tween(110, easing = LinearEasing))
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                    val fullTelemetry = listOfNotNull(
-                        message.engine.takeIf { it.isNotBlank() },
-                        telemetryRow1.takeIf { it.isNotBlank() },
-                        telemetryRow2.takeIf { it.isNotBlank() }
-                    ).joinToString(" · ")
-                    if (fullTelemetry.isNotBlank()) {
-                        Text(
-                            fullTelemetry,
-                            color = c.muted,
-                            fontSize = 11.sp,
-                            style = TextStyle(fontFeatureSettings = "tnum"),
-                            modifier = Modifier.padding(horizontal = 4.dp)
-                        )
-                    }
-                    Row(
-                        Modifier.clip(RoundedCornerShape(12.dp))
-                            .background(c.surface)
-                            .border(0.5.dp, c.line.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
-                            .padding(horizontal = 12.dp, vertical = 7.dp),
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        TelegramActionChip("copy", "复制", c.ink) { model.copy(message.text); showActions = false }
-                        TelegramActionChip("reply", "引用", c.ink) { model.reply(message); showActions = false }
-                        TelegramActionChip("spark", "重生成", c.ink) { model.rerollMessage(message); showActions = false }
-                        TelegramActionChip("pin", "钉住记忆", c.accent) {
-                            val t = message.text.trim()
-                            val clipped = if (t.length <= 280) t else {
-                                val cut = if (t[279].isHighSurrogate()) 279 else 280
-                                t.substring(0, cut) + "…"
-                            }
-                            model.addMemoryPin(clipped)
-                            showActions = false
+                previewText = aiCleanText.ifBlank { message.text }.trim(),
+                telemetry = fullTelemetry,
+                actions = listOf(
+                    MessageContextAction("copy", "复制回复", c.ink) { model.copy(message.text); showActions = false },
+                    MessageContextAction("reply", "引用回复", c.ink) { model.reply(message); showActions = false },
+                    MessageContextAction("refresh", "重新生成", c.ink) { model.rerollMessage(message); showActions = false },
+                    MessageContextAction("pin", "钉住核心记忆", c.accent) {
+                        val t = message.text.trim()
+                        val clipped = if (t.length <= 280) t else {
+                            val cut = if (t[279].isHighSurrogate()) 279 else 280
+                            t.substring(0, cut) + "…"
                         }
+                        model.addMemoryPin(clipped)
+                        showActions = false
                     }
-                }
-            }
+                ),
+                onDismiss = { showActions = false }
+            )
         }
     }
 }

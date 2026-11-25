@@ -15,7 +15,7 @@ class RunInput(BaseModel):
 class InputAction(BaseModel):
     kind: Literal[
         'click', 'double_click', 'right_click', 'move', 'hover', 'drag',
-        'scroll', 'key', 'hotkey', 'type', 'launch_app', 'bash', 'batch',
+        'scroll', 'key', 'hotkey', 'type', 'launch_app', 'bash', 'eval_js', 'batch',
         'focus_window', 'close_window', 'tile_windows', 'clipboard',
         'click_ref', 'type_ref', 'wait', 'find_text',
     ]
@@ -33,6 +33,7 @@ class InputAction(BaseModel):
     target: str = Field('', max_length=200)
     text: str = Field('', max_length=16000)
     command: str = Field('', max_length=16000)
+    script: str = Field('', max_length=16000)
     key: str = Field('', max_length=60)
     app: str = Field('', max_length=80)
     direction: Literal['up', 'down', 'left', 'right'] = 'down'
@@ -46,11 +47,13 @@ class InputAction(BaseModel):
     is_input: bool = False
     steps: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     include_frame: bool = True
+    actor: Literal['agent', 'user'] = 'agent'
 
 
 class NavigateInput(BaseModel):
     url: str = Field(min_length=4, max_length=3000)
     include_frame: bool = True
+    actor: Literal['agent', 'user'] = 'agent'
 
 
 class SteerInput(BaseModel):

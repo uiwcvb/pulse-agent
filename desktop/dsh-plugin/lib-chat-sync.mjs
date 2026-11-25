@@ -94,7 +94,7 @@ export async function waitForCloudBotReply(localBot, cloudBotId, epoch, ctrl, ma
       tail.role === "assistant" &&
       !tail.is_sub_turn &&
       normMsgKind(tail.kind) !== "bot_message" &&
-      String(tail.text || "").trim() &&
+      (String(tail.text || "").trim() || String(tail.sticker || "").trim() || (Array.isArray(tail.attachments) && tail.attachments.length > 0)) &&
       (!tail.id || (!knownBefore.has(String(tail.id)) && !knownBefore.has(`reply-${tail.id}`))) &&
       (!expectedTurnId || !tail.turn_id || tail.turn_id === expectedTurnId)
     ) {
@@ -156,25 +156,28 @@ export async function executeCloudChatTurn(op, body = {}) {
 
   if (op === "send") {
     const text = String(body?.text || body?.message || "").trim();
-    if (!text) return { ok: false, error: "消息不能为空" };
-    let lastRoomIdx = -1;
-    for (let i = cached.length - 1; i >= 0; i--) {
-      if (cached[i].bot_id === bot.id) { lastRoomIdx = i; break; }
-    }
-    if (lastRoomIdx >= 0 && cached[lastRoomIdx].role === "user" && cached[lastRoomIdx].text === text) {
-      userMsg = cached[lastRoomIdx];
+    const sticker = String(body?.sticker || "").trim();
+    if (!text && !sticker) return { ok: false, error: "消息不能为空" };
+    const reqCid = String(body?.client_msg_id || "").trim();
+    const dupIdx = reqCid
+      ? cached.findIndex((m) => m.bot_id === bot.id && m.role === "user" && (m.id === reqCid || m.client_msg_id === reqCid))
+      : -1;
+    if (dupIdx >= 0) {
+      userMsg = cached[dupIdx];
       reused = true;
       kept = cached;
     } else {
-      const rawId = String(body?.message_id || body?.client_msg_id || `pc-${Date.now()}`);
+      const rawId = String(body?.message_id || reqCid || `pc-${Date.now()}`);
+      const effId = rawId.startsWith("pc-") ? rawId : `pc-${rawId}`;
       const maxExistingSeq = cached.reduce((mx, item) => Math.max(mx, Number(item?.order_seq || item?.seq || 0)), 0);
       const nowMs = Date.now();
       userMsg = {
-        id: rawId.startsWith("pc-") ? rawId : `pc-${rawId}`,
-        client_msg_id: rawId.startsWith("pc-") ? rawId : `pc-${rawId}`,
+        id: effId,
+        client_msg_id: effId,
         role: "user",
         kind: "chat",
         text,
+        ...(sticker ? { sticker } : {}),
         bot_id: bot.id,
         source: "pc",
         pc_local: true,
@@ -189,24 +192,17 @@ export async function executeCloudChatTurn(op, body = {}) {
     const messageId = String(body?.message_id || "").trim();
     const newText = String(body?.text || "").trim();
     if (!messageId || !newText) return { ok: false, error: "message_id 和新内容不能为空" };
-    let targetIdx = cached.findIndex((m) => m.id === messageId && m.bot_id === bot.id);
-    if (targetIdx === -1) targetIdx = cached.findIndex((m) => m.id === messageId);
+    let targetIdx = cached.findIndex((m) => (m.id === messageId || m.client_msg_id === messageId) && m.bot_id === bot.id);
+    if (targetIdx === -1) targetIdx = cached.findIndex((m) => m.id === messageId || m.client_msg_id === messageId);
     if (targetIdx === -1) {
-      for (let i = cached.length - 1; i >= 0; i--) {
-        if (cached[i].bot_id === bot.id && cached[i].role === "user") { targetIdx = i; break; }
-      }
+      return { ok: false, error: `未找到待编辑的消息 (${messageId})` };
     }
-    if (targetIdx >= 0) {
-      for (let i = 0; i < cached.length; i++) {
-        if (i < targetIdx || cached[i].bot_id !== bot.id) kept.push(cached[i]);
-        else if (i === targetIdx) {
-          userMsg = { ...cached[i], id: String(cached[i].id || "").startsWith("pc-") ? cached[i].id : `pc-${cached[i].id || Date.now()}`, role: "user", text: newText, bot_id: bot.id, source: "pc", pc_local: true };
-          kept.push(userMsg);
-        } else removedIds.push(cached[i].id);
-      }
-    } else {
-      userMsg = { id: messageId.startsWith("pc-") ? messageId : `pc-${messageId}`, role: "user", text: newText, bot_id: bot.id, source: "pc", pc_local: true, time: new Date().toLocaleTimeString("zh-CN", { hour12: false }) };
-      kept = [...cached, userMsg];
+    for (let i = 0; i < cached.length; i++) {
+      if (i < targetIdx || cached[i].bot_id !== bot.id) kept.push(cached[i]);
+      else if (i === targetIdx) {
+        userMsg = { ...cached[i], id: String(cached[i].id || messageId), role: "user", text: newText, bot_id: bot.id, source: "pc", pc_local: true };
+        kept.push(userMsg);
+      } else removedIds.push(cached[i].id);
     }
     saveLocalChatCache(kept, true, true);
   } else if (op === "reroll") {
@@ -239,7 +235,7 @@ export async function executeCloudChatTurn(op, body = {}) {
   let assistantMsg = null;
   try {
     if (op === "send") {
-      primaryRes = await cloudFetch("/api/chat", "POST", { text: userMsg.text, bot_id: cloudBotId, mode: body?.mode || "auto", client_msg_id: userMsg.id, source: "pc", async_ack: true }, 25000, ctrl.signal)
+      primaryRes = await cloudFetch("/api/chat", "POST", { text: userMsg.text, ...(userMsg.sticker ? { sticker: userMsg.sticker } : {}), bot_id: cloudBotId, mode: body?.mode || "auto", client_msg_id: userMsg.id, source: "pc", async_ack: true }, 25000, ctrl.signal)
         .catch((e) => ({ ok: false, error: String(e?.message || e) }));
     } else {
       const endpoint = op === "edit" ? "/api/messages/edit" : "/api/messages/reroll";
@@ -247,8 +243,10 @@ export async function executeCloudChatTurn(op, body = {}) {
         ? { message_id: userMsg.id, text: userMsg.text, bot_id: cloudBotId, source: "pc" }
         : { bot_id: cloudBotId, message_id: userMsg.id, source: "pc" };
       primaryRes = await cloudFetch(endpoint, "POST", reqPayload, 25000, ctrl.signal)
-        .catch((e) => ({ ok: false, error: String(e?.message || e) }));
-      if (!primaryRes?.ok) {
+        .catch((e) => ({ ok: false, network_error: true, error: String(e?.message || e) }));
+      const stCode = Number(primaryRes?.status || 0);
+      const isBusiness4xx = stCode >= 400 && stCode < 500 && stCode !== 404 && stCode !== 405;
+      if (!primaryRes?.ok && !isBusiness4xx && op === "reroll") {
         primaryRes = await cloudFetch("/api/chat", "POST", { text: userMsg.text, bot_id: cloudBotId, mode: "auto", client_msg_id: userMsg.id, source: "pc", async_ack: true }, 25000, ctrl.signal)
           .catch((e) => ({ ok: false, error: String(e?.message || e) }));
       }

@@ -8,7 +8,11 @@ work/
 dist/*.apk
 dist/*.tar.gz
 dist/*.zip
-.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/pulse-pc-bootstrap/
+!.agents/skills/pulse-quickstart/
 android/.gradle/
 android/build/
 android/app/build/

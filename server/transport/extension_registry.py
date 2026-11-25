@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from core.interfaces import MemoryHook, SearchPlugin, ToolPlugin
 
@@ -82,38 +83,152 @@ class ExtensionRegistry:
                     pass
         return True
 
-    def resolve_sticker(self, code: str) -> str:
-        key = (code or '').strip().lower()
-        if not key:
-            return ''
+    def list_active_stickers(self) -> List[Dict[str, str]]:
+        items: List[Dict[str, str]] = []
         for pid, pack in self.sticker_packs.items():
             if not pack.get('enabled', True):
                 continue
             stickers = pack.get('stickers') or {}
-            if key in stickers:
-                fname = stickers[key].get('file') or f'{key}.png'
-                return f'/stickers/{pid}/{fname}'
+            if not isinstance(stickers, dict):
+                continue
             for sk, sinfo in stickers.items():
-                lbl = str(sinfo.get('label') or '').strip().lower()
-                if key == sk.lower() or (lbl and (key in lbl or lbl in key)):
-                    fname = sinfo.get('file') or f'{sk}.png'
-                    return f'/stickers/{pid}/{fname}'
-        return ''
+                info = sinfo if isinstance(sinfo, dict) else {}
+                fname = str(info.get('file') or f'{sk}.png').strip()
+                lbl = str(info.get('label') or sk).strip()
+                items.append({
+                    'pack_id': pid,
+                    'code': str(sk),
+                    'label': lbl,
+                    'file': fname,
+                    'url': f'/stickers/{pid}/{fname}',
+                })
+        return items
 
-    def sticker_prompt_hint(self) -> str:
-        active_items: List[str] = []
+    def resolve_sticker_info(self, code: str) -> Optional[Dict[str, str]]:
+        raw = str(code or '').strip()
+        if not raw:
+            return None
+        # Unwrap optional shell syntax such as <sticker:wink>, [sticker: wink], [表情: 眨眼得意], [贴纸：开心比心]
+        m_wrap = re.fullmatch(
+            r"""(?:<sticker\s*[:：]\s*([^>\n]+?)\s*/?>|\[(?:sticker|表情|贴纸)\s*[:：]\s*([^\]\n]+?)\]|<sticker>\s*([^<\n]+?)\s*</sticker>)""",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m_wrap:
+            raw = (m_wrap.group(1) or m_wrap.group(2) or m_wrap.group(3) or '').strip()
+        raw = raw.strip().strip('"\'`').strip()
+        if not raw:
+            return None
+
+        norm = raw.replace('：', ':')
+        target_pack: str | None = None
+        if norm.lower().startswith('/stickers/'):
+            rest = norm[len('/stickers/'):].lstrip('/')
+            if '/' in rest:
+                p_cand, r_cand = rest.split('/', 1)
+                if p_cand in self.sticker_packs:
+                    target_pack = p_cand
+                    norm = r_cand.strip()
+        elif '/' in norm or ':' in norm:
+            sep = '/' if '/' in norm else ':'
+            p_cand, r_cand = norm.split(sep, 1)
+            p_cand_clean = p_cand.strip()
+            for pid in self.sticker_packs:
+                if pid.lower() == p_cand_clean.lower():
+                    target_pack = pid
+                    norm = r_cand.strip()
+                    break
+
+        norm_low = norm.lower().strip()
+        if not norm_low:
+            return None
+        norm_stem = re.sub(r'\.(?:png|webp|gif|jpe?g)$', '', norm_low, flags=re.IGNORECASE)
+        norm_compact = norm_low.replace(' ', '')
+
+        candidates: list[tuple[str, str, str, str, list[str]]] = []
         for pid, pack in self.sticker_packs.items():
             if not pack.get('enabled', True):
                 continue
-            for sk, sinfo in (pack.get('stickers') or {}).items():
-                lbl = str(sinfo.get('label') or sk)
-                active_items.append(f'{sk}={lbl}')
+            if target_pack is not None and pid != target_pack:
+                continue
+            stickers = pack.get('stickers') or {}
+            if not isinstance(stickers, dict):
+                continue
+            for sk, sinfo in stickers.items():
+                info = sinfo if isinstance(sinfo, dict) else {}
+                fname = str(info.get('file') or f'{sk}.png').strip()
+                lbl = str(info.get('label') or sk).strip()
+                raw_aliases = info.get('aliases')
+                aliases = [str(a).strip() for a in raw_aliases if str(a).strip()] if isinstance(raw_aliases, list) else []
+                candidates.append((pid, str(sk), lbl, fname, aliases))
+
+        def _make_item(c: tuple[str, str, str, str, list[str]]) -> Dict[str, str]:
+            pid, sk, lbl, fname, _ = c
+            return {
+                'pack_id': pid,
+                'code': sk,
+                'label': lbl,
+                'file': fname,
+                'url': f'/stickers/{pid}/{fname}',
+            }
+
+        # Tier 1: exact sticker code or exact file name / stem
+        for c in candidates:
+            _, sk, _, fname, _ = c
+            sk_low = sk.lower()
+            fn_low = fname.lower()
+            fn_stem = Path(fname).stem.lower()
+            if norm_low in (sk_low, fn_low) or norm_stem in (sk_low, fn_stem):
+                return _make_item(c)
+
+        # Tier 2: exact label or alias (case-insensitive)
+        for c in candidates:
+            _, _, lbl, _, aliases = c
+            lbl_low = lbl.lower()
+            if norm_low == lbl_low or norm_compact == lbl_low.replace(' ', ''):
+                return _make_item(c)
+            for al in aliases:
+                al_low = al.lower()
+                if norm_low == al_low or norm_compact == al_low.replace(' ', ''):
+                    return _make_item(c)
+
+        # Tier 3: strict prefix / substring of label or aliases ONLY for queries of length >= 2
+        if len(norm_low) >= 2:
+            prefix_hits: list[tuple[int, tuple[str, str, str, str, list[str]]]] = []
+            sub_hits: list[tuple[int, tuple[str, str, str, str, list[str]]]] = []
+            for c in candidates:
+                _, _, lbl, _, aliases = c
+                texts = [lbl.lower(), *(a.lower() for a in aliases)]
+                matched_prefix = [len(t) for t in texts if t.startswith(norm_low)]
+                if matched_prefix:
+                    prefix_hits.append((min(matched_prefix), c))
+                    continue
+                matched_sub = [len(t) for t in texts if norm_low in t]
+                if matched_sub:
+                    sub_hits.append((min(matched_sub), c))
+            if prefix_hits:
+                prefix_hits.sort(key=lambda pair: pair[0])
+                return _make_item(prefix_hits[0][1])
+            if sub_hits:
+                sub_hits.sort(key=lambda pair: pair[0])
+                return _make_item(sub_hits[0][1])
+
+        return None
+
+    def resolve_sticker(self, code: str) -> str:
+        info = self.resolve_sticker_info(code)
+        return info['url'] if info else ''
+
+    def sticker_prompt_hint(self) -> str:
+        active_items: List[str] = []
+        for s in self.list_active_stickers():
+            active_items.append(f"{s['code']}={s['label']}")
         if not active_items:
             return ''
         joined = ', '.join(active_items[:16])
         return (
-            f'\n【可选表情包插件已启用】：日常互动、撒娇、得意或表达情绪时，可在回复末尾顺手附带一个表情包标签 `<sticker:代码>`'
-            f'（可用代码：{joined}；前端会自动渲染成无背景大贴纸，正文绝不裸露标签）。'
+            f'\n【表情贴纸】：日常互动、撒娇、得意或表达情绪想配一张贴纸时，直接调用原生工具 `reply(op="sticker", code="代码")`'
+            f'（可用代码：{joined}；贴纸会自动附在回复旁，严禁在正文中手写 `<sticker:...>` 或 `[sticker:...]` 标签）。'
         )
 
     def tool_schemas(self) -> List[Dict[str, Any]]:
@@ -201,6 +316,16 @@ class ExtensionRegistry:
                     'enabled': p['enabled'],
                     'count': len(p.get('stickers') or {}),
                     'codes': list((p.get('stickers') or {}).keys()),
+                    'stickers': [
+                        {
+                            'code': sk,
+                            'label': str((sinfo or {}).get('label') or sk),
+                            'file': str((sinfo or {}).get('file') or f'{sk}.png'),
+                            'url': f"/stickers/{p['id']}/{str((sinfo or {}).get('file') or f'{sk}.png')}",
+                        }
+                        for sk, sinfo in (p.get('stickers') or {}).items()
+                        if isinstance(sinfo, dict) or sk
+                    ],
                 }
                 for p in self.sticker_packs.values()
             ],

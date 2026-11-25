@@ -222,3 +222,57 @@ def run_storage_hygiene(
 
 
 run_storage_maintenance = run_storage_hygiene
+
+
+def compact_trace_list(trace: list | None, finalize: bool = False) -> list[dict]:
+    """
+    Strip heavy tool outputs and large write_file/edit_file argument blobs from persisted/broadcast UI trace arrays.
+    When `finalize=True`, any leftover 'running' status is normalized to 'done'.
+    """
+    if not isinstance(trace, list):
+        return []
+    compacted: list[dict] = []
+    for step in trace[-256:]:
+        if not isinstance(step, dict):
+            continue
+        raw_args = step.get('arguments')
+        slim_args: dict = {}
+        if isinstance(raw_args, dict):
+            for k, v in raw_args.items():
+                if k in ('content', 'old', 'new', 'code', 'script', 'image', 'base64'):
+                    continue
+                if isinstance(v, str):
+                    slim_args[k] = v[:90]
+                elif isinstance(v, (int, float, bool)):
+                    slim_args[k] = v
+                elif isinstance(v, list):
+                    slim_args[k] = v[:4]
+        raw_res = step.get('result')
+        slim_res: dict = {}
+        if isinstance(raw_res, dict):
+            if raw_res.get('error'):
+                slim_res['error'] = str(raw_res['error'])[:200]
+            if str(step.get('tool') or '') in ('send_message', 'send_message_callback'):
+                for k in ('ok', 'status', 'from_bot_id', 'from_bot_name', 'to_bot_id', 'to_bot_name'):
+                    if k in raw_res:
+                        slim_res[k] = raw_res[k]
+                if raw_res.get('reply'):
+                    slim_res['reply'] = str(raw_res['reply'])[:300]
+        entry: dict = {
+            'tool': str(step.get('tool') or ''),
+            'arguments': slim_args,
+            'duration_ms': int(step.get('duration_ms') or 0),
+        }
+        st_val = str(step.get('status') or '')
+        if finalize and st_val == 'running':
+            st_val = 'done'
+        if st_val:
+            entry['status'] = st_val
+        if slim_res:
+            entry['result'] = slim_res
+        if step.get('step_note'):
+            entry['step_note'] = str(step['step_note'])[:280]
+        if step.get('step_thought'):
+            entry['step_thought'] = str(step['step_thought'])[:280]
+        compacted.append(entry)
+    return compacted

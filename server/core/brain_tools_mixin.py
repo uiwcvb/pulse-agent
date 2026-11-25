@@ -97,6 +97,8 @@ class BrainToolsMixin(StreamPublisherMixin):
                 res_cnt = int((_auto_resume_spec or {}).get('resume_count') or 0)
                 TaskContinuityManager.touch_foreground_activity(self.store)
                 TaskContinuityManager.begin_foreground_chain(self, bot_id, src, eff_turn_id, text, user_msg_seq=u_seq, resume_count=res_cnt)
+                if hasattr(self, '_touch_cache_keepalive'):
+                    self._touch_cache_keepalive(src, bot_id)
             prev_interrupted_ledger = TurnLedgerManager.begin_turn(self.store, src, bot_id, eff_turn_id, text) if self.hop_depth.get() == 0 else None
             my_exec = {'bot_id': bot_id, 'source': src, 'turn_id': eff_turn_id, 'goal': text[:200], 'trace': [], 'turn_steps': [], 'tool': None, 'started_at': time.time()}
             self.executions_by_node_bot[f'{src}:{bot_id}'] = my_exec
@@ -124,8 +126,7 @@ class BrainToolsMixin(StreamPublisherMixin):
                     final_msg_for_handoff = await self.emit('记下了。具体最卡的是哪一步，理想结果又是什么？\n\n目前使用本地引导；在右上角「设置」中填入 API Key 并选择模型后，就能直接读写工作区、调工具和安排其它 Bot 干活啦。', 'curiosity', engine='local_prompt', source=src)
                     return final_msg_for_handoff
 
-                from core.observation_masker import GUI_UI_TOOLS, extract_ephemeral_ui_from_result, maybe_mask_room_observations
-                maybe_mask_room_observations(self.store, self.memory_engine, bot_id, source=src)
+                from core.observation_masker import GUI_UI_TOOLS, extract_ephemeral_ui_from_result
                 comp_res = await self._auto_compact_if_needed(bot_id, source=src)
                 if isinstance(comp_res, dict) and comp_res.get('compacted') and hasattr(self, 'dsh_adapter'):
                     with contextlib.suppress(Exception):

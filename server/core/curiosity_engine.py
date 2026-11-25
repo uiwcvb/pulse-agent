@@ -534,7 +534,10 @@ class CuriosityEngine:
                 except (ValueError, KeyError):
                     c_args = {}
             t0 = asyncio.get_running_loop().time()
-            res = await b.harness.execute(c_name, c_args) if is_tool_allowed(c_name, allowed) else {'error': '此助手未启用该工具'}
+            try:
+                res = await b.harness.execute(c_name, c_args) if is_tool_allowed(c_name, allowed) else {'error': '此助手未启用该工具'}
+            except Exception as exc:
+                res = {'ok': False, 'error': f'{type(exc).__name__}: {str(exc)[:260]}'}
             dur = max(1, round((asyncio.get_running_loop().time() - t0) * 1000))
             return c_item, c_name, c_args, res, dur, r_ent
 
@@ -595,279 +598,281 @@ class CuriosityEngine:
         src = normalize_node_source(source)
         target_id = bot_id or self.store.state['primary_bot_id']
         origin_tok = b.turn_origin_context.set('autonomous') if hasattr(b, 'turn_origin_context') else None
-        async with b.lock, b._get_bot_lock(target_id, src):
-            pre_push_guard = gate.capture_guard() if gate is not None else None
-            if not manual:
-                if b.executions_by_bot or any(bool(q) for q in b.queued_tasks_by_bot.values()):
-                    return {'suppressed': True, 'reason': 'bot_busy', 'next_delay_s': 120.0}
-                bot_for_src = get_assistant(self.store, target_id, source=src)
-                if not bot_for_src.get('curiosity_enabled', False):
-                    return {'suppressed': True, 'reason': 'curiosity_disabled_on_node'}
+        try:
+            async with b.lock, b._get_bot_lock(target_id, src):
+                pre_push_guard = gate.capture_guard() if gate is not None else None
+                if not manual:
+                    if b.executions_by_bot or any(bool(q) for q in b.queued_tasks_by_bot.values()):
+                        return {'suppressed': True, 'reason': 'bot_busy', 'next_delay_s': 120.0}
+                    bot_for_src = get_assistant(self.store, target_id, source=src)
+                    if not bot_for_src.get('curiosity_enabled', False):
+                        return {'suppressed': True, 'reason': 'curiosity_disabled_on_node'}
 
-            marker = b.bot_context.set(target_id)
-            room_marker = b.room_context.set(target_id)
-            src_marker = b.source_context.set(src)
-            cur_turn_token = b.turn_id_var.set('turn-' + secrets.token_hex(6))
-            cur_prefix_token = b.stream_prefix_var.set('')
-            cur_choices_token = b.choices_var.set(None)
-            cur_choices_prompt_token = b.choices_prompt_var.set('')
-            cur_task_c = asyncio.current_task()
-            nb_cur = f'{src}:{target_id}'
-            if cur_task_c:
-                b.active_tasks_by_node_bot[nb_cur] = cur_task_c
-                b.active_tasks_by_bot[target_id] = cur_task_c
-            b.activity = 'curiosity'
-            try:
-                now_ts = time.time()
-                bot = get_assistant(self.store, target_id, source=src)
-                use_big = (bot.get('engine') == 'big')
-                cfg = self.store.config
-                api_key = cfg.effective_api_key(big=use_big) or cfg.effective_api_key(big=not use_big)
-                model = cfg.effective_model(bot_model=bot.get('model', ''), big=use_big) or cfg.effective_model(bot_model=bot.get('model', ''), big=not use_big)
+                marker = b.bot_context.set(target_id)
+                room_marker = b.room_context.set(target_id)
+                src_marker = b.source_context.set(src)
+                cur_turn_token = b.turn_id_var.set('turn-' + secrets.token_hex(6))
+                cur_prefix_token = b.stream_prefix_var.set('')
+                cur_choices_token = b.choices_var.set(None)
+                cur_choices_prompt_token = b.choices_prompt_var.set('')
+                cur_task_c = asyncio.current_task()
+                nb_cur = f'{src}:{target_id}'
+                if cur_task_c:
+                    b.active_tasks_by_node_bot[nb_cur] = cur_task_c
+                    b.active_tasks_by_bot[target_id] = cur_task_c
+                b.activity = 'curiosity'
+                try:
+                    now_ts = time.time()
+                    bot = get_assistant(self.store, target_id, source=src)
+                    use_big = (bot.get('engine') == 'big')
+                    cfg = self.store.config
+                    api_key = cfg.effective_api_key(big=use_big) or cfg.effective_api_key(big=not use_big)
+                    model = cfg.effective_model(bot_model=bot.get('model', ''), big=use_big) or cfg.effective_model(bot_model=bot.get('model', ''), big=not use_big)
 
-                # BUG-TOX-01/02 purge: zero canned fallback when no API key/model is configured.
-                if not api_key or not model:
-                    b._finish_curiosity_cycle('silent', target_id, '未配置可用模型 API Key，静默跳过')
-                    return {'status': 'silent', 'ok': True, 'silent': True, 'bot_id': target_id, 'reason': 'no_api_key_configured'}
+                    # BUG-TOX-01/02 purge: zero canned fallback when no API key/model is configured.
+                    if not api_key or not model:
+                        b._finish_curiosity_cycle('silent', target_id, '未配置可用模型 API Key，静默跳过')
+                        return {'status': 'silent', 'ok': True, 'silent': True, 'bot_id': target_id, 'reason': 'no_api_key_configured'}
 
-                if api_key != 'fixture' and b.is_phone_online():
-                    await b._poll_and_converge_notifications(timeout=2.5)
-                notif_digest_md = b.notification_hub.build_curiosity_digest(mark_seen=False)
-                raw_imp, missing_imp = b.memory_engine.get_personal_impression()
-                recent_items = [m for m in self.store.state['messages'] if m.get('bot_id', 'companion') == target_id and normalize_node_source(m.get('source')) == src][-8:]
-                coalesced = self._collect_coalesced_periodic_work(now_ts=now_ts, target_id=target_id)
+                    if api_key != 'fixture' and b.is_phone_online():
+                        await b._poll_and_converge_notifications(timeout=2.5)
+                    notif_digest_md = b.notification_hub.build_curiosity_digest(mark_seen=False)
+                    raw_imp, missing_imp = b.memory_engine.get_personal_impression()
+                    recent_items = [m for m in self.store.state['messages'] if m.get('bot_id', 'companion') == target_id and normalize_node_source(m.get('source')) == src][-8:]
+                    coalesced = self._collect_coalesced_periodic_work(now_ts=now_ts, target_id=target_id)
 
-                plan = self._select_intent(
-                    now_ts=now_ts,
-                    manual=manual,
-                    target_id=target_id,
-                    raw_imp=raw_imp,
-                    notif_digest_md=notif_digest_md,
-                    recent_msgs=recent_items,
-                    coalesced=coalesced,
-                )
-                if plan.get('intent') == 'silent_noop':
-                    self._record_silent_episode(plan, target_id, plan.get('reason', ''), 'zero_token_noop', [], now_ts)
-                    b._finish_curiosity_cycle('silent', target_id, str(plan.get('reason') or 'silent_noop'))
-                    return {'status': 'silent', 'ok': True, 'silent': True, 'bot_id': target_id, 'intent': 'silent_noop', 'reason': str(plan.get('reason') or '')}
-
-                bot_allowed = normalize_bot_tools(bot.get('tools'))
-                allowed = [name for name in CURIOSITY_SAFE_TOOLS if is_tool_allowed(name, bot_allowed) or name == 'reply']
-                available_tools = [t for t in TOOLS if is_tool_allowed(t['function']['name'], allowed)]
-
-                opps = b.vault.read('tasks/sniffed_opportunities.md')[:2400]
-                deadlines = b.vault.read('tasks/active_deadlines.md')[:2400]
-                routines_md = b.vault.read('playbooks/routines.md')[:2000]
-                schedule_md = ''
-                with contextlib.suppress(Exception):
-                    schedule_md = b.vault.read('profile/course_schedule.md')[:3000]
-
-                deltas_block = b.memory_engine.peek_recent_memory_deltas(limit=8)
-                sql = getattr(self.store, 'sql', None)
-                recent_episodes = sql.list_recent_curiosity_episodes(limit=6) if (sql is not None and hasattr(sql, 'list_recent_curiosity_episodes')) else []
-
-                recent_digest = [
-                    {
-                        'role': m.get('role', 'user'),
-                        'speaker': '用户' if m.get('role') == 'user' else (m.get('from_bot_name') or bot['name']),
-                        'kind': m.get('kind', 'chat'),
-                        'text': (b._get_llm_history_text(m) if m.get('role') == 'assistant' else m.get('text', ''))[:240],
-                    }
-                    for m in recent_items
-                ]
-                missing_hint = ('\n- ' + '\n- '.join(missing_imp[:8])) if missing_imp else '（主要维度已初步记录，可深入细节）'
-                intent_directive = self._format_intent_directive(plan, recent_episodes)
-                periodic_awareness = self._build_periodic_awareness_summary(target_id=target_id, coalesced=coalesced)
-
-                force_ask = bool(plan.get('force_ask_curiosity'))
-                mode_rules = (
-                    '【好奇心主动提问模式 · 本轮强制发问】：\n'
-                    '- 主人已把好奇心设为主动提问模式：本轮**必须**用 2~4 句自然熟稔的口吻向主人提出**一个明确、具体且带问号（？/?）的问题**，**严禁**调用 `reply(op="silent")` 或输出 `SILENT_OK` 静默跳过。\n'
-                    '- 若周期巡检/通知栏无异常或旧待办已过时，直接略过汇报废话，切入下方的【本轮强制好奇心提问】方向自然聊天并提问；可按需调用 `reply(op="choices", choices=[...])` 提供贴心快捷选项。\n'
-                    if force_ask
-                    else
-                    '【好奇心与主动陪伴原则 · 没事就调用 `reply(op="silent")` 沉默】：\n'
-                    '- 根据下方选定的意图、今日状态、记忆增量、待办与最近触达台账做一次轻量判断。\n'
-                    '- 若没有真正值得告诉用户或温和关心的内容，请立即调用 `reply(op="silent", reason="...", snooze_minutes=0)` 静默结束（或仅输出 `SILENT_OK`），绝不为了凑字数硬聊。\n'
-                    '- 若决定开口：控制在 2~4 句，语气真诚自然、不查户口、不复读报错，可按需调用 `reply(op="choices", choices=[...])` 提供贴心选项。\n'
-                )
-                sys_prompt = (
-                    b.harness.static_system_instructions(b.memory_engine.build_static_pinned_block()) + '\n\n'
-                    '你的设定：' + b.persona() + '\n\n' + mode_rules
-                )
-                user_trigger = (
-                    '当前时间：' + b._fmt_bj(now_ts) + ' (' + now_iso() + ')\n'
-                    + intent_directive + '\n\n'
-                    + (periodic_awareness + '\n\n' if periodic_awareness else '')
-                    + (deltas_block + '\n\n' if deltas_block else '')
-                    + '【手机通知栏积攒摘要】：\n' + notif_digest_md + '\n\n'
-                    + '个人印象档案：\n' + raw_imp[:1800] + '\n\n'
-                    + '尚未了解的个人印象维度：' + missing_hint + '\n\n'
-                    + '课表：\n' + (schedule_md or '（未记录）') + '\n\n'
-                    + '待确认截止事项：\n' + deadlines + '\n\n'
-                    + '常驻例行：\n' + routines_md + '\n\n'
-                    + '待办机会池：\n' + opps + '\n\n'
-                    + '最近对话摘要（仅用于防重复，严禁顺着里面的闲聊或报错继续尬聊）：\n' + json.dumps(recent_digest, ensure_ascii=False)
-                )
-
-                messages: list[dict[str, Any]] = [
-                    {'role': 'system', 'content': sys_prompt},
-                    {'role': 'user', 'content': user_trigger},
-                ]
-                trace: list[dict[str, Any]] = []
-                cur_accumulated: list[str] = []
-                cur_mm_frame: dict[str, Any] | None = None
-                api_calls = 0
-                forced_ask_retried = False
-                silent_requested_in_tools = False
-                silent_reason_saved = 'stay_silent'
-                silent_snooze_saved: int | None = None
-
-                for _ in range(6):
-                    api_calls += 1
-                    call_msgs, cur_mm_frame = self._build_vision_msgs(messages, cur_mm_frame, b._is_current_bot_vision_capable())
-                    msg = await b.llm.complete_silent(call_msgs, tools=available_tools or None, big=use_big, bot_id=target_id)
-                    msg.pop('_metrics', None)
-                    step_txt = b._clean_and_filter_dot_text(msg.get('content') or '')
-                    if step_txt and (not cur_accumulated or (step_txt != cur_accumulated[-1] and step_txt not in cur_accumulated[-1])):
-                        cur_accumulated.append(step_txt)
-                    calls = msg.get('tool_calls') or []
-                    if not calls:
-                        break
-                    messages.append(msg)
-                    batch_c = calls[:6]
-                    silent_res, new_mm = await self._execute_tool_batch(
-                        batch=batch_c, allowed=allowed, target_id=target_id, trace=trace, messages=messages,
+                    plan = self._select_intent(
+                        now_ts=now_ts,
+                        manual=manual,
+                        target_id=target_id,
+                        raw_imp=raw_imp,
+                        notif_digest_md=notif_digest_md,
+                        recent_msgs=recent_items,
+                        coalesced=coalesced,
                     )
-                    if new_mm is not None:
-                        cur_mm_frame = new_mm
-                    if silent_res is not None:
-                        silent_reason_saved = str(silent_res.get('reason') or 'stay_silent')
-                        silent_snooze_saved = int(silent_res.get('snooze_minutes') or 0) or None
-                        if force_ask and not forced_ask_retried:
-                            silent_requested_in_tools = True
-                            cur_accumulated.clear()
+                    if plan.get('intent') == 'silent_noop':
+                        self._record_silent_episode(plan, target_id, plan.get('reason', ''), 'zero_token_noop', [], now_ts)
+                        b._finish_curiosity_cycle('silent', target_id, str(plan.get('reason') or 'silent_noop'))
+                        return {'status': 'silent', 'ok': True, 'silent': True, 'bot_id': target_id, 'intent': 'silent_noop', 'reason': str(plan.get('reason') or '')}
+
+                    bot_allowed = normalize_bot_tools(bot.get('tools'))
+                    allowed = [name for name in CURIOSITY_SAFE_TOOLS if is_tool_allowed(name, bot_allowed) or name == 'reply']
+                    available_tools = [t for t in TOOLS if is_tool_allowed(t['function']['name'], allowed)]
+
+                    opps = b.vault.read('tasks/sniffed_opportunities.md')[:2400]
+                    deadlines = b.vault.read('tasks/active_deadlines.md')[:2400]
+                    routines_md = b.vault.read('playbooks/routines.md')[:2000]
+                    schedule_md = ''
+                    with contextlib.suppress(Exception):
+                        schedule_md = b.vault.read('profile/course_schedule.md')[:3000]
+
+                    deltas_block = b.memory_engine.peek_recent_memory_deltas(limit=8)
+                    sql = getattr(self.store, 'sql', None)
+                    recent_episodes = sql.list_recent_curiosity_episodes(limit=6) if (sql is not None and hasattr(sql, 'list_recent_curiosity_episodes')) else []
+
+                    recent_digest = [
+                        {
+                            'role': m.get('role', 'user'),
+                            'speaker': '用户' if m.get('role') == 'user' else (m.get('from_bot_name') or bot['name']),
+                            'kind': m.get('kind', 'chat'),
+                            'text': (b._get_llm_history_text(m) if m.get('role') == 'assistant' else m.get('text', ''))[:240],
+                        }
+                        for m in recent_items
+                    ]
+                    missing_hint = ('\n- ' + '\n- '.join(missing_imp[:8])) if missing_imp else '（主要维度已初步记录，可深入细节）'
+                    intent_directive = self._format_intent_directive(plan, recent_episodes)
+                    periodic_awareness = self._build_periodic_awareness_summary(target_id=target_id, coalesced=coalesced)
+
+                    force_ask = bool(plan.get('force_ask_curiosity'))
+                    mode_rules = (
+                        '【好奇心主动提问模式 · 本轮强制发问】：\n'
+                        '- 主人已把好奇心设为主动提问模式：本轮**必须**用 2~4 句自然熟稔的口吻向主人提出**一个明确、具体且带问号（？/?）的问题**，**严禁**调用 `reply(op="silent")` 或输出 `SILENT_OK` 静默跳过。\n'
+                        '- 若周期巡检/通知栏无异常或旧待办已过时，直接略过汇报废话，切入下方的【本轮强制好奇心提问】方向自然聊天并提问；可按需调用 `reply(op="choices", choices=[...])` 提供贴心快捷选项。\n'
+                        if force_ask
+                        else
+                        '【好奇心与主动陪伴原则 · 没事就调用 `reply(op="silent")` 沉默】：\n'
+                        '- 根据下方选定的意图、今日状态、记忆增量、待办与最近触达台账做一次轻量判断。\n'
+                        '- 若没有真正值得告诉用户或温和关心的内容，请立即调用 `reply(op="silent", reason="...", snooze_minutes=0)` 静默结束（或仅输出 `SILENT_OK`），绝不为了凑字数硬聊。\n'
+                        '- 若决定开口：控制在 2~4 句，语气真诚自然、不查户口、不复读报错，可按需调用 `reply(op="choices", choices=[...])` 提供贴心选项。\n'
+                    )
+                    sys_prompt = (
+                        b.harness.static_system_instructions(b.memory_engine.build_static_pinned_block()) + '\n\n'
+                        '你的设定：' + b.persona() + '\n\n' + mode_rules
+                    )
+                    user_trigger = (
+                        '当前时间：' + b._fmt_bj(now_ts) + ' (' + now_iso() + ')\n'
+                        + intent_directive + '\n\n'
+                        + (periodic_awareness + '\n\n' if periodic_awareness else '')
+                        + (deltas_block + '\n\n' if deltas_block else '')
+                        + '【手机通知栏积攒摘要】：\n' + notif_digest_md + '\n\n'
+                        + '个人印象档案：\n' + raw_imp[:1800] + '\n\n'
+                        + '尚未了解的个人印象维度：' + missing_hint + '\n\n'
+                        + '课表：\n' + (schedule_md or '（未记录）') + '\n\n'
+                        + '待确认截止事项：\n' + deadlines + '\n\n'
+                        + '常驻例行：\n' + routines_md + '\n\n'
+                        + '待办机会池：\n' + opps + '\n\n'
+                        + '最近对话摘要（仅用于防重复，严禁顺着里面的闲聊或报错继续尬聊）：\n' + json.dumps(recent_digest, ensure_ascii=False)
+                    )
+
+                    messages: list[dict[str, Any]] = [
+                        {'role': 'system', 'content': sys_prompt},
+                        {'role': 'user', 'content': user_trigger},
+                    ]
+                    trace: list[dict[str, Any]] = []
+                    cur_accumulated: list[str] = []
+                    cur_mm_frame: dict[str, Any] | None = None
+                    api_calls = 0
+                    forced_ask_retried = False
+                    silent_requested_in_tools = False
+                    silent_reason_saved = 'stay_silent'
+                    silent_snooze_saved: int | None = None
+
+                    for _ in range(6):
+                        api_calls += 1
+                        call_msgs, cur_mm_frame = self._build_vision_msgs(messages, cur_mm_frame, b._is_current_bot_vision_capable())
+                        msg = await b.llm.complete_silent(call_msgs, tools=available_tools or None, big=use_big, bot_id=target_id)
+                        msg.pop('_metrics', None)
+                        step_txt = b._clean_and_filter_dot_text(msg.get('content') or '')
+                        if step_txt and (not cur_accumulated or (step_txt != cur_accumulated[-1] and step_txt not in cur_accumulated[-1])):
+                            cur_accumulated.append(step_txt)
+                        calls = msg.get('tool_calls') or []
+                        if not calls:
                             break
+                        messages.append(msg)
+                        batch_c = calls[:6]
+                        silent_res, new_mm = await self._execute_tool_batch(
+                            batch=batch_c, allowed=allowed, target_id=target_id, trace=trace, messages=messages,
+                        )
+                        if new_mm is not None:
+                            cur_mm_frame = new_mm
+                        if silent_res is not None:
+                            silent_reason_saved = str(silent_res.get('reason') or 'stay_silent')
+                            silent_snooze_saved = int(silent_res.get('snooze_minutes') or 0) or None
+                            if force_ask and not forced_ask_retried:
+                                silent_requested_in_tools = True
+                                cur_accumulated.clear()
+                                break
+                            return self._finalize_silent(
+                                plan=plan, target_id=target_id, reason=silent_reason_saved,
+                                outcome='silent', coalesced=coalesced, trace=trace, now_ts=now_ts,
+                                snooze_min=silent_snooze_saved,
+                            )
+                        if all(c['function']['name'] in ('present_choices', 'reply') for c in batch_c) and cur_accumulated:
+                            break
+
+                    choice_prompt = b._clean_and_filter_dot_text(b.choices_prompt_var.get() or '')
+                    if choice_prompt and all(choice_prompt not in p for p in cur_accumulated):
+                        cur_accumulated.append(choice_prompt)
+                    text = b._clean_and_filter_dot_text('\n\n'.join(cur_accumulated))
+
+                    if force_ask and not forced_ask_retried and (silent_requested_in_tools or not text or is_silent_proactive_output(text)):
+                        forced_ask_retried = True
+                        api_calls += 1
+                        retry_prompt = (
+                            '禁止静默！巡检无需汇报也没关系，但本轮好奇心必须向主人提出一个明确问题。'
+                            '请不要调工具也不要输出 SILENT_OK，立刻用 2~3 句熟稔自然的语气围绕本轮【本轮强制好奇心提问】直接对主人开口，并在结尾带一个明确问号（？）。'
+                        )
+                        retry_msg = await b.llm.complete_silent(
+                            messages + [{'role': 'user', 'content': retry_prompt}],
+                            tools=available_tools or None,
+                            big=use_big,
+                            bot_id=target_id,
+                            tool_choice='none',
+                        )
+                        text = b._clean_and_filter_dot_text(retry_msg.get('content') or '')
+
+                    if (text and is_silent_proactive_output(text)) or (silent_requested_in_tools and not text):
                         return self._finalize_silent(
-                            plan=plan, target_id=target_id, reason=silent_reason_saved,
+                            plan=plan, target_id=target_id, reason=(text or silent_reason_saved)[:120],
                             outcome='silent', coalesced=coalesced, trace=trace, now_ts=now_ts,
                             snooze_min=silent_snooze_saved,
                         )
-                    if all(c['function']['name'] in ('present_choices', 'reply') for c in batch_c) and cur_accumulated:
-                        break
 
-                choice_prompt = b._clean_and_filter_dot_text(b.choices_prompt_var.get() or '')
-                if choice_prompt and all(choice_prompt not in p for p in cur_accumulated):
-                    cur_accumulated.append(choice_prompt)
-                text = b._clean_and_filter_dot_text('\n\n'.join(cur_accumulated))
+                    if not text and (trace or b.choices_var.get()):
+                        api_calls += 1
+                        nudge_msg = (
+                            '请基于以上结果直接用自然简练的语气对用户说一句主动的话并提出本轮【强制好奇心提问】的明确问题（必须带问号 ？），不要再调用工具。'
+                            if force_ask
+                            else '请基于以上结果直接用自然简练的语气对用户说一句主动的话（若无需打扰请直接输出 SILENT_OK），不要再调用工具。'
+                        )
+                        summary = await b.llm.complete_silent(
+                            messages + [{'role': 'user', 'content': nudge_msg}],
+                            tools=available_tools or None,
+                            big=use_big,
+                            bot_id=target_id,
+                            tool_choice='none',
+                        )
+                        text = b._clean_and_filter_dot_text(summary.get('content') or '')
+                        if text and is_silent_proactive_output(text):
+                            return self._finalize_silent(
+                                plan=plan, target_id=target_id, reason=text[:120],
+                                outcome='silent', coalesced=coalesced, trace=trace, now_ts=now_ts,
+                            )
 
-                if force_ask and not forced_ask_retried and (silent_requested_in_tools or not text or is_silent_proactive_output(text)):
-                    forced_ask_retried = True
-                    api_calls += 1
-                    retry_prompt = (
-                        '禁止静默！巡检无需汇报也没关系，但本轮好奇心必须向主人提出一个明确问题。'
-                        '请不要调工具也不要输出 SILENT_OK，立刻用 2~3 句熟稔自然的语气围绕本轮【本轮强制好奇心提问】直接对主人开口，并在结尾带一个明确问号（？）。'
-                    )
-                    retry_msg = await b.llm.complete_silent(
-                        messages + [{'role': 'user', 'content': retry_prompt}],
-                        tools=available_tools or None,
-                        big=use_big,
-                        bot_id=target_id,
-                        tool_choice='none',
-                    )
-                    text = b._clean_and_filter_dot_text(retry_msg.get('content') or '')
-
-                if (text and is_silent_proactive_output(text)) or (silent_requested_in_tools and not text):
-                    return self._finalize_silent(
-                        plan=plan, target_id=target_id, reason=(text or silent_reason_saved)[:120],
-                        outcome='silent', coalesced=coalesced, trace=trace, now_ts=now_ts,
-                        snooze_min=silent_snooze_saved,
-                    )
-
-                if not text and (trace or b.choices_var.get()):
-                    api_calls += 1
-                    nudge_msg = (
-                        '请基于以上结果直接用自然简练的语气对用户说一句主动的话并提出本轮【强制好奇心提问】的明确问题（必须带问号 ？），不要再调用工具。'
-                        if force_ask
-                        else '请基于以上结果直接用自然简练的语气对用户说一句主动的话（若无需打扰请直接输出 SILENT_OK），不要再调用工具。'
-                    )
-                    summary = await b.llm.complete_silent(
-                        messages + [{'role': 'user', 'content': nudge_msg}],
-                        tools=available_tools or None,
-                        big=use_big,
-                        bot_id=target_id,
-                        tool_choice='none',
-                    )
-                    text = b._clean_and_filter_dot_text(summary.get('content') or '')
-                    if text and is_silent_proactive_output(text):
+                    # Zero canned fallback on empty model output!
+                    if not text:
                         return self._finalize_silent(
-                            plan=plan, target_id=target_id, reason=text[:120],
-                            outcome='silent', coalesced=coalesced, trace=trace, now_ts=now_ts,
+                            plan=plan, target_id=target_id, reason='empty_model_output',
+                            outcome='empty_silent', coalesced=coalesced, trace=trace, now_ts=now_ts,
+                            mark_notifs_seen=False,
                         )
 
-                # Zero canned fallback on empty model output!
-                if not text:
-                    return self._finalize_silent(
-                        plan=plan, target_id=target_id, reason='empty_model_output',
-                        outcome='empty_silent', coalesced=coalesced, trace=trace, now_ts=now_ts,
-                        mark_notifs_seen=False,
-                    )
+                    if gate is not None:
+                        ok_guard, guard_reason = gate.verify_guard(pre_push_guard, manual=manual)
+                        if not ok_guard:
+                            self._record_silent_episode(plan, target_id, f'guard:{guard_reason}', 'guard_suppressed', trace, now_ts)
+                            b._finish_curiosity_cycle('silent', target_id, f'推送前拦截: {guard_reason}')
+                            return {'status': 'silent', 'ok': True, 'silent': True, 'suppressed': True, 'reason': guard_reason}
 
-                if gate is not None:
-                    ok_guard, guard_reason = gate.verify_guard(pre_push_guard, manual=manual)
-                    if not ok_guard:
-                        self._record_silent_episode(plan, target_id, f'guard:{guard_reason}', 'guard_suppressed', trace, now_ts)
-                        b._finish_curiosity_cycle('silent', target_id, f'推送前拦截: {guard_reason}')
-                        return {'status': 'silent', 'ok': True, 'silent': True, 'suppressed': True, 'reason': guard_reason}
+                    cur_min = max(1, int(getattr(self.store.config, 'curiosity_interval_minutes', 30) or 30))
+                    if gate is not None and not manual:
+                        gate.record_proactive_sent()
+                        next_gap_min = max(cur_min, int(round(cur_min * gate.multiplier())))
+                    else:
+                        next_gap_min = cur_min
 
-                cur_min = max(1, int(getattr(self.store.config, 'curiosity_interval_minutes', 30) or 30))
-                if gate is not None and not manual:
-                    gate.record_proactive_sent()
-                    next_gap_min = max(cur_min, int(round(cur_min * gate.multiplier())))
-                else:
-                    next_gap_min = cur_min
-
-                b.notification_hub.mark_curiosity_digest_seen()
-                self._advance_coalesced_periodic_work(coalesced, outcome='sent', now_ts=now_ts)
-                b._finish_curiosity_cycle('emitted', target_id, text[:120], snooze_min=next_gap_min)
-                self._post_send_bookkeeping(plan=plan, target_id=target_id, text=text, trace=trace, now_ts=now_ts)
-                mode = 'big_brain' if use_big else 'small_brain'
-                extra: dict[str, Any] = {'api_calls': api_calls, 'from_bot_id': target_id, 'from_bot_name': bot['name'], 'intent': plan.get('intent', ''), 'coalesced_count': len(coalesced)}
-                if trace:
-                    extra['trace'] = trace
-                emitted = await b.emit(text, 'curiosity', engine=mode, **extra)
-                if bot.get('notify', True):
-                    await b.publish({
-                        'type': 'user_notification',
-                        'id': emitted['id'],
-                        'bot_id': target_id,
-                        'bot_name': bot['name'],
-                        'title': f"{bot['name']} · 主动搭话",
-                        'body': text[:300],
-                        'urgent': False,
-                    })
-                return emitted
-            finally:
-                if cur_task_c and b.active_tasks_by_node_bot.get(nb_cur) is cur_task_c:
-                    b.active_tasks_by_node_bot.pop(nb_cur, None)
-                if cur_task_c and b.active_tasks_by_bot.get(target_id) is cur_task_c:
-                    b.active_tasks_by_bot.pop(target_id, None)
-                fin_cur_turn = b.turn_id_var.get() or ''
-                if not b.executions_by_bot.get(target_id):
-                    b._clear_bot_stream(target_id, source=src)
-                    with contextlib.suppress(Exception):
-                        await b.publish({'type': 'stream', 'source': src, 'bot_id': target_id, 'turn_id': fin_cur_turn, 'stream': None, 'seq': b.stream_seq})
-                        await b.publish({'type': 'execution', 'source': src, 'bot_id': target_id, 'execution': None, 'seq': b.stream_seq})
-                b.choices_var.reset(cur_choices_token)
-                b.choices_prompt_var.reset(cur_choices_prompt_token)
-                b.stream_prefix_var.reset(cur_prefix_token)
-                b.turn_id_var.reset(cur_turn_token)
-                b.source_context.reset(src_marker)
-                b.room_context.reset(room_marker)
-                b.bot_context.reset(marker)
-                if origin_tok is not None:
-                    b.turn_origin_context.reset(origin_tok)
-                b.activity = 'thinking' if b.executions_by_bot else b.ready_state()
+                    b.notification_hub.mark_curiosity_digest_seen()
+                    self._advance_coalesced_periodic_work(coalesced, outcome='sent', now_ts=now_ts)
+                    b._finish_curiosity_cycle('emitted', target_id, text[:120], snooze_min=next_gap_min)
+                    self._post_send_bookkeeping(plan=plan, target_id=target_id, text=text, trace=trace, now_ts=now_ts)
+                    mode = 'big_brain' if use_big else 'small_brain'
+                    extra: dict[str, Any] = {'api_calls': api_calls, 'from_bot_id': target_id, 'from_bot_name': bot['name'], 'intent': plan.get('intent', ''), 'coalesced_count': len(coalesced)}
+                    if trace:
+                        extra['trace'] = trace
+                    emitted = await b.emit(text, 'curiosity', engine=mode, **extra)
+                    if bot.get('notify', True):
+                        await b.publish({
+                            'type': 'user_notification',
+                            'id': emitted['id'],
+                            'bot_id': target_id,
+                            'bot_name': bot['name'],
+                            'title': f"{bot['name']} · 主动搭话",
+                            'body': text[:300],
+                            'urgent': False,
+                        })
+                    return emitted
+                finally:
+                    if cur_task_c and b.active_tasks_by_node_bot.get(nb_cur) is cur_task_c:
+                        b.active_tasks_by_node_bot.pop(nb_cur, None)
+                    if cur_task_c and b.active_tasks_by_bot.get(target_id) is cur_task_c:
+                        b.active_tasks_by_bot.pop(target_id, None)
+                    fin_cur_turn = b.turn_id_var.get() or ''
+                    if not b.executions_by_bot.get(target_id):
+                        b._clear_bot_stream(target_id, source=src)
+                        with contextlib.suppress(Exception):
+                            await b.publish({'type': 'stream', 'source': src, 'bot_id': target_id, 'turn_id': fin_cur_turn, 'stream': None, 'seq': b.stream_seq})
+                            await b.publish({'type': 'execution', 'source': src, 'bot_id': target_id, 'execution': None, 'seq': b.stream_seq})
+                    b.choices_var.reset(cur_choices_token)
+                    b.choices_prompt_var.reset(cur_choices_prompt_token)
+                    b.stream_prefix_var.reset(cur_prefix_token)
+                    b.turn_id_var.reset(cur_turn_token)
+                    b.source_context.reset(src_marker)
+                    b.room_context.reset(room_marker)
+                    b.bot_context.reset(marker)
+                    b.activity = 'thinking' if b.executions_by_bot else b.ready_state()
+        finally:
+            if origin_tok is not None:
+                b.turn_origin_context.reset(origin_tok)
 
     async def _cleanup_turn(
         self,

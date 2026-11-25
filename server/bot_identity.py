@@ -4,10 +4,11 @@ import base64, binascii, hashlib, io, os, time
 import httpx
 from typing import Literal
 from pathlib import Path
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from assistants import AssistantInput, ShapeLiteral, get_assistant
+from assistants import AssistantInput, ShapeLiteral, get_assistant, primary_bot_id_for_source, resolve_bots_for_source
+from storage import normalize_node_source
 from vault_manager import atomic_write
 
 GROK_BOT_AVATAR_PROMPT_TEMPLATE = (
@@ -132,8 +133,12 @@ def install_identity_routes(app, auth, store, brain, publish):
             get_assistant(store, bot_id)
         except ValueError as error:
             raise HTTPException(404, str(error))
-        api_key = store.effective_api_key(big=True) if hasattr(store, 'effective_api_key') else (store.config.big_brain.api_key or store.config.small_brain.api_key)
-        base_url = store.effective_base_url(big=True) if hasattr(store, 'effective_base_url') else (store.config.big_brain.base_url or store.config.small_brain.base_url)
+        if hasattr(store.config, 'resolve_route'):
+            base_url, api_key, real_model, _cid = store.config.resolve_route(bot_model=data.model, big=True)
+        else:
+            api_key = store.effective_api_key(big=True) if hasattr(store, 'effective_api_key') else (store.config.big_brain.api_key or store.config.small_brain.api_key)
+            base_url = store.effective_base_url(big=True) if hasattr(store, 'effective_base_url') else (store.config.big_brain.base_url or store.config.small_brain.base_url)
+            real_model = data.model
         if not api_key or not base_url:
             raise HTTPException(409, '先在执行大脑中保存图像服务的 API Key 和 Base URL')
         final_prompt = build_grok_bot_prompt(data.prompt, data.style)
@@ -141,7 +146,7 @@ def install_identity_routes(app, auth, store, brain, publish):
             async with httpx.AsyncClient(timeout=150, trust_env=False) as client:
                 response = await client.post(base_url.rstrip('/') + '/images/generations',
                     headers={'Authorization':'Bearer ' + api_key},
-                    json={'model':data.model, 'prompt':final_prompt, 'n':1, 'size':'1024x1024'})
+                    json={'model':real_model or data.model, 'prompt':final_prompt, 'n':1, 'size':'1024x1024'})
             if response.status_code >= 400:
                 raise HTTPException(502, f'图像服务返回 HTTP {response.status_code}；请检查图像模型和服务是否支持 Images API')
             encoded = response.json().get('data', [{}])[0].get('b64_json', '')
@@ -177,20 +182,24 @@ def install_identity_routes(app, auth, store, brain, publish):
         os.replace(tmp, path)
 
     @app.put('/api/bots/primary', dependencies=[Depends(auth)])
-    async def replace_primary(data: PrimaryInput):
+    async def replace_primary(request: Request, data: PrimaryInput, source: str | None = None):
+        req_src = normalize_node_source(source or request.headers.get('X-Node-Source'))
         try:
             bot = get_assistant(store, data.bot_id)
         except ValueError as error:
             raise HTTPException(404, str(error))
         canonical_id = str(bot['id'])
-        store.state['primary_bot_id'] = canonical_id
+        if req_src in ('pc', 'pc2'):
+            store.state['pc_primary_bot_id'] = canonical_id
+        else:
+            store.state['primary_bot_id'] = canonical_id
         store.save()
         se = getattr(brain, 'sync_engine', None)
         if se is not None:
-            await se.notify_bots_changed(bot_id=canonical_id, force=True)
+            await se.notify_bots_changed(bot_id=canonical_id, source=req_src, force=True)
         else:
-            await publish({'type':'bots_changed', 'primary_bot_id':canonical_id})
-        return {'primary_bot_id':canonical_id, 'bots':store.state['assistants']}
+            await publish({'type': 'bots_changed', 'source': req_src, 'primary_bot_id': canonical_id})
+        return {'primary_bot_id': canonical_id, 'bots': resolve_bots_for_source(store.state['assistants'], req_src)}
 
     @app.patch('/api/bots/{bot_id}/identity', dependencies=[Depends(auth)])
     async def update_identity(bot_id: str, data: IdentityInput):

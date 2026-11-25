@@ -18,9 +18,24 @@ def _fast_msg_sig(msg: dict) -> tuple[Any, ...]:
     txt = str(msg.get('text') or '')
     tr = msg.get('trace') or []
     ch = msg.get('choices') or []
+    ext_blob = json.dumps(
+        {
+            'llm_text': msg.get('llm_text') or '',
+            'turn_steps': msg.get('turn_steps') or [],
+            'timeline': msg.get('timeline') or [],
+            'attachments': msg.get('attachments') or [],
+            'stickers': msg.get('stickers') or [],
+            'variants': msg.get('variants') or [],
+            'active_variant_idx': msg.get('active_variant_idx'),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
     return (
         int(msg.get('order_seq') or msg.get('seq') or 0),
         hashlib.sha1(txt.encode('utf-8', 'ignore')).hexdigest()[:12],
+        hashlib.sha1(ext_blob.encode('utf-8', 'ignore')).hexdigest()[:12],
         len(tr),
         len(ch),
         str(msg.get('decision') or ''),

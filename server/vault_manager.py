@@ -46,11 +46,13 @@ from core.skill_templates import (
     NOTIFY_OVERLAY_SKILL_MD,
     SELF_ARCH_SKILL_MD,
     SKILLS_INDEX_MD,
+    TOOLS_REFERENCE_SKILL_MD,
     WHALECHAN_ONBOARDING_SKILL_MD,
 )
 
 BUILTIN_SKILL_PATHS = (
     'skills/INDEX.md',
+    'skills/tools_reference.md',
     'skills/self_architecture.md',
     'skills/notify_and_overlay.md',
     'skills/device_control.md',
@@ -62,9 +64,10 @@ TEMPLATES = {
     'INDEX.md': (
         '# 共生记忆库\n\n'
         '所有记忆都可以查看、修改。只记录已知事实；猜测必须标注。\n'
-        '> 📌 **架构自省置顶索引**：[[skills/onboarding_guide]]（开箱配置向导）｜[[skills/self_architecture]]（DSB 系统总纲）｜[[skills/notify_and_overlay]]（分级通知与悬浮窗）｜[[skills/device_control]]（三域设备操控）｜[[skills/blackboard_collab]]（黑板协同）｜[[skills/INDEX]]（技能库目录）｜[[profile/pinned_memories]]（核心钉住记忆）\n\n'
+        '> 📌 **架构自省置顶索引**：[[skills/onboarding_guide]]（开箱配置向导）｜[[skills/tools_reference]]（工具契约速查）｜[[skills/self_architecture]]（DSB 系统总纲）｜[[skills/notify_and_overlay]]（分级通知与悬浮窗）｜[[skills/device_control]]（三域设备操控）｜[[skills/blackboard_collab]]（黑板协同）｜[[skills/INDEX]]（技能库目录）｜[[profile/pinned_memories]]（核心钉住记忆）\n\n'
     ),
     'skills/INDEX.md': SKILLS_INDEX_MD,
+    'skills/tools_reference.md': TOOLS_REFERENCE_SKILL_MD,
     'skills/onboarding_guide.md': WHALECHAN_ONBOARDING_SKILL_MD,
     'skills/self_architecture.md': SELF_ARCH_SKILL_MD,
     'skills/notify_and_overlay.md': NOTIFY_OVERLAY_SKILL_MD,

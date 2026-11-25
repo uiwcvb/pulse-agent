@@ -1,13 +1,19 @@
 package dev.bubuki.proactive
 
+import android.content.ContentValues
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.util.Base64
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -92,7 +98,7 @@ internal fun NativePulseModel.startCloudDesktopStreamLoop(forceFull: Boolean = f
         var round = 0
         while (isActive && active && ui.activePanel == "cloud_desktop") {
             val isBusy = ui.workingBot != null || ui.streamBotId != null || ui.busyBot != null || ui.cloudDesktopTaskRunning
-            delay(if (isBusy) 1600L else 2400L)
+            delay(if (ui.cloudDesktopUserControl) 750L else if (isBusy) 1600L else 2400L)
             if (active && ui.activePanel == "cloud_desktop" && !ui.cloudDesktopLoading) {
                 refreshCloudDesktopFrame(forceFull = false)
                 round++
@@ -124,6 +130,7 @@ internal fun NativePulseModel.applyCloudDesktopMeta(res: JSONObject) {
 }
 
 internal suspend fun NativePulseModel.applyCloudDesktopPacket(res: JSONObject) {
+    if (res.has("ok") && !res.optBoolean("ok", true)) toast(res.optString("error").trim().ifBlank { "云电脑操作未生效" }.take(80))
     val unchanged = res.optBoolean("unchanged", false)
     val newHash = res.optString("hash", ui.cloudDesktopHash)
     val rawImg = res.optString("image").ifBlank { res.optString("frame") }.ifBlank { res.optString("screenshot") }.trim()
@@ -142,7 +149,7 @@ internal suspend fun NativePulseModel.applyCloudDesktopPacket(res: JSONObject) {
 
 internal suspend fun NativePulseModel.refreshCloudDesktopFrame(forceFull: Boolean = false) {
     val now = SystemClock.uptimeMillis()
-    if (!forceFull && now - lastCloudFrameRefreshAtMs < 1500L) return
+    if (!forceFull && now - lastCloudFrameRefreshAtMs < (if (ui.cloudDesktopUserControl) 550L else 1500L)) return
     lastCloudFrameRefreshAtMs = now
     runCatching {
         val q = JSONObject().put("quality", 60)
@@ -151,7 +158,12 @@ internal suspend fun NativePulseModel.refreshCloudDesktopFrame(forceFull: Boolea
         }
         val res = request("GET", "/api/computer/frame", query = q)
         applyCloudDesktopPacket(res)
-    }.onFailure { ui = ui.copy(cloudDesktopLoading = false) }
+    }.onFailure { err ->
+        ui = ui.copy(cloudDesktopLoading = false)
+        if (forceFull && ui.activePanel == "cloud_desktop") {
+            toast("云电脑画面加载失败：${err.message?.take(60) ?: "请检查网络或云桌面服务"}")
+        }
+    }
 }
 
 internal fun NativePulseModel.cloudDesktopTakeover() {
@@ -287,6 +299,7 @@ internal fun NativePulseModel.cloudDesktopType(text: String, submit: Boolean = f
 }
 
 internal fun NativePulseModel.cloudDesktopKey(key: String) {
+    val isCombo = key.contains("+")
     val mappedKey = when (key) {
         "Backspace" -> "BackSpace"
         "Enter" -> "Return"
@@ -295,7 +308,7 @@ internal fun NativePulseModel.cloudDesktopKey(key: String) {
         else -> key
     }
     perform {
-        val res = request("POST", "/api/computer/input", JSONObject().put("kind", "key").put("key", mappedKey).put("include_frame", true))
+        val res = request("POST", "/api/computer/input", JSONObject().put("kind", if (isCombo) "hotkey" else "key").put("key", mappedKey).put("include_frame", true))
         applyCloudDesktopPacket(res)
         if (!hasCloudFrameImage(res)) refreshCloudDesktopFrame(forceFull = true)
     }
@@ -307,20 +320,22 @@ internal fun NativePulseModel.toggleNodeSource() {
     val next = if (cur == "phone2") "phone" else "phone2"
     val label = if (next == "phone2") "安卓二 (phone2)" else "安卓一 (phone)"
     perform {
+        val appCtx = activity.applicationContext
         withContext(Dispatchers.IO) {
-            val s = SecurePrefs.read(activity)
-            s.put("nodeSource", next)
-            SecurePrefs.save(activity, s)
-            prefs = s
+            prefs = SecurePrefs.update(appCtx) { s ->
+                s.put("nodeSource", next)
+            }
             SecureTransport.invalidateCache()
         }
         remoteMessages = emptyList()
         optimisticList.clear()
+        confirmedSyncSeq = 0L
         ui = ui.copy(messages = emptyList(), streamBotId = null, workingBot = null, streamText = "", streamThought = "")
         runCatching {
-            activity.stopService(Intent(activity, AgentForegroundService::class.java))
             if (ui.backgroundService) {
-                activity.startForegroundService(Intent(activity, AgentForegroundService::class.java))
+                AgentForegroundService.reconnectOrStart(activity)
+            } else {
+                activity.stopService(Intent(activity, AgentForegroundService::class.java))
             }
         }
         toast("已切换当前端标识为：$label（多端对话完全独立隔离）")
@@ -445,7 +460,7 @@ internal fun NativePulseModel.destroyVirtualDisplay() {
             }
             toast("已彻底销毁手机虚拟屏")
         } catch (e: Exception) {
-            toast("销毁虚拟屏失败：${MainActivity.safeError(e)}")
+            toast("销毁虚拟屏失败：${PulseErrors.safeError(e)}")
         }
     }
 }
@@ -479,7 +494,7 @@ internal fun NativePulseModel.launchFloatingVirtualDisplay() {
             if (!FloatingVirtualDisplay.canOverlay(activity)) {
                 FloatingVirtualDisplay.requestOverlayPermission(activity)
             }
-            toast("虚拟屏启动提示：${MainActivity.safeError(e)}")
+            toast("虚拟屏启动提示：${PulseErrors.safeError(e)}")
         }
     }
 }
@@ -512,14 +527,27 @@ internal fun NativePulseModel.chooseMediaGallery() {
     if (!ensurePaired() || pickerBot != null || ui.busyBot != null) return
     pickerBot = ui.botId
     pickerSource = "workspace"
-    try { activity.pickVisualMedia() } catch (e: Exception) { pickerBot = null; pickerSource = null; toast(MainActivity.safeError(e)) }
+    try { activity.pickVisualMedia() } catch (e: Exception) { pickerBot = null; pickerSource = null; toast(PulseErrors.safeError(e)) }
 }
 
 internal fun NativePulseModel.chooseDocuments() {
     if (!ensurePaired() || pickerBot != null || ui.busyBot != null) return
     pickerBot = ui.botId
     pickerSource = "workspace"
-    try { activity.pickDocument() } catch (e: Exception) { pickerBot = null; pickerSource = null; toast(MainActivity.safeError(e)) }
+    try { activity.pickDocument() } catch (e: Exception) { pickerBot = null; pickerSource = null; toast(PulseErrors.safeError(e)) }
+}
+
+internal fun NativePulseModel.captureQuickPhoto() {
+    if (!ensurePaired() || pickerBot != null || ui.busyBot != null) return
+    pickerBot = ui.botId
+    pickerSource = "workspace"
+    try {
+        activity.captureQuickPhoto()
+    } catch (e: Throwable) {
+        pickerBot = null
+        pickerSource = null
+        toast("无法打开系统相机：${e.message ?: "请检查相机应用"}")
+    }
 }
 
 internal fun NativePulseModel.restorePicker(state: Bundle?) {
@@ -598,7 +626,12 @@ private fun NativePulseModel.enqueueUploadUris(targetBot: String, source: String
                     }
                 }
                 val file = PulseAttachment.from(res.put("source", source))
-                synchronized(draftLock) { attachmentDrafts[targetBot] = attachments(targetBot) + file }
+                synchronized(draftLock) {
+                    val cur = attachments(targetBot)
+                    if (cur.none { it.source == file.source && it.path == file.path }) {
+                        attachmentDrafts[targetBot] = cur + file
+                    }
+                }
                 localRevision++
                 val nextThumbs = if (item.thumb != null) ui.attachmentThumbs + (file.path to item.thumb) else ui.attachmentThumbs
                 ui = ui.copy(
@@ -609,7 +642,7 @@ private fun NativePulseModel.enqueueUploadUris(targetBot: String, source: String
                 refreshUploadingFlag()
                 succeeded++
             } catch (err: Exception) {
-                val errTxt = MainActivity.safeError(err)
+                val errTxt = PulseErrors.safeError(err)
                 ui = ui.copy(
                     pendingUploads = ui.pendingUploads.map {
                         if (it.id == item.id) it.copy(error = errTxt, progress = 0f) else it
@@ -630,6 +663,7 @@ private fun NativePulseModel.enqueueUploadUris(targetBot: String, source: String
 
 internal fun NativePulseModel.retryPendingUpload(uploadId: String) {
     val item = ui.pendingUploads.firstOrNull { it.id == uploadId } ?: return
+    if (item.error.isBlank()) return
     val u = item.uri ?: return
     ui = ui.copy(
         pendingUploads = ui.pendingUploads.map { if (it.id == uploadId) it.copy(error = "", progress = 0.05f) else it },
@@ -695,9 +729,15 @@ internal fun NativePulseModel.handleIncomingShareIntent(intent: Intent?) {
 }
 
 internal fun NativePulseModel.clearAttachments() {
+    val clearedPaths = attachments(ui.botId).asSequence().map { it.path }.toSet()
     synchronized(draftLock) { attachmentDrafts[ui.botId] = emptyList() }
     localRevision++
-    ui = ui.copy(attachments = emptyList(), pendingUploads = emptyList(), uploading = false, attachmentThumbs = emptyMap())
+    ui = ui.copy(
+        attachments = emptyList(),
+        pendingUploads = emptyList(),
+        uploading = false,
+        attachmentThumbs = ui.attachmentThumbs - clearedPaths
+    )
     scope.launch(Dispatchers.IO) { persistDrafts().get() }
 }
 
@@ -747,16 +787,24 @@ internal fun NativePulseModel.openAccessibilitySettings() {
 
 internal fun NativePulseModel.connectRootVirtualDisplay() {
     perform {
+        val shizuku = ShizukuController.get(activity)
         withContext(Dispatchers.IO) {
+            shizuku.refreshState()
             RootPhoneHarness.initialize(activity)
-            RootPhoneHarness.command(activity, JSONObject().put("op", "connect").put("manual", true))
+            runCatching { RootPhoneHarness.command(activity, JSONObject().put("op", "connect").put("manual", true)) }
             RootPhoneHarness.status(activity)
         }
         val st = RootPhoneHarness.changes.value
+        if (!st.root && !st.privileged && shizuku.isRunningNeedingPermission()) {
+            shizuku.requestPermission()
+            toast("已调起 Shizuku 授权弹窗，请点允许")
+            return@perform
+        }
         val msg = when {
+            st.privilegeMode == "shizuku" && st.privileged -> "Shizuku 后台虚拟屏已就绪 (uid ${st.uid})"
             st.root -> "Root 后台虚拟屏权限已就绪 (uid 0)"
             st.privileged -> "无线 ADB 后台虚拟屏已就绪 (uid ${st.uid})"
-            else -> "请在 Root 管理器（KernelSU / Magisk）或无线 ADB 调试中授权 DSB"
+            else -> "请在 Root 管理器、Shizuku（推荐免 Root 无线启动）或无线 ADB 调试中授权 DSB"
         }
         toast(msg)
     }
@@ -786,41 +834,29 @@ internal fun resolveWorkspaceMediaUrl(rawPath: String, serverUrl: String): Strin
     return "$base$rel"
 }
 
+internal suspend fun NativePulseModel.loadMediaBitmap(rawPath: String): ImageBitmap? {
+    val clean = rawPath.trim()
+    if (clean.isEmpty()) return null
+    val fullUrl = resolveWorkspaceMediaUrl(clean, ui.serverUrl)
+    if (fullUrl.isBlank()) return null
+    PulseMediaCache.getMemoryCached(fullUrl)?.let { return it }
+    val base = ui.serverUrl.trimEnd('/')
+    val token = if (base.isNotBlank() && fullUrl.startsWith(base)) {
+        withContext(Dispatchers.IO) {
+            runCatching { SecurePrefs.readFastConfig(activity).deviceToken.trim() }.getOrDefault("")
+        }
+    } else ""
+    return PulseMediaCache.load(activity, fullUrl, token)
+}
+
 internal fun NativePulseModel.loadStickerBitmap(stickerPath: String, onLoaded: (ImageBitmap) -> Unit) {
     val clean = stickerPath.trim()
     if (clean.isEmpty()) return
-    synchronized(stickerCache) { stickerCache.get(clean) }?.let { onLoaded(it); return }
-    scope.launch(Dispatchers.IO) {
-        runCatching {
-            val fullUrl = resolveWorkspaceMediaUrl(clean, ui.serverUrl)
-            if (fullUrl.isBlank()) return@runCatching
-            val base = ui.serverUrl.trimEnd('/')
-            val token = if (base.isNotBlank() && fullUrl.startsWith(base)) {
-                runCatching { SecurePrefs.readFast(activity).optString("deviceToken", "").trim() }.getOrDefault("")
-            } else ""
-            val conn = (java.net.URL(fullUrl).openConnection() as java.net.HttpURLConnection).apply {
-                connectTimeout = 10000
-                readTimeout = 15000
-                if (token.isNotBlank()) setRequestProperty("Authorization", "Bearer $token")
-            }
-            val rawBytes = try {
-                conn.inputStream.use { it.readBytes() }
-            } finally {
-                conn.disconnect()
-            }
-            if (rawBytes.isEmpty()) return@runCatching
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, bounds)
-            val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
-            var sample = 1
-            while (maxDim / sample > 1600) sample *= 2
-            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
-            val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decodeOpts)?.asImageBitmap()
-            if (bmp != null) {
-                synchronized(stickerCache) { stickerCache.put(clean, bmp) }
-                withContext(Dispatchers.Main) { onLoaded(bmp) }
-            }
-        }
+    val fullUrl = resolveWorkspaceMediaUrl(clean, ui.serverUrl)
+    if (fullUrl.isBlank()) return
+    PulseMediaCache.getMemoryCached(fullUrl)?.let { onLoaded(it); return }
+    scope.launch {
+        loadMediaBitmap(clean)?.let { onLoaded(it) }
     }
 }
 
@@ -895,5 +931,66 @@ internal fun NativePulseModel.toggleStickerPack(packId: String, enabled: Boolean
         val res = request("POST", "/api/plugins/stickers/toggle", JSONObject().put("pack_id", packId).put("enabled", enabled))
         ui = ui.copy(stickerPacks = res.optJSONArray("packs")?.objects() ?: ui.stickerPacks)
         toast(if (enabled) "已启用表情包插件" else "已关闭表情包插件")
+    }
+}
+
+internal fun NativePulseModel.saveBitmapToGallery(bitmap: ImageBitmap, rawPath: String) {
+    scope.launch {
+        val res = withContext(Dispatchers.IO) {
+            runCatching {
+                val baseName = rawPath.substringAfterLast('/').substringBefore('?').substringBeforeLast('.')
+                    .replace(Regex("[^a-zA-Z0-9._-]"), "_").take(40).ifBlank { "dsb_image" }
+                val fileName = "${baseName}_${System.currentTimeMillis() % 100000}.png"
+                val cv = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/DeepSeekBot")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+                val resolver = activity.contentResolver
+                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                    ?: throw IllegalStateException("系统相册拒绝创建文件")
+                resolver.openOutputStream(uri)?.use { out ->
+                    if (!bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                        throw IllegalStateException("图片编码失败")
+                    }
+                } ?: throw IllegalStateException("无法写入相册文件")
+                cv.clear()
+                cv.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, cv, null, null)
+                fileName
+            }
+        }
+        res.onSuccess { toast("已保存到系统相册 (Pictures/DeepSeekBot)") }
+            .onFailure { toast("保存失败：${it.message ?: "请检查存储权限"}") }
+    }
+}
+
+internal fun NativePulseModel.shareBitmapImage(bitmap: ImageBitmap, rawPath: String) {
+    scope.launch {
+        val res = withContext(Dispatchers.IO) {
+            runCatching {
+                val dir = java.io.File(activity.cacheDir, "shared-media").apply { mkdirs() }
+                val baseName = rawPath.substringAfterLast('/').substringBefore('?').substringBeforeLast('.')
+                    .replace(Regex("[^a-zA-Z0-9._-]"), "_").take(36).ifBlank { "dsb_image" }
+                val file = java.io.File(dir, "${baseName}_${System.currentTimeMillis() % 100000}.png")
+                java.io.FileOutputStream(file).use { out ->
+                    if (!bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                        throw IllegalStateException("图片编码失败")
+                    }
+                }
+                FileProvider.getUriForFile(activity, "${activity.packageName}.avatar-files", file)
+            }
+        }
+        res.onSuccess { uri ->
+            runCatching {
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "image/png"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                activity.startActivity(Intent.createChooser(shareIntent, "分享图片"))
+            }.onFailure { toast("无法调起系统分享：${it.message ?: ""}") }
+        }.onFailure { toast("准备分享图片失败：${it.message ?: ""}") }
     }
 }

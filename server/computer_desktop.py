@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from cloud_os.agent_browser import cdp_click_or_type_ref, extract_live_cdp_dom_snapshot, fetch_semantic_dom_snapshot, launch_modern_browser
+from cloud_os.agent_browser import cdp_click_or_type_ref, cdp_eval_js, extract_live_cdp_dom_snapshot, fetch_semantic_dom_snapshot, launch_modern_browser
 from cloud_os.bash_session import CloudBashSession
 from cloud_os.subsystem import ensure_subsystem_environment, get_subsystem_telemetry
 from cloud_os.tmux_terminal import ensure_single_tmux_terminal
@@ -174,13 +174,42 @@ class CloudDesktop(DesktopBrowserMixin):
         for child in self.children:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 await asyncio.to_thread(child.wait, 2)
+        with contextlib.suppress(Exception):
+            from cloud_os.agent_browser import close_tracked_browsers
+            await asyncio.to_thread(close_tracked_browsers, 2.0)
+
+    @staticmethod
+    def _dedup_x11_windows(wins: list[dict], max_items: int = 16) -> list[dict]:
+        """Collapse duplicate unfocused popup windows (e.g. repeated Chromium 'Profile error occurred')."""
+        if not isinstance(wins, list) or not wins:
+            return []
+        deduped: list[dict] = []
+        seen_unfocused: dict[tuple[str, str], int] = {}
+        for w in wins:
+            if not isinstance(w, dict):
+                continue
+            item = dict(w)
+            focused = bool(item.get('focused'))
+            title = str(item.get('title') or '').strip()
+            wm_class = str(item.get('wm_class') or '').strip().lower()
+            key = (title.lower(), wm_class)
+            if not focused and title and key in seen_unfocused:
+                idx = seen_unfocused[key]
+                deduped[idx]['duplicate_count'] = int(deduped[idx].get('duplicate_count') or 1) + 1
+                continue
+            if not focused and title:
+                seen_unfocused[key] = len(deduped)
+            deduped.append(item)
+            if len(deduped) >= max_items:
+                break
+        return deduped
 
     def _list_windows(self, force: bool = False) -> list[dict]:
         now_m = time.monotonic()
         cached_w = getattr(self, '_wins_cache', None)
         if not force and cached_w is not None and (now_m - cached_w[0]) < 0.6:
             return list(cached_w[1])
-        wins = list_x11_windows(self._proxy_env())
+        wins = self._dedup_x11_windows(list_x11_windows(self._proxy_env()))
         self._wins_cache = (now_m, wins)
         return list(wins)
 
@@ -344,8 +373,9 @@ class CloudDesktop(DesktopBrowserMixin):
         self, kind: str, x: int = 0, y: int = 0, x2: int = 0, y2: int = 0,
         nx: int = -1, ny: int = -1, nx2: int = -1, ny2: int = -1,
         grid: str = '', grid2: str = '', ref: str = '', target: str = '', text: str = '',
-        command: str = '', key: str = '', direction: str = 'down', amount: int = 3, app: str = '', timeout: int = 35,
+        command: str = '', script: str = '', key: str = '', direction: str = 'down', amount: int = 3, app: str = '', timeout: int = 35,
         click: bool = False, clear: bool = False, submit: bool = False, dx: int = 0, dy: int = 0, is_input: bool = False,
+        skip_dom_sync: bool = False,
     ) -> dict | None:
         env = self._proxy_env()
 
@@ -422,6 +452,8 @@ class CloudDesktop(DesktopBrowserMixin):
                 b_res['ok'] = False
                 b_res.setdefault('error', f'bash 命令{"超时" if b_res.get("timed_out") else f"失败 (exit_code={ec})"}')
             return b_res
+        if kind == 'eval_js':
+            return await asyncio.to_thread(cdp_eval_js, script or command or text, timeout=float(timeout or 8))
         if kind == 'launch_app':
             try:
                 launched = await asyncio.to_thread(self._launch_or_focus_desktop_app, app or target or text, text if app else '')
@@ -578,11 +610,20 @@ class CloudDesktop(DesktopBrowserMixin):
         if not x_ok:
             return {'ok': False, 'error': f'输入执行失败 ({kind}): {x_err}'}
 
+        if skip_dom_sync:
+            await asyncio.sleep(0.05)
+            out_meta: dict = {
+                'ok': True, 'title': self._active_windows_summary(), 'url': self.current_url,
+            }
+            if kind in ('click', 'double_click', 'right_click', 'move', 'hover', 'type'):
+                out_meta['x'], out_meta['y'] = px, py
+            return out_meta
+
         await asyncio.sleep(0.12)
         wins_after, dom_elems_after, page_txt_after = await asyncio.to_thread(
             self._sync_active_dom_state, None, kind in ('click', 'double_click', 'scroll', 'key', 'hotkey', 'type'),
         )
-        out_meta: dict = {
+        out_meta = {
             'ok': True, 'windows': wins_after, 'window_count': len(wins_after),
             'dom_elements': dom_elems_after, 'page_text': page_txt_after,
             'title': self._active_windows_summary(), 'url': self.current_url,
@@ -638,11 +679,13 @@ class CloudDesktop(DesktopBrowserMixin):
             await asyncio.sleep(0.11)
 
     async def input(self, action: InputAction):
-        self._auto_takeover_for_interactive()
-        if self.user_takeover_locked:
+        is_user = getattr(action, 'actor', 'agent') == 'user'
+        if not is_user:
+            self._auto_takeover_for_interactive()
+        if self.user_takeover_locked and not is_user:
             return {'ok': False, 'error': '当前云电脑正由用户人工接管中（user_takeover_locked=True），操作已被锁定', 'control': 'user', 'user_takeover_locked': True, 'title': self._active_windows_summary(), 'url': self.current_url}
         _STEP_INT_DEFS = (('x', 0), ('y', 0), ('x2', 0), ('y2', 0), ('nx', -1), ('ny', -1), ('nx2', -1), ('ny2', -1), ('amount', 3), ('timeout', 35), ('dx', 0), ('dy', 0))
-        _STEP_STR_DEFS = (('grid', ''), ('grid2', ''), ('ref', ''), ('target', ''), ('text', ''), ('command', ''), ('key', ''), ('direction', 'down'), ('app', ''))
+        _STEP_STR_DEFS = (('grid', ''), ('grid2', ''), ('ref', ''), ('target', ''), ('text', ''), ('command', ''), ('script', ''), ('key', ''), ('direction', 'down'), ('app', ''))
         _STEP_BOOL_DEFS = ('click', 'clear', 'submit', 'is_input')
         async with self.input_lock:
             extra_res = None
@@ -651,23 +694,44 @@ class CloudDesktop(DesktopBrowserMixin):
                     kw = {k: int(step[k] if step.get(k) is not None else d) for k, d in _STEP_INT_DEFS}
                     kw.update({k: str(step.get(k) or d) for k, d in _STEP_STR_DEFS})
                     kw.update({k: bool(step.get(k, False)) for k in _STEP_BOOL_DEFS})
-                    r = await self._exec_single_input(kind=str(step.get('kind') or step.get('op') or 'click'), **kw)
+                    r = await self._exec_single_input(kind=str(step.get('kind') or step.get('op') or 'click'), skip_dom_sync=is_user, **kw)
                     if r is not None:
                         extra_res = r
                         if isinstance(r, dict) and r.get('ok') is False:
                             break
-                    await asyncio.sleep(0.06)
+                    await asyncio.sleep(0.04 if is_user else 0.06)
             else:
                 kw = {k: getattr(action, k) for k, _ in _STEP_INT_DEFS + _STEP_STR_DEFS}
                 kw.update({k: getattr(action, k) for k in _STEP_BOOL_DEFS})
-                extra_res = await self._exec_single_input(kind=action.kind, **kw)
+                extra_res = await self._exec_single_input(kind=action.kind, skip_dom_sync=is_user, **kw)
+            if action.kind in ('bash', 'eval_js') and not action.include_frame:
+                lean_out = {
+                    'ok': bool(extra_res.get('ok', True)) if isinstance(extra_res, dict) else True,
+                    'op': action.kind,
+                    'control': self.control,
+                    'user_takeover_locked': bool(self.user_takeover_locked),
+                }
+                if isinstance(extra_res, dict):
+                    lean_out.update(extra_res)
+                return lean_out
+            if is_user:
+                res: dict = {
+                    'ok': True, 'control': self.control, 'user_takeover_locked': bool(self.user_takeover_locked),
+                    'title': self._active_windows_summary(), 'url': self.current_url, 'quota': self._quota_info(),
+                }
+                if isinstance(extra_res, dict):
+                    res.update(extra_res)
+                if action.include_frame:
+                    await asyncio.sleep(0.08)
+                    res.update(await asyncio.to_thread(self.frame, 62))
+                return res
             if isinstance(extra_res, dict) and 'windows' in extra_res and 'dom_elements' in extra_res:
                 wins_now, dom_elems_now, page_txt_now = extra_res['windows'], extra_res['dom_elements'], extra_res.get('page_text', '')
             else:
                 wins_now, dom_elems_now, page_txt_now = await asyncio.to_thread(self._sync_active_dom_state)
             focused_win = next((w for w in wins_now if w.get('focused')), wins_now[0] if wins_now else None)
             snap = self.last_dom_snapshot or {}
-            res: dict = {
+            res = {
                 'ok': True, 'control': self.control, 'user_takeover_locked': bool(self.user_takeover_locked),
                 'title': self._active_windows_summary(), 'url': self.current_url, 'active_window': focused_win,
                 'windows': wins_now, 'x11_windows': wins_now, 'window_count': len(wins_now),
@@ -797,16 +861,17 @@ def create_app(desktop=None, token=None):
 
     @app.post('/navigate', dependencies=[Depends(auth)])
     async def navigate(body: NavigateInput):
-        return await operation(desktop.navigate(body.url, body.include_frame))
+        return await operation(desktop.navigate(body.url, body.include_frame, actor=body.actor))
 
     class SearchInput(BaseModel):
         query: str = ''
         engine: str = 'auto'
         include_frame: bool = True
+        actor: str = 'agent'
 
     @app.post('/search', dependencies=[Depends(auth)])
     async def search_route(body: SearchInput):
-        return await operation(desktop.search(body.query, body.engine, body.include_frame))
+        return await operation(desktop.search(body.query, body.engine, body.include_frame, actor=body.actor))
 
     @app.post('/input', dependencies=[Depends(auth)])
     async def input_action(body: InputAction):

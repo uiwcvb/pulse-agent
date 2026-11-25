@@ -2,6 +2,7 @@ package dev.bubuki.proactive
 
 import android.content.Intent
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -32,29 +33,29 @@ internal fun NativePulseModel.syncLocalConfigPrefs(
     apiBaseUrl: String? = null,
 ) {
     runCatching {
-        val s = SecurePrefs.read(activity)
-        val localCfg = s.optJSONObject("config") ?: JSONObject()
-        var dirty = false
-        if (autoCompact != null && autoCompact in 8000..1000000 && localCfg.optInt("auto_compact_tokens", 0) != autoCompact) {
-            localCfg.put("auto_compact_tokens", autoCompact)
-            dirty = true
-        }
-        if (curiosityMin != null && curiosityMin in 1..1440 && localCfg.optInt("curiosity_interval_minutes", 0) != curiosityMin) {
-            localCfg.put("curiosity_interval_minutes", curiosityMin)
-            dirty = true
-        }
-        if (!defaultModel.isNullOrBlank() && localCfg.optString("default_model") != defaultModel) {
-            localCfg.put("default_model", defaultModel)
-            dirty = true
-        }
-        if (!apiBaseUrl.isNullOrBlank() && localCfg.optString("api_base_url") != apiBaseUrl) {
-            localCfg.put("api_base_url", apiBaseUrl)
-            dirty = true
-        }
-        if (dirty) {
+        val appCtx = activity.applicationContext
+        val fastCfg = SecurePrefs.readFast(appCtx).optJSONObject("config") ?: JSONObject()
+        val needUpdate =
+            (autoCompact != null && autoCompact in 8000..1000000 && fastCfg.optInt("auto_compact_tokens", 0) != autoCompact) ||
+                (curiosityMin != null && curiosityMin in 1..1440 && fastCfg.optInt("curiosity_interval_minutes", 0) != curiosityMin) ||
+                (!defaultModel.isNullOrBlank() && fastCfg.optString("default_model") != defaultModel) ||
+                (!apiBaseUrl.isNullOrBlank() && fastCfg.optString("api_base_url") != apiBaseUrl)
+        if (!needUpdate) return@runCatching
+        prefs = SecurePrefs.update(appCtx) { s ->
+            val localCfg = s.optJSONObject("config") ?: JSONObject()
+            if (autoCompact != null && autoCompact in 8000..1000000) {
+                localCfg.put("auto_compact_tokens", autoCompact)
+            }
+            if (curiosityMin != null && curiosityMin in 1..1440) {
+                localCfg.put("curiosity_interval_minutes", curiosityMin)
+            }
+            if (!defaultModel.isNullOrBlank()) {
+                localCfg.put("default_model", defaultModel)
+            }
+            if (!apiBaseUrl.isNullOrBlank()) {
+                localCfg.put("api_base_url", apiBaseUrl)
+            }
             s.put("config", localCfg)
-            SecurePrefs.save(activity, s)
-            prefs = s
         }
     }
 }
@@ -114,9 +115,14 @@ internal fun NativePulseModel.openSettings() {
         val rFbModel = remote.optString("fallback_model", "")
         val rCompact = remote.optInt("auto_compact_tokens", 200000).coerceIn(8000, 1000000)
         val rCurMin = remote.optInt("curiosity_interval_minutes", 30).coerceIn(1, 1440)
+        val rChannels = PulseApiChannel.listFromJson(remote.optJSONArray("channels"))
         withContext(Dispatchers.IO) {
             syncLocalConfigPrefs(autoCompact = rCompact, curiosityMin = rCurMin, defaultModel = rModel, apiBaseUrl = rUrl)
         }
+        val mergedModels = linkedSetOf<String>().apply {
+            addAll(ui.availableModels)
+            rChannels.filter { it.enabled }.forEach { ch -> addAll(ch.models) }
+        }.toList()
         ui = ui.copy(
             apiBaseUrl = if (ui.apiBaseUrl == "https://api.openai.com/v1" && rUrl.isNotBlank()) rUrl else ui.apiBaseUrl,
             defaultModel = ui.defaultModel.ifBlank { rModel },
@@ -125,9 +131,19 @@ internal fun NativePulseModel.openSettings() {
             fallbackBaseUrl = rFbUrl.ifBlank { ui.fallbackBaseUrl },
             fallbackModel = rFbModel.ifBlank { ui.fallbackModel },
             hasFallbackApiKey = remote.optBoolean("has_fallback_api_key", storedFbKey.isNotBlank()),
+            channels = rChannels,
+            availableModels = mergedModels,
+            modelEntries = if (ui.modelEntries.isNotEmpty()) ui.modelEntries else PulseModelEntry.synthesize(mergedModels, rChannels),
             curiosityEnabledGlobal = remote.optBoolean("enabled", true),
             curiosityMinutes = rCurMin.toString(),
-            autoCompactTokens = rCompact.toString()
+            autoCompactTokens = rCompact.toString(),
+            workerModel = remote.optString("worker_model", ui.workerModel),
+            embeddingTier = remote.optString("embedding_tier", ui.embeddingTier).ifBlank { "local_gte_small_zh" },
+            cacheKeepaliveEnabled = remote.optBoolean("cache_keepalive_enabled", ui.cacheKeepaliveEnabled),
+            cacheKeepaliveIntervalSec = remote.optInt("cache_keepalive_interval_sec", 260).coerceIn(60, 600).toString(),
+            cacheKeepaliveMaxPings = remote.optInt("cache_keepalive_max_pings", 1).coerceIn(0, 5).toString(),
+            idleCompactMinutes = remote.optInt("idle_compact_minutes", 9).coerceIn(0, 120).toString(),
+            sleepConsolidateIdleMinutes = (remote.optInt("sleep_consolidate_idle_seconds", 480) / 60).coerceIn(1, 60).toString()
         )
     }
 }
@@ -145,6 +161,12 @@ internal fun NativePulseModel.updateSettingsField(
     curiosityEnabled: Boolean = ui.curiosityEnabledGlobal,
     curiosityMinutes: String = ui.curiosityMinutes,
     autoCompactTokens: String = ui.autoCompactTokens,
+    workerModel: String = ui.workerModel,
+    embeddingTier: String = ui.embeddingTier,
+    cacheKeepaliveEnabled: Boolean = ui.cacheKeepaliveEnabled,
+    cacheKeepaliveIntervalSec: String = ui.cacheKeepaliveIntervalSec,
+    cacheKeepaliveMaxPings: String = ui.cacheKeepaliveMaxPings,
+    idleCompactMinutes: String = ui.idleCompactMinutes, sleepConsolidateIdleMinutes: String = ui.sleepConsolidateIdleMinutes,
     backgroundService: Boolean = ui.backgroundService,
     appearance: String = ui.appearance,
     motion: Boolean = ui.motion,
@@ -164,20 +186,44 @@ internal fun NativePulseModel.updateSettingsField(
         fallbackBaseUrl = fallbackBaseUrl, fallbackApiKeyInput = fallbackApiKeyInput, fallbackModel = fallbackModel,
         curiosityEnabledGlobal = curiosityEnabled,
         curiosityMinutes = curiosityMinutes, autoCompactTokens = autoCompactTokens,
+        workerModel = workerModel, embeddingTier = embeddingTier,
+        cacheKeepaliveEnabled = cacheKeepaliveEnabled, cacheKeepaliveIntervalSec = cacheKeepaliveIntervalSec,
+        cacheKeepaliveMaxPings = cacheKeepaliveMaxPings, idleCompactMinutes = idleCompactMinutes, sleepConsolidateIdleMinutes = sleepConsolidateIdleMinutes,
         backgroundService = backgroundService,
         appearance = nextApp, dark = nextDark, motion = motion, haptics = haptics, powerSave = powerSave
     )
+    settingsWriteJob?.cancel()
+    settingsWriteJob = scope.launch {
+        delay(350L)
+        flushSettingsPersistence(forceServerSync = serverChanged)
+    }
+}
+
+internal fun NativePulseModel.flushSettingsPersistence(forceServerSync: Boolean = false) {
+    settingsWriteJob?.cancel()
+    settingsWriteJob = null
+    val appCtx = activity.applicationContext
+    val snap = ui
+    val cleanServer = snap.serverUrl.trim().trimEnd('/')
+    val cleanToken = snap.deviceTokenInput.trim()
+    val nextApp = if (snap.appearance == "light") "light" else "dark"
+    val mot = snap.motion
+    val hap = snap.haptics
+    val pwr = snap.powerSave
     draftWriter.submit {
-        synchronized(SecurePrefs::class.java) {
-            val s = SecurePrefs.read(activity)
-            s.put("appearance", nextApp).put("motion", motion).put("haptics", haptics).put("power_save", powerSave)
-            if (serverChanged) {
-                s.put("serverUrl", serverUrl.trim().trimEnd('/'))
-                s.put("deviceToken", deviceTokenInput.trim())
-                SecureTransport.invalidateCache()
+        runCatching {
+            prefs = SecurePrefs.update(appCtx) { s ->
+                val srvChanged = forceServerSync ||
+                    s.optString("serverUrl", "").trim().trimEnd('/') != cleanServer ||
+                    s.optString("deviceToken", "").trim() != cleanToken
+                s.put("appearance", nextApp).put("motion", mot).put("haptics", hap).put("power_save", pwr)
+                if (srvChanged) {
+                    s.put("serverUrl", cleanServer)
+                    s.put("deviceToken", cleanToken)
+                    SecureTransport.invalidateCache()
+                }
             }
-            SecurePrefs.save(activity, s)
-            UiPreferences.update(activity, JSONObject().put("appearance", nextApp).put("motion", motion).put("haptics", haptics).put("power_save", powerSave))
+            UiPreferences.update(appCtx, JSONObject().put("appearance", nextApp).put("motion", mot).put("haptics", hap).put("power_save", pwr))
         }
     }
 }
@@ -187,20 +233,25 @@ internal fun NativePulseModel.fetchModels(forBotEditor: Boolean = false) {
     ui = ui.copy(fetchingModels = true)
     perform {
         try {
+            val cleanSrv = ui.serverUrl.trim().ifBlank { SecureTransport.DEFAULT_SERVER }
+            val appCtx = activity.applicationContext
             withContext(Dispatchers.IO) {
-                val s = SecurePrefs.read(activity)
-                s.put("serverUrl", ui.serverUrl.trim().ifBlank { SecureTransport.DEFAULT_SERVER })
-                SecurePrefs.save(activity, s)
+                prefs = SecurePrefs.update(appCtx) { s ->
+                    s.put("serverUrl", cleanSrv)
+                }
             }
             val payload = JSONObject().put("base_url", ui.apiBaseUrl.trim())
             if (ui.apiKeyInput.trim().isNotBlank()) payload.put("api_key", ui.apiKeyInput.trim())
             val res = request("POST", "/api/models", payload)
             val arr = res.optJSONArray("models") ?: JSONArray()
             val list = (0 until arr.length()).map { arr.getString(it) }.filter { it.isNotBlank() }
+            val updatedChannels = res.optJSONArray("channels")?.let { PulseApiChannel.listFromJson(it) } ?: ui.channels
+            val parsedEntries = PulseModelEntry.listFromJson(res.optJSONArray("model_entries"))
+                .ifEmpty { PulseModelEntry.synthesize(list, updatedChannels) }
             val pickedDefault = if (ui.defaultModel.isBlank() && list.isNotEmpty()) list.first() else ui.defaultModel
             val pickedBotModel = if (forBotEditor && ui.editBotModel.isBlank() && list.isNotEmpty()) list.first() else ui.editBotModel
-            ui = ui.copy(availableModels = list, defaultModel = pickedDefault, editBotModel = pickedBotModel)
-            toast(if (list.isEmpty()) "接口未返回模型列表，可手动填写模型名" else "已获取 ${list.size} 个可用模型！")
+            ui = ui.copy(availableModels = list, modelEntries = parsedEntries, channels = updatedChannels, defaultModel = pickedDefault, editBotModel = pickedBotModel)
+            toast(if (list.isEmpty()) "接口未返回模型列表，可手动填写模型名" else "已聚合 ${parsedEntries.size} 个可用模型！")
         } finally {
             ui = ui.copy(fetchingModels = false)
         }
@@ -209,6 +260,8 @@ internal fun NativePulseModel.fetchModels(forBotEditor: Boolean = false) {
 
 internal fun NativePulseModel.saveSettings() {
     if (ui.savingSettings) return
+    settingsWriteJob?.cancel()
+    settingsWriteJob = null
     val cleanServer = ui.serverUrl.trim().ifBlank { SecureTransport.DEFAULT_SERVER }.trimEnd('/')
     val cleanToken = ui.deviceTokenInput.trim()
     val cleanBase = ui.apiBaseUrl.trim().ifBlank { "https://api.openai.com/v1" }.trimEnd('/')
@@ -222,37 +275,37 @@ internal fun NativePulseModel.saveSettings() {
     ui = ui.copy(savingSettings = true, autoCompactTokens = compactTokens.toString())
     perform {
         try {
+            val appCtx = activity.applicationContext
             withContext(Dispatchers.IO) {
-                val s = SecurePrefs.read(activity)
-                s.put("serverUrl", cleanServer)
-                val effToken = cleanToken.ifBlank { s.optString("deviceToken").ifBlank { SecureTransport.defaultToken() } }
-                s.put("deviceToken", effToken)
-                SecureTransport.invalidateCache()
-                s.put("background", ui.backgroundService)
-                val normApp = if (ui.appearance == "light") "light" else "dark"
-                s.put("appearance", normApp)
-                UiPreferences.update(activity, JSONObject().put("appearance", normApp).put("motion", ui.motion).put("haptics", ui.haptics))
-                val localCfg = s.optJSONObject("config") ?: JSONObject()
-                localCfg.put("api_base_url", cleanBase)
-                localCfg.put("auto_compact_tokens", compactTokens)
-                localCfg.put("curiosity_interval_minutes", minutes)
-                if (cleanKey.isNotBlank()) localCfg.put("api_key", cleanKey)
-                if (cleanModel.isNotBlank()) localCfg.put("default_model", cleanModel)
-                localCfg.put("fallback_enabled", ui.fallbackEnabled)
-                localCfg.put("fallback_base_url", cleanFbBase)
-                if (cleanFbKey.isNotBlank()) localCfg.put("fallback_api_key", cleanFbKey)
-                localCfg.put("fallback_model", cleanFbModel)
-                val brainObj = JSONObject().put("base_url", cleanBase).put("model", cleanModel)
-                if (cleanKey.isNotBlank()) brainObj.put("api_key", cleanKey)
-                else {
-                    val oldKey = localCfg.optJSONObject("big_brain")?.optString("api_key").orEmpty()
-                    if (oldKey.isNotBlank()) brainObj.put("api_key", oldKey)
+                prefs = SecurePrefs.update(appCtx) { s ->
+                    s.put("serverUrl", cleanServer)
+                    val effToken = cleanToken.ifBlank { s.optString("deviceToken").ifBlank { SecureTransport.defaultToken() } }
+                    s.put("deviceToken", effToken)
+                    SecureTransport.invalidateCache()
+                    s.put("background", ui.backgroundService)
+                    val normApp = if (ui.appearance == "light") "light" else "dark"
+                    s.put("appearance", normApp)
+                    UiPreferences.update(appCtx, JSONObject().put("appearance", normApp).put("motion", ui.motion).put("haptics", ui.haptics).put("power_save", ui.powerSave))
+                    val localCfg = s.optJSONObject("config") ?: JSONObject()
+                    localCfg.put("api_base_url", cleanBase)
+                    localCfg.put("auto_compact_tokens", compactTokens)
+                    localCfg.put("curiosity_interval_minutes", minutes)
+                    if (cleanKey.isNotBlank()) localCfg.put("api_key", cleanKey)
+                    if (cleanModel.isNotBlank()) localCfg.put("default_model", cleanModel)
+                    localCfg.put("fallback_enabled", ui.fallbackEnabled)
+                    localCfg.put("fallback_base_url", cleanFbBase)
+                    if (cleanFbKey.isNotBlank()) localCfg.put("fallback_api_key", cleanFbKey)
+                    localCfg.put("fallback_model", cleanFbModel)
+                    val brainObj = JSONObject().put("base_url", cleanBase).put("model", cleanModel)
+                    if (cleanKey.isNotBlank()) brainObj.put("api_key", cleanKey)
+                    else {
+                        val oldKey = localCfg.optJSONObject("big_brain")?.optString("api_key").orEmpty()
+                        if (oldKey.isNotBlank()) brainObj.put("api_key", oldKey)
+                    }
+                    localCfg.put("small_brain", JSONObject(brainObj.toString()))
+                    localCfg.put("big_brain", JSONObject(brainObj.toString()))
+                    s.put("config", localCfg)
                 }
-                localCfg.put("small_brain", JSONObject(brainObj.toString()))
-                localCfg.put("big_brain", JSONObject(brainObj.toString()))
-                s.put("config", localCfg)
-                SecurePrefs.save(activity, s)
-                prefs = s
             }
             val updatePayload = JSONObject()
                 .put("fallback_enabled", ui.fallbackEnabled)
@@ -261,6 +314,13 @@ internal fun NativePulseModel.saveSettings() {
                 .put("enabled", ui.curiosityEnabledGlobal)
                 .put("curiosity_interval_minutes", minutes)
                 .put("auto_compact_tokens", compactTokens)
+                .put("worker_model", ui.workerModel.trim())
+                .put("embedding_tier", ui.embeddingTier.trim().ifBlank { "local_gte_small_zh" })
+                .put("cache_keepalive_enabled", ui.cacheKeepaliveEnabled)
+                .put("cache_keepalive_interval_sec", (ui.cacheKeepaliveIntervalSec.toIntOrNull() ?: 260).coerceIn(60, 600))
+                .put("cache_keepalive_max_pings", (ui.cacheKeepaliveMaxPings.toIntOrNull() ?: 1).coerceIn(0, 5))
+                .put("idle_compact_minutes", (ui.idleCompactMinutes.toIntOrNull() ?: 9).coerceIn(0, 120))
+                .put("sleep_consolidate_idle_seconds", ((ui.sleepConsolidateIdleMinutes.toIntOrNull() ?: 8).coerceIn(1, 60)) * 60)
             if (cleanBase.isNotBlank() && (cleanBase != "https://api.openai.com/v1" || cleanKey.isNotBlank())) {
                 updatePayload.put("api_base_url", cleanBase)
             }
@@ -272,9 +332,9 @@ internal fun NativePulseModel.saveSettings() {
             val dark = ui.appearance != "light"
             activity.systemBarsFor(dark)
             RootPhoneHarness.initialize(activity)
-            if (ui.backgroundService && !AgentForegroundService.running) {
-                runCatching { activity.startForegroundService(Intent(activity, AgentForegroundService::class.java)) }
-            } else if (!ui.backgroundService) {
+            if (ui.backgroundService) {
+                runCatching { AgentForegroundService.reconnectOrStart(activity) }
+            } else {
                 activity.stopService(Intent(activity, AgentForegroundService::class.java))
             }
             ui = ui.copy(
@@ -329,7 +389,10 @@ internal fun NativePulseModel.fetchPromptPreview(botId: String? = null) {
             val myNodeSource = SecureTransport.getNodeSource(activity)
             val res = request(
                 "GET",
-                "/api/system/prompt_preview?bot_id=${android.net.Uri.encode(targetId)}&source=${android.net.Uri.encode(myNodeSource)}"
+                "/api/system/prompt_preview",
+                query = JSONObject()
+                    .put("bot_id", targetId)
+                    .put("source", myNodeSource)
             )
             ui = ui.copy(promptPreview = res)
         } finally {
@@ -450,15 +513,15 @@ internal fun NativePulseModel.placement(id: String, key: String, value: Boolean)
 
 internal fun NativePulseModel.openVault(initialPath: String = "INDEX.md") {
     dismissMenu()
-    ui = ui.copy(activePanel = "vault", selectedVaultPath = initialPath, vaultLoading = true)
+    ui = ui.copy(activePanel = "vault", selectedVaultPath = initialPath, vaultLoading = true, vaultDirty = false)
     perform {
         try {
             val listRes = request("GET", "/api/vault")
             val filesArr = listRes.optJSONArray("files") ?: JSONArray()
-            val paths = (0 until filesArr.length()).map { filesArr.getJSONObject(it).getString("path") }
+            val paths = (0 until filesArr.length()).mapNotNull { filesArr.optJSONObject(it)?.optString("path")?.takeIf { p -> p.isNotBlank() } }
             val target = if (initialPath in paths) initialPath else (paths.firstOrNull() ?: "INDEX.md")
             val docRes = request("GET", "/api/vault", query = JSONObject().put("path", target))
-            ui = ui.copy(vaultFiles = paths, selectedVaultPath = target, vaultContent = docRes.optString("content", ""))
+            ui = ui.copy(vaultFiles = paths, selectedVaultPath = target, vaultContent = docRes.optString("content", ""), vaultDirty = false)
         } finally {
             ui = ui.copy(vaultLoading = false)
         }
@@ -466,18 +529,18 @@ internal fun NativePulseModel.openVault(initialPath: String = "INDEX.md") {
 }
 
 internal fun NativePulseModel.selectVaultFile(path: String) {
-    ui = ui.copy(selectedVaultPath = path, vaultLoading = true)
+    ui = ui.copy(selectedVaultPath = path, vaultLoading = true, vaultDirty = false)
     perform {
         try {
             val docRes = request("GET", "/api/vault", query = JSONObject().put("path", path))
-            ui = ui.copy(vaultContent = docRes.optString("content", ""))
+            ui = ui.copy(vaultContent = docRes.optString("content", ""), vaultDirty = false)
         } finally {
             ui = ui.copy(vaultLoading = false)
         }
     }
 }
 
-internal fun NativePulseModel.updateVaultContent(content: String) { ui = ui.copy(vaultContent = content) }
+internal fun NativePulseModel.updateVaultContent(content: String) { ui = ui.copy(vaultContent = content, vaultDirty = true) }
 
 internal fun NativePulseModel.saveVaultFile() {
     if (ui.vaultSaving) return
@@ -485,6 +548,7 @@ internal fun NativePulseModel.saveVaultFile() {
     perform {
         try {
             request("PUT", "/api/vault", JSONObject().put("path", ui.selectedVaultPath).put("content", ui.vaultContent))
+            ui = ui.copy(vaultDirty = false)
             toast("已保存记忆：${ui.selectedVaultPath}")
         } finally {
             ui = ui.copy(vaultSaving = false)
@@ -615,16 +679,16 @@ internal fun NativePulseModel.estimateLocalTextTokens(text: String): Int {
 
 internal fun NativePulseModel.contextStatsFor(botId: String = ui.botId): Triple<Int, Int, Int> {
     val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 100000).coerceIn(8000, 1000000)
-    val localMsgs = ui.messages.filter { it.botId == botId }
-    val localEst = 14800 + localMsgs.sumOf { estimateLocalTextTokens(it.text) + 12 }
     val serverTok = ui.contextTokensByBot[botId] ?: 0
-    val curTok = if (serverTok > 0) serverTok else localEst
-    val msgCnt = ui.contextMsgsByBot[botId] ?: localMsgs.size
+    val serverMsgCnt = ui.contextMsgsByBot[botId]
+    val localMsgs by lazy(LazyThreadSafetyMode.NONE) { ui.messages.filter { it.botId == botId } }
+    val curTok = if (serverTok > 0) serverTok else 14800 + localMsgs.sumOf { estimateLocalTextTokens(it.text) + 12 }
+    val msgCnt = serverMsgCnt ?: localMsgs.size
     return Triple(curTok, thresh, msgCnt)
 }
 
-internal fun NativePulseModel.contextCacheFor(botId: String = ui.botId): Pair<Int, Int> {
-    val (curTok, _, _) = contextStatsFor(botId)
+internal fun NativePulseModel.contextCacheFor(botId: String = ui.botId, precomputedCurTok: Int? = null): Pair<Int, Int> {
+    val curTok = precomputedCurTok ?: contextStatsFor(botId).first
     val cachedTok = (ui.contextCachedByBot[botId] ?: 0).coerceIn(0, curTok.coerceAtLeast(0))
     val pct = if (curTok > 0 && cachedTok > 0) ((cachedTok.toDouble() / curTok.toDouble()) * 100.0).toInt().coerceIn(0, 100) else 0
     return cachedTok to pct
@@ -641,14 +705,14 @@ internal fun NativePulseModel.formatTokenCount(tokens: Int): String {
 internal fun NativePulseModel.applyContextWindowTokens(tokens: Int, botId: String = ui.editingBotId ?: ui.botId) {
     val cleanTokens = tokens.coerceIn(8_000, 1_000_000)
     ui = ui.copy(autoCompactTokens = cleanTokens.toString())
+    val appCtx = activity.applicationContext
     draftWriter.submit {
-        synchronized(SecurePrefs::class.java) {
-            val s = SecurePrefs.read(activity)
-            val localCfg = s.optJSONObject("config") ?: JSONObject()
-            localCfg.put("auto_compact_tokens", cleanTokens)
-            s.put("config", localCfg)
-            SecurePrefs.save(activity, s)
-            prefs = s
+        runCatching {
+            prefs = SecurePrefs.update(appCtx) { s ->
+                val localCfg = s.optJSONObject("config") ?: JSONObject()
+                localCfg.put("auto_compact_tokens", cleanTokens)
+                s.put("config", localCfg)
+            }
         }
     }
     perform {
@@ -723,7 +787,9 @@ internal fun NativePulseModel.compactBotContext(botId: String = ui.botId) {
                 toast("当前上下文已是最新压缩状态，无需重复压缩")
             } else if (compacted) {
                 val msgResp = request("GET", "/api/messages", null, JSONObject().put("limit", 120))
-                val freshMsgs = msgResp.getJSONArray("messages").objects().map(PulseMessage::from)
+                val freshMsgs = msgResp.optJSONArray("messages")?.objects()?.mapNotNull {
+                    runCatching { PulseMessage.from(it) }.getOrNull()
+                }.orEmpty()
                 mergeRemoteMessages(freshMsgs, fullReplace = true)
                 ui = ui.copy(messages = combinedMessages())
                 toast("✅ 上下文压缩完成 (归档 $archivedCount 条消息)")
@@ -837,4 +903,89 @@ internal fun NativePulseModel.togglePowerSave(enabled: Boolean) {
 
 internal fun NativePulseModel.stopBotById(targetBotId: String) {
     stop(targetBotId)
+}
+
+internal fun NativePulseModel.saveApiChannel(
+    id: String,
+    name: String,
+    baseUrl: String,
+    apiKey: String,
+    priority: Int,
+    enabled: Boolean = true,
+    autoFetch: Boolean = true,
+    onDone: () -> Unit = {}
+) {
+    val cleanUrl = baseUrl.trim().trimEnd('/')
+    if (cleanUrl.isBlank()) {
+        toast("请填写渠道 API Base URL")
+        return
+    }
+    perform {
+        val body = JSONObject()
+            .put("id", id.trim())
+            .put("name", name.trim())
+            .put("base_url", cleanUrl)
+            .put("api_key", apiKey.trim())
+            .put("priority", priority.coerceIn(0, 1000))
+            .put("enabled", enabled)
+            .put("auto_fetch", autoFetch)
+        val res = request("POST", "/api/channels", body)
+        val updated = PulseApiChannel.listFromJson(res.optJSONArray("channels"))
+        val testObj = res.optJSONObject("test")
+        val mergedModels = linkedSetOf<String>().apply {
+            addAll(ui.availableModels)
+            updated.filter { it.enabled }.forEach { ch -> addAll(ch.models) }
+        }.toList()
+        ui = ui.copy(channels = updated, availableModels = mergedModels, modelEntries = PulseModelEntry.synthesize(mergedModels, updated))
+        val testTip = when {
+            testObj == null -> "已保存渠道"
+            testObj.optBoolean("ok", false) -> "渠道已保存并拉取 ${testObj.optJSONArray("models")?.length() ?: 0} 个模型 (${testObj.optInt("latency_ms", 0)}ms)"
+            else -> "渠道已保存，测速提示：${testObj.optString("error", "拉取失败").take(50)}"
+        }
+        toast(testTip)
+        onDone()
+    }
+}
+
+internal fun NativePulseModel.toggleApiChannel(ch: PulseApiChannel, enabled: Boolean) {
+    saveApiChannel(
+        id = ch.id,
+        name = ch.name,
+        baseUrl = ch.baseUrl,
+        apiKey = "",
+        priority = ch.priority,
+        enabled = enabled,
+        autoFetch = false
+    )
+}
+
+internal fun NativePulseModel.testApiChannel(channelId: String) {
+    if (ui.testingChannelId != null) return
+    ui = ui.copy(testingChannelId = channelId)
+    perform {
+        try {
+            val res = request("POST", "/api/channels/$channelId/test")
+            val updated = res.optJSONArray("channels")?.let { PulseApiChannel.listFromJson(it) } ?: ui.channels
+            val mergedModels = linkedSetOf<String>().apply {
+                addAll(ui.availableModels)
+                updated.filter { it.enabled }.forEach { ch -> addAll(ch.models) }
+            }.toList()
+            ui = ui.copy(channels = updated, availableModels = mergedModels, modelEntries = PulseModelEntry.synthesize(mergedModels, updated))
+            if (res.optBoolean("ok", false)) {
+                toast("连通成功 · ${res.optInt("count", 0)} 个模型 · ${res.optInt("latency_ms", 0)}ms")
+            } else {
+                toast("连通失败：${res.optString("error", "未知错误").take(60)}")
+            }
+        } finally {
+            ui = ui.copy(testingChannelId = null)
+        }
+    }
+}
+
+internal fun NativePulseModel.deleteApiChannel(channelId: String) {
+    perform {
+        val res = request("DELETE", "/api/channels/$channelId")
+        val updated = PulseApiChannel.listFromJson(res.optJSONArray("channels"))
+        ui = ui.copy(channels = updated, modelEntries = PulseModelEntry.synthesize(ui.availableModels, updated)); toast("已删除渠道")
+    }
 }

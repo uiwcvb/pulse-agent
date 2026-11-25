@@ -240,6 +240,8 @@ const TOOLS = [
       ...WINDOW_ID, nx: { type: "number" }, ny: { type: "number" },
       x: { type: "number" }, y: { type: "number" },
       scrollX: { type: "number" }, scrollY: { type: "number" },
+      delta_x: { type: "number" }, delta_y: { type: "number" },
+      pages: { type: "number" }, amount: { type: "number" },
       direction: { type: "string", enum: ["up", "down", "left", "right"] },
     }, []),
     async run(a) {
@@ -250,25 +252,52 @@ const TOOLS = [
         x = Math.round(dims.width / 2);
         y = Math.round(dims.height / 2);
       }
-      const sx = a.scrollX ?? 0;
-      const sy = a.scrollY ?? (a.direction === "up" ? -5 : 5);
+      const dir = String(a.direction || "").trim().toLowerCase();
+      const mag = Math.max(1, Math.min(20, Math.round(Number(a.pages || a.amount || 5) || 5)));
+      const sx = a.scrollX ?? a.delta_x ?? (dir === "left" ? -mag : (dir === "right" ? mag : 0));
+      const sy = a.scrollY ?? a.delta_y ?? (dir === "up" ? -mag : (dir === "down" ? mag : (sx !== 0 ? 0 : 5)));
       await callWin32("scroll", { window_id: winId, x: Math.round(x), y: Math.round(y), scrollX: Math.round(sx), scrollY: Math.round(sy) }, REQUEST_TIMEOUT_MS);
       return text({ ok: true, window_id: winId, x: Math.round(x), y: Math.round(y), scrollX: sx, scrollY: sy });
     },
   },
   {
     name: "drag",
-    description: "Drag from (from_x, from_y) to (to_x, to_y).",
-    inputSchema: obj({ ...WINDOW_ID, from_x: { type: "number" }, from_y: { type: "number" }, to_x: { type: "number" }, to_y: { type: "number" } },
-      ["from_x", "from_y", "to_x", "to_y"]),
+    description: "Drag from normalized (from_nx, from_ny) / (nx, ny) or pixel (from_x, from_y) to (to_nx, to_ny) / (end_nx, end_ny) or (to_x, to_y).",
+    inputSchema: obj({
+      ...WINDOW_ID,
+      nx: { type: "number" }, ny: { type: "number" },
+      from_nx: { type: "number" }, from_ny: { type: "number" },
+      to_nx: { type: "number" }, to_ny: { type: "number" },
+      end_nx: { type: "number" }, end_ny: { type: "number" },
+      from_x: { type: "number" }, from_y: { type: "number" },
+      to_x: { type: "number" }, to_y: { type: "number" },
+      coord_space: { type: "string" },
+    }, []),
     async run(a) {
       const winId = await resolveWindowId(a);
+      const start = await resolveWindowCoords(winId, {
+        nx: a.from_nx ?? a.nx,
+        ny: a.from_ny ?? a.ny,
+        x: a.from_x,
+        y: a.from_y,
+        coord_space: a.coord_space,
+      });
+      const end = await resolveWindowCoords(winId, {
+        nx: a.to_nx ?? a.end_nx,
+        ny: a.to_ny ?? a.end_ny,
+        x: a.to_x,
+        y: a.to_y,
+        coord_space: a.coord_space,
+      });
+      if (start.x == null || start.y == null || end.x == null || end.y == null) {
+        throw new Error("drag requires start (from_nx/from_ny or from_x/from_y) and end (to_nx/to_ny or to_x/to_y) coordinates");
+      }
       await callWin32("drag", {
         window_id: winId,
-        from_x: Math.round(a.from_x), from_y: Math.round(a.from_y),
-        to_x: Math.round(a.to_x), to_y: Math.round(a.to_y),
+        from_x: Math.round(start.x), from_y: Math.round(start.y),
+        to_x: Math.round(end.x), to_y: Math.round(end.y),
       }, REQUEST_TIMEOUT_MS);
-      return text({ ok: true, window_id: winId });
+      return text({ ok: true, window_id: winId, from_x: Math.round(start.x), from_y: Math.round(start.y), to_x: Math.round(end.x), to_y: Math.round(end.y) });
     },
   },
   {

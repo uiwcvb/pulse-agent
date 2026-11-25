@@ -32,16 +32,20 @@ import java.util.concurrent.Future
 internal data class PulseBot(
     val id: String, val name: String, val description: String, val color: String, val shape: String,
     val engine: String, val pinned: Boolean, val hidden: Boolean, val pinnedAt: Double, val avatarVersion: String,
-    val instructions: String = "", val model: String = "", val curiosityEnabled: Boolean = false, val notify: Boolean = true
+    val instructions: String = "", val model: String = "", val curiosityEnabled: Boolean = false, val notify: Boolean = true,
+    val homeNode: String = "phone"
 ) {
     fun json() = JSONObject().put("id", id).put("name", name).put("description", description).put("color", color).put("shape", shape)
         .put("engine", engine).put("pinned", pinned).put("hidden", hidden).put("pinned_at", pinnedAt).put("avatar_version", avatarVersion)
         .put("instructions", instructions).put("model", model).put("curiosity_enabled", curiosityEnabled).put("notify", notify)
+        .put("home_node", homeNode)
     companion object {
         fun from(j: JSONObject, source: String = "phone"): PulseBot {
             val normSrc = source.trim().lowercase().ifBlank { "phone" }
             val nodeCfg = j.optJSONObject("node_settings")?.optJSONObject(normSrc)
             val id = j.getString("id")
+            val homeNode = j.optString("home_node", if (id.startsWith("pc_")) "pc" else "phone")
+                .trim().lowercase().ifBlank { if (id.startsWith("pc_")) "pc" else "phone" }
             return PulseBot(
                 id, j.optString("name"), j.optString("description"),
                 j.optString("color", "#B568F7"), j.optString("shape", if (id == "companion") "flower" else "circle"), j.optString("engine", "small"),
@@ -52,8 +56,22 @@ internal data class PulseBot(
                 j.optString("instructions", ""),
                 nodeCfg?.optString("model", j.optString("model", "")) ?: j.optString("model", ""),
                 nodeCfg?.optBoolean("curiosity_enabled", j.optBoolean("curiosity_enabled", id == "companion")) ?: j.optBoolean("curiosity_enabled", id == "companion"),
-                nodeCfg?.optBoolean("notify", j.optBoolean("notify", true)) ?: j.optBoolean("notify", true)
+                nodeCfg?.optBoolean("notify", j.optBoolean("notify", true)) ?: j.optBoolean("notify", true),
+                homeNode
             )
+        }
+
+        fun filterForNode(bots: List<PulseBot>, source: String = "phone"): List<PulseBot> {
+            if (bots.isEmpty()) return bots
+            val normSrc = source.trim().lowercase().ifBlank { "phone" }
+            val isPc = normSrc == "pc" || normSrc == "pc2"
+            val filtered = bots.filter { b ->
+                val hn = b.homeNode.trim().lowercase().ifBlank { "phone" }
+                if (hn == "all") true
+                else if (isPc) hn == "pc" || hn == "pc2"
+                else hn != "pc" && hn != "pc2"
+            }
+            return filtered.ifEmpty { bots }
         }
     }
 }
@@ -258,6 +276,117 @@ internal data class PulseMessage(
 internal data class PulseMenuItem(val title: String, val description: String = "", val icon: String = "next", val run: () -> Unit)
 internal data class PulseMenu(val title: String, val items: List<PulseMenuItem>)
 
+internal data class PulseApiChannel(
+    val id: String,
+    val name: String,
+    val baseUrl: String,
+    val enabled: Boolean = true,
+    val priority: Int = 100,
+    val models: List<String> = emptyList(),
+    val hasApiKey: Boolean = false,
+    val apiKeyMasked: String = ""
+) {
+    companion object {
+        fun fromJson(o: JSONObject): PulseApiChannel {
+            val arr = o.optJSONArray("models")
+            val ms = mutableListOf<String>()
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val m = arr.optString(i).trim()
+                    if (m.isNotBlank()) ms.add(m)
+                }
+            }
+            val cid = o.optString("id").trim()
+            return PulseApiChannel(
+                id = cid,
+                name = o.optString("name").trim().ifBlank { cid },
+                baseUrl = o.optString("base_url").trim(),
+                enabled = o.optBoolean("enabled", true),
+                priority = o.optInt("priority", 100),
+                models = ms,
+                hasApiKey = o.optBoolean("has_api_key", false),
+                apiKeyMasked = o.optString("api_key_masked").trim()
+            )
+        }
+
+        fun listFromJson(arr: JSONArray?): List<PulseApiChannel> {
+            if (arr == null) return emptyList()
+            val out = mutableListOf<PulseApiChannel>()
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val ch = fromJson(item)
+                if (ch.id.isNotBlank()) out.add(ch)
+            }
+            return out.sortedWith(compareBy<PulseApiChannel> { it.priority }.thenBy { it.id })
+        }
+    }
+}
+
+internal data class PulseModelEntry(
+    val value: String,
+    val model: String,
+    val channelId: String,
+    val channelName: String,
+    val isChannel: Boolean = false
+) {
+    companion object {
+        fun listFromJson(arr: JSONArray?): List<PulseModelEntry> {
+            if (arr == null) return emptyList()
+            val out = mutableListOf<PulseModelEntry>()
+            val seen = HashSet<String>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val value = o.optString("value").trim()
+                if (value.isBlank() || !seen.add(value)) continue
+                val model = o.optString("model").trim().ifBlank { value }
+                val chId = o.optString("channel_id").trim().ifBlank { "primary" }
+                val chName = o.optString("channel_name").trim().ifBlank { if (chId == "primary") "主接口" else chId }
+                out.add(PulseModelEntry(value, model, chId, chName, o.optBoolean("is_channel", false)))
+            }
+            return out
+        }
+
+        fun synthesize(models: List<String>, channels: List<PulseApiChannel>): List<PulseModelEntry> {
+            val enabledCh = channels.filter { it.enabled }.sortedWith(compareBy<PulseApiChannel> { it.priority }.thenBy { it.id })
+            val chById = channels.associateBy { it.id }
+            val out = mutableListOf<PulseModelEntry>()
+            val seen = HashSet<String>()
+            // 1. Add all enabled channel models with explicit channel attribution
+            val modelCount = HashMap<String, Int>()
+            enabledCh.forEach { ch -> ch.models.forEach { m -> modelCount[m] = (modelCount[m] ?: 0) + 1 } }
+            enabledCh.forEach { ch ->
+                ch.models.forEach { m ->
+                    val multi = (modelCount[m] ?: 0) > 1
+                    val value = if (multi) "ch:${ch.id}/$m" else m
+                    if (seen.add(value)) {
+                        out.add(PulseModelEntry(value, m, ch.id, ch.name.ifBlank { ch.id }, true))
+                    }
+                }
+            }
+            // 2. Add remaining raw models (primary / fallback / explicit ch: prefix)
+            models.forEach { raw ->
+                if (raw.isBlank() || !seen.add(raw)) return@forEach
+                if (raw.startsWith("ch:") && raw.indexOf('/') > 3) {
+                    val rest = raw.substring(3)
+                    val slash = rest.indexOf('/')
+                    val cid = rest.substring(0, slash)
+                    val mid = rest.substring(slash + 1)
+                    val cname = chById[cid]?.name?.ifBlank { cid } ?: cid
+                    out.add(PulseModelEntry(raw, mid, cid, cname, true))
+                } else {
+                    val owner = enabledCh.firstOrNull { raw in it.models }
+                    if (owner != null) {
+                        out.add(PulseModelEntry(raw, raw, owner.id, owner.name.ifBlank { owner.id }, true))
+                    } else {
+                        out.add(PulseModelEntry(raw, raw, "primary", "主接口", false))
+                    }
+                }
+            }
+            return out
+        }
+    }
+}
+
 internal data class NativePulseState(
     val bots: List<PulseBot> = emptyList(), val messages: List<PulseMessage> = emptyList(), val unread: Set<String> = emptySet(),
     val online: Boolean = false, val paired: Boolean = true, val latency: Long = 0, val primary: String = "companion",
@@ -280,12 +409,24 @@ internal data class NativePulseState(
     val fallbackApiKeyInput: String = "",
     val fallbackModel: String = "",
     val hasFallbackApiKey: Boolean = false,
+    val channels: List<PulseApiChannel> = emptyList(),
+    val testingChannelId: String? = null,
     val availableModels: List<String> = emptyList(),
+    val modelEntries: List<PulseModelEntry> = emptyList(),
     val fetchingModels: Boolean = false,
     val savingSettings: Boolean = false,
     val curiosityEnabledGlobal: Boolean = true,
     val curiosityMinutes: String = "90",
     val autoCompactTokens: String = "100000",
+    val workerModel: String = "",
+    val embeddingTier: String = "local_gte_small_zh",
+    val cacheKeepaliveEnabled: Boolean = true,
+    val cacheKeepaliveIntervalSec: String = "260",
+    val cacheKeepaliveMaxPings: String = "1",
+    val idleCompactMinutes: String = "9",
+    val sleepConsolidateIdleMinutes: String = "8",
+    val reorganizingMemory: Boolean = false,
+    val memoryReorgNotice: String = "",
     val contextTokensByBot: Map<String, Int> = emptyMap(),
     val contextCachedByBot: Map<String, Int> = emptyMap(),
     val contextMsgsByBot: Map<String, Int> = emptyMap(),
@@ -316,6 +457,7 @@ internal data class NativePulseState(
     val vaultContent: String = "",
     val vaultLoading: Boolean = false,
     val vaultSaving: Boolean = false,
+    val vaultDirty: Boolean = false,
     val streamBotId: String? = null,
     val streamSpeakerId: String? = null,
     val streamSpeakerName: String = "",
@@ -329,8 +471,6 @@ internal data class NativePulseState(
     val streamChoices: List<PulseChoice> = emptyList(),
     val consumedChoiceIds: Set<String> = emptySet(),
     val streamStartedAt: Long = 0L,
-    val activeTypewriterMsgId: String? = null,
-    val activeTypewriterChars: Int = Int.MAX_VALUE,
     val cloudDesktopFrame: ImageBitmap? = null,
     val cloudDesktopHash: String = "",
     val cloudDesktopUrl: String = "",
@@ -361,9 +501,120 @@ internal data class NativePulseState(
     val quickGateDismissed: Boolean = false,
     val promptPreview: JSONObject? = null,
     val promptPreviewLoading: Boolean = false,
-    val healthDialogOpen: Boolean = false
+    val healthDialogOpen: Boolean = false,
+    val subtasks: List<PulseSubtask> = emptyList(),
+    val activeSubtaskId: String = "",
+    val subtaskActionBusy: Boolean = false
 )
 
+
+internal data class PulseSubtaskStep(
+    val ts: Double = 0.0,
+    val tool: String = "",
+    val stage: String = "",
+    val args: String = "",
+    val ok: Boolean = true,
+    val result: String = "",
+    val error: String = ""
+) {
+    companion object {
+        fun from(j: JSONObject) = PulseSubtaskStep(
+            ts = j.optDouble("ts", 0.0),
+            tool = j.optString("tool", ""),
+            stage = j.optString("stage", ""),
+            args = j.optString("args", ""),
+            ok = j.optBoolean("ok", true),
+            result = j.optString("result", ""),
+            error = j.optString("error", "")
+        )
+    }
+}
+
+internal data class PulseSubtaskMessage(
+    val role: String = "user",
+    val text: String = "",
+    val ts: Double = 0.0
+) {
+    companion object {
+        fun from(j: JSONObject) = PulseSubtaskMessage(
+            role = j.optString("role", "user"),
+            text = j.optString("text", ""),
+            ts = j.optDouble("ts", 0.0)
+        )
+    }
+}
+
+internal data class PulseSubtask(
+    val taskId: String,
+    val title: String,
+    val preset: String = "",
+    val goal: String = "",
+    val parentBotId: String = "companion",
+    val parentSource: String = "phone",
+    val model: String = "",
+    val status: String = "running",
+    val stageIdx: Int = 0,
+    val stageTotal: Int = 0,
+    val stageLabel: String = "",
+    val subDone: Int = 0,
+    val subTotal: Int = 0,
+    val progressPct: Int = 0,
+    val stepsExecuted: Int = 0,
+    val maxSteps: Int = 200,
+    val elapsedSec: Double = 0.0,
+    val recentSteps: List<PulseSubtaskStep> = emptyList(),
+    val messages: List<PulseSubtaskMessage> = emptyList(),
+    val lastOutput: String = "",
+    val liveThought: String = "",
+    val lastError: String = "",
+    val resultSummary: String = "",
+    val metrics: JSONObject = JSONObject(),
+    val backupId: String = "",
+    val reportPath: String = "",
+    val updatedAt: Double = 0.0
+) {
+    companion object {
+        fun from(j: JSONObject): PulseSubtask {
+            val stepsArr = j.optJSONArray("recent_steps")
+            val steps = if (stepsArr != null) {
+                (0 until stepsArr.length()).mapNotNull { i -> stepsArr.optJSONObject(i)?.let(PulseSubtaskStep::from) }
+            } else emptyList()
+            val msgsArr = j.optJSONArray("messages")
+            val msgs = if (msgsArr != null) {
+                (0 until msgsArr.length()).mapNotNull { i -> msgsArr.optJSONObject(i)?.let(PulseSubtaskMessage::from) }
+            } else emptyList()
+            return PulseSubtask(
+                taskId = j.optString("task_id", ""),
+                title = j.optString("title", "后台子任务").ifBlank { "后台子任务" },
+                preset = j.optString("preset", ""),
+                goal = j.optString("goal", ""),
+                parentBotId = j.optString("parent_bot_id", "companion"),
+                parentSource = j.optString("parent_source", "phone"),
+                model = j.optString("model", ""),
+                status = j.optString("status", "running"),
+                stageIdx = j.optInt("stage_idx", 0),
+                stageTotal = j.optInt("stage_total", 0),
+                stageLabel = j.optString("stage_label", ""),
+                subDone = j.optInt("sub_done", 0),
+                subTotal = j.optInt("sub_total", 0),
+                progressPct = j.optInt("progress_pct", 0),
+                stepsExecuted = j.optInt("steps_executed", 0),
+                maxSteps = j.optInt("max_steps", 200),
+                elapsedSec = j.optDouble("elapsed_sec", 0.0),
+                recentSteps = steps,
+                messages = msgs,
+                lastOutput = j.optString("last_output", ""),
+                liveThought = j.optString("live_thought", ""),
+                lastError = j.optString("last_error", ""),
+                resultSummary = j.optString("result_summary", ""),
+                metrics = j.optJSONObject("metrics") ?: JSONObject(),
+                backupId = j.optString("backup_id", ""),
+                reportPath = j.optString("report_path", ""),
+                updatedAt = j.optDouble("updated_at", 0.0)
+            )
+        }
+    }
+}
 
 internal fun JSONArray.objects(): List<JSONObject> = (0 until length()).map { getJSONObject(it) }
 

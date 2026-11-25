@@ -7,3 +7,6 @@ cryptography==46.0.3
 tzdata==2025.2
 Pillow==13.0.0
 asyncssh>=2.18.0
+onnxruntime>=1.19.0
+tokenizers>=0.20.0
+numpy>=1.26.0

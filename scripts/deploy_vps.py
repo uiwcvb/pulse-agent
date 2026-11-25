@@ -94,6 +94,7 @@ Environment=AGENT_DATA_DIR=/opt/proactive-agent/data
 Environment=AGENT_APK=/opt/proactive-agent/dist/proactive-agent.apk
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
 Environment=BRAIN_ENGINE=dsh
 Environment=DSH_BRAIN_URL=http://127.0.0.1:18199
 ExecStart=/opt/proactive-agent/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 18190 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --root-path /proactive-agent --no-access-log
@@ -176,6 +177,13 @@ for i in $(seq 1 15); do
 done
 systemctl enable --now proactive-agent.service
 systemctl restart proactive-agent.service
+if [ -d "$BASE/cloud-computer/server" ]; then
+  for cf in computer_models.py computer_desktop.py computer_browser.py; do
+    if [ -f "$BASE/server/$cf" ]; then cp -f "$BASE/server/$cf" "$BASE/cloud-computer/server/$cf"; fi
+  done
+  chown proactive-desktop:proactive-desktop "$BASE/cloud-computer/server"/computer_*.py 2>/dev/null || true
+  systemctl restart proactive-desktop.service 2>/dev/null || true
+fi
 systemctl reload nginx.service
 for i in $(seq 1 15); do
   curl -fsS http://127.0.0.1:18190/health >/dev/null 2>&1 && break

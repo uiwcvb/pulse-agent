@@ -389,7 +389,7 @@ async def test_l1_l2_l3_ephemeral_ui_scrub_observation_masking_and_subtask(tmp_p
         return {'content': '调研结论：工作区目录正常，无异常文件。', 'tool_calls': []}
 
     brain.complete = sub_complete  # type: ignore[method-assign]
-    sub_res = await brain._tool_run_subtask({'goal': '检查工作区结构并返回简短摘要', 'max_steps': 5})
+    sub_res = await brain._tool_run_subtask({'goal': '检查工作区结构并返回简短摘要', 'max_steps': 5, 'wait': True})
     assert sub_res['ok'] is True
     assert sub_res['steps_used'] == 2
     assert '工作区目录正常' in sub_res['result_summary']

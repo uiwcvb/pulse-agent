@@ -41,35 +41,47 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
     val c = LocalPulsePalette.current
     val focus = LocalFocusManager.current
     val haptics = LocalHapticFeedback.current
+    val chatReduceMotion = rememberReducedMotion()
     val otherUnreadCount = remember(s.unread, s.messages, bot.id) {
         s.messages.count { it.botId != bot.id && it.id in s.unread }
     }
+    var chatScrolled by remember(bot.id) { mutableStateOf(false) }
+    val phoneSt by RootPhoneHarness.changes.collectAsState()
 
     Column(modifier.background(c.chatBg)) {
         // 1. Telegram iOS Navigation Bar (Swipe Left/Right to switch Bot, Swipe Down or Tap Avatar to open Contact Info)
-        Surface(
+    Surface(
             color = c.surface.copy(alpha = 0.96f),
             tonalElevation = 0.dp,
             modifier = Modifier.pointerInput(bot.id) {
+                val horizThresh = 38.dp.toPx()
+                val vertThresh = 32.dp.toPx()
                 var dx = 0f
                 var dy = 0f
                 awaitEachGesture {
                     awaitFirstDown(requireUnconsumed = false)
                     dx = 0f
                     dy = 0f
+                    var childConsumed = false
                     do {
                         val event = awaitPointerEvent()
                         val change = event.changes.firstOrNull() ?: break
+                        if (change.isConsumed) {
+                            childConsumed = true
+                            break
+                        }
                         dx += change.position.x - change.previousPosition.x
                         dy += change.position.y - change.previousPosition.y
                     } while (event.changes.any { it.pressed })
-                    if (abs(dx) > abs(dy) && abs(dx) > 70f) {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        if (dx < 0) model.switchAdjacentBot(1) else model.switchAdjacentBot(-1)
-                    } else if (dy > 60f && abs(dy) > abs(dx)) {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        focus.clearFocus()
-                        model.openBotEditor(bot.id)
+                    if (!childConsumed) {
+                        if (abs(dx) > abs(dy) && abs(dx) > horizThresh) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            if (dx < 0) model.switchAdjacentBot(1) else model.switchAdjacentBot(-1)
+                        } else if (dy > vertThresh && abs(dy) > abs(dx)) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            focus.clearFocus()
+                            model.openBotEditor(bot.id)
+                        }
                     }
                 }
             }
@@ -139,6 +151,7 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     bot.name,
+                                    modifier = Modifier.weight(1f, fill = false),
                                     color = c.ink,
                                     fontSize = 16.5.sp,
                                     fontWeight = FontWeight.SemiBold,
@@ -158,35 +171,22 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                                         fontWeight = FontWeight.SemiBold
                                     )
                                 }
-                                // 3-Bot Switcher Indicator Dots (Swipe Left/Right hint)
-                                if (s.bots.size > 1) {
-                                    Row(
-                                        Modifier.padding(start = 8.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(3.5.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        s.bots.forEach { b ->
-                                            val active = b.id == bot.id
-                                            Box(
-                                                Modifier.size(if (active) 5.5.dp else 4.dp)
-                                                    .clip(CircleShape)
-                                                    .background(if (active) c.accent else c.faint.copy(alpha = 0.45f))
-                                            )
-                                        }
-                                    }
-                                }
                             }
-                            val (hdrCurTok, _, _) = model.contextStatsFor(bot.id)
-                            val (hdrCachedTok, hdrCachePct) = model.contextCacheFor(bot.id)
-                            val (hdrTtft, hdrTps, _) = model.contextPerfFor(bot.id)
-                            val ttftStr = if (hdrTtft > 0) {
-                                if (hdrTtft >= 1000) String.format(java.util.Locale.US, " · 首字%.1fs", hdrTtft / 1000.0)
-                                else " · 首字${hdrTtft}ms"
-                            } else ""
-                            val tpsStr = if (hdrTps > 0.0) String.format(java.util.Locale.US, " · %.0ft/s", hdrTps) else ""
+                            val (hdrCurTok, _, _) = remember(
+                                s.contextTokensByBot,
+                                s.contextMsgsByBot,
+                                s.autoCompactTokens,
+                                s.messages,
+                                bot.id
+                            ) {
+                                model.contextStatsFor(bot.id)
+                            }
+                            val (hdrCachedTok, hdrCachePct) = remember(s.contextCachedByBot, hdrCurTok, bot.id) {
+                                model.contextCacheFor(bot.id, precomputedCurTok = hdrCurTok)
+                            }
                             val ctxBadge = if (hdrCurTok > 0) {
-                                (if (hdrCachedTok > 0) " · ${model.formatTokenCount(hdrCurTok)} ($hdrCachePct%)"
-                                else " · ${model.formatTokenCount(hdrCurTok)}") + ttftStr + tpsStr
+                                if (hdrCachedTok > 0) " · ${model.formatTokenCount(hdrCurTok)} ($hdrCachePct%)"
+                                else " · ${model.formatTokenCount(hdrCurTok)}"
                             } else ""
                             Text(
                                 if (isLiveHere) {
@@ -204,47 +204,74 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                         }
                     }
 
-                    // Right: Live Connection & Virtual Display Health Pill + More Options
-                    val overlayMode by FloatingVirtualDisplay.overlayModeFlow.collectAsState()
-                    val phoneSt by RootPhoneHarness.changes.collectAsState()
+                    // Right: Active Subtask Pill (only when this bot has running subtasks) + Connection Health Dot
+                    val botRunningSubtasks = remember(s.subtasks, bot.id) {
+                        s.subtasks.filter { it.parentBotId == bot.id && it.status == "running" }
+                    }
+                    if (botRunningSubtasks.isNotEmpty()) {
+                        val leadSub = botRunningSubtasks.first()
+                        Row(
+                            Modifier.heightIn(min = 30.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(c.accent.copy(alpha = 0.14f))
+                                .border(0.5.dp, c.accent.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                                .iosPressScale(0.94f) {
+                                    focus.clearFocus()
+                                    model.openSubtaskPanel(leadSub.taskId)
+                                }
+                                .padding(horizontal = 9.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Box(Modifier.size(6.dp).clip(CircleShape).background(c.accent))
+                            Text(
+                                if (botRunningSubtasks.size == 1) leadSub.title.take(8) else "子任务 ${botRunningSubtasks.size}",
+                                color = c.accent,
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
                     val dotColor = when {
                         !s.online -> c.muted
                         else -> Color(0xFF34C759)
                     }
-                    Row(
-                        Modifier.clip(RoundedCornerShape(12.dp))
-                            .background(c.bg.copy(alpha = 0.65f))
-                            .border(0.5.dp, c.line.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
-                            .iosPressScale(0.95f) {
+                    Box(
+                        Modifier.size(40.dp)
+                            .iosPressScale(0.92f) {
                                 focus.clearFocus()
                                 model.openHealthDialog()
                             }
-                            .semantics { contentDescription = "连接与小窗实时自检" }
-                            .padding(horizontal = 8.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            .semantics { contentDescription = "连接与小窗实时自检" },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Box(Modifier.size(7.dp).clip(CircleShape).background(dotColor))
-                        if (phoneSt.displayCreated && overlayMode != OverlayMode.HIDDEN) {
-                            Text(
-                                overlayMode.label,
-                                color = c.accent,
-                                fontSize = 10.5.sp,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1
-                            )
+                        Box(
+                            Modifier.clip(CircleShape)
+                                .background(c.bg.copy(alpha = 0.65f))
+                                .border(0.5.dp, c.line.copy(alpha = 0.7f), CircleShape)
+                                .padding(7.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(Modifier.size(7.dp).clip(CircleShape).background(dotColor))
                         }
                     }
                     PulseRoundButton("more", "选项", { focus.clearFocus(); model.botMenu(bot.id) }, background = false)
                 }
 
-                HorizontalDivider(color = c.line.copy(alpha = 0.65f), thickness = 0.5.dp)
+                val hdrDivAlpha by animateFloatAsState(
+                    targetValue = if (chatScrolled || s.pinnedMemories.isNotEmpty()) 0.65f else 0f,
+                    animationSpec = if (chatReduceMotion) snap() else tween(160),
+                    label = "chat_hdr_div"
+                )
+                HorizontalDivider(color = c.line.copy(alpha = hdrDivAlpha), thickness = 0.5.dp)
 
                 // 2. Telegram-Style Pinned Memory Bar (`📌 置顶记忆`)
                 AnimatedVisibility(
                     visible = s.pinnedMemories.isNotEmpty(),
-                    enter = expandVertically(spring(dampingRatio = 0.82f, stiffness = 400f)) + fadeIn(),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 450f)) + fadeOut()
+                    enter = if (chatReduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                    exit = if (chatReduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
                 ) {
                     var pinsExpanded by remember { mutableStateOf(false) }
                     val latestPin = s.pinnedMemories.lastOrNull()?.optString("text").orEmpty()
@@ -283,7 +310,7 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                             }
                             val chevronRot by animateFloatAsState(
                                 targetValue = if (pinsExpanded) 180f else 0f,
-                                animationSpec = spring(dampingRatio = 0.78f, stiffness = 420f),
+                                animationSpec = if (chatReduceMotion) snap() else iosGentleSpring(),
                                 label = "pin_chevron_rot"
                             )
                             PulseIcon(
@@ -296,8 +323,8 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                         }
                         AnimatedVisibility(
                             visible = pinsExpanded,
-                            enter = expandVertically(spring(dampingRatio = 0.80f, stiffness = 400f)) + fadeIn(),
-                            exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 440f)) + fadeOut()
+                            enter = if (chatReduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                            exit = if (chatReduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
                         ) {
                             Column(
                                 Modifier.fillMaxWidth().padding(start = 16.dp, end = 14.dp, bottom = 10.dp),
@@ -310,7 +337,7 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                                         Modifier.fillMaxWidth()
                                             .clip(RoundedCornerShape(10.dp))
                                             .background(c.fill.copy(alpha = 0.72f))
-                                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                                            .padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
@@ -320,17 +347,24 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                                             lineHeight = 17.sp,
                                             modifier = Modifier.weight(1f)
                                         )
-                                        Text(
-                                            "移除",
-                                            Modifier.padding(start = 8.dp)
-                                                .clip(RoundedCornerShape(6.dp))
-                                                .background(c.surface)
-                                                .clickable { model.removeMemoryPin(pid) }
-                                                .padding(horizontal = 8.dp, vertical = 3.dp),
-                                            color = c.warn,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Medium
-                                        )
+                                        Box(
+                                            Modifier.padding(start = 4.dp)
+                                                .heightIn(min = 40.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .iosPressScale(0.95f) { model.removeMemoryPin(pid) }
+                                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                "移除",
+                                                Modifier.clip(RoundedCornerShape(6.dp))
+                                                    .background(c.surface)
+                                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                                                color = c.warn,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -338,31 +372,34 @@ internal fun NativeChat(model: NativePulseModel, bot: PulseBot, modifier: Modifi
                         HorizontalDivider(color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
                     }
                 }
-                val chatVdState by RootPhoneHarness.changes.collectAsState()
                 AppleLiveActivityPill(
-                    visible = chatVdState.displayCreated,
-                    displayId = chatVdState.displayId,
+                    visible = phoneSt.displayCreated,
+                    displayId = phoneSt.displayId,
                     onExpand = { model.launchFloatingVirtualDisplay() },
                     onDestroy = { model.destroyVirtualDisplay() }
                 )
             }
         }
 
-        // 3. Directional AnimatedContent for Bot Switching (Glides smoothly left/right when swiping between Bots!)
+        // 3. Directional AnimatedContent for Bot Switching
         AnimatedContent(
             targetState = bot,
             modifier = Modifier.weight(1f).fillMaxWidth(),
             transitionSpec = {
-                val dir = s.lastSwitchDir
-                (slideInHorizontally(spring(dampingRatio = 0.84f, stiffness = 400f)) { fullWidth -> dir * (fullWidth / 3) } +
-                    fadeIn(tween(180))) togetherWith
-                    (slideOutHorizontally(spring(dampingRatio = 0.86f, stiffness = 420f)) { fullWidth -> -dir * (fullWidth / 3) } +
-                        fadeOut(tween(130)))
+                if (chatReduceMotion) {
+                    fadeIn(tween(110)) togetherWith fadeOut(tween(90))
+                } else {
+                    val dir = s.lastSwitchDir
+                    (slideInHorizontally(spring(dampingRatio = 0.84f, stiffness = 400f)) { fullWidth -> dir * (fullWidth / 3) } +
+                        fadeIn(tween(180))) togetherWith
+                        (slideOutHorizontally(spring(dampingRatio = 0.86f, stiffness = 420f)) { fullWidth -> -dir * (fullWidth / 3) } +
+                            fadeOut(tween(110)))
+                }
             },
             contentKey = { it.id },
             label = "bot_room_switch"
         ) { activeBot ->
-            NativeChatRoomViewport(model, activeBot)
+            NativeChatRoomViewport(model, activeBot) { chatScrolled = it }
         }
 
         // 4. Telegram iOS Bottom Composer

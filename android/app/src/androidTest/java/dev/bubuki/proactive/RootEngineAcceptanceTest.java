@@ -109,7 +109,7 @@ public class RootEngineAcceptanceTest {
             RootPhoneHarness.submitFromBridge(c,"companion","[root-proof] 在独立测试屏点击按钮，然后截图核对。");waitPhase("done",70);
             assertTrue(RootPhoneHarness.history(c).toString().contains("Root 独立屏真实工具回环验收通过"));
             assertTrue("The provider did not receive actual PNG screenshots",fixtureMetrics().getInt("images")>=2);
-            JSONObject stored=SecurePrefs.read(c);assertTrue(stored.getJSONArray("phoneHistory").toString().contains("phone_capture"));
+            JSONObject stored=SecurePrefs.readPhoneHistory(c);assertTrue(stored.getJSONArray("phoneHistory").toString().contains("phone_capture"));
             assertFalse("Raw frame leaked into persistent trace",stored.getJSONArray("phoneHistory").toString().contains("data:image"));
             proof.put("tool_loop",true).put("unicode_paste",true).put("clipboard_restored",true).put("main_focus_preserved",phone.hasWindowFocus());
             RootPhoneHarness.submitFromBridge(c,"companion","[needs-user] 请在工作区核对后等我继续。");waitPhase("waiting_user",20);
@@ -119,7 +119,7 @@ public class RootEngineAcceptanceTest {
             RootPhoneHarness.stop(c);waitPhase("stopped",15);int calls=fixtureMetrics().getInt("calls");Thread.sleep(1800);assertEquals(calls,fixtureMetrics().getInt("calls"));
             assertFalse(privilege.execute(new JSONObject().put("op","status")).getBoolean("created"));
             proof.put("needs_user_resume",true).put("stop_released_display",true).put("fixture",fixtureMetrics());
-            assertTrue(SecurePrefs.read(c).getJSONArray("phoneHistory").toString().contains("phone_stopped"));
+            assertTrue(SecurePrefs.readPhoneHistory(c).getJSONArray("phoneHistory").toString().contains("phone_stopped"));
             ins.runOnMainSync(()->phone.finish());
             NativePulseActivity chat=(NativePulseActivity)ins.startActivitySync(new Intent(c,NativePulseActivity.class).putExtra("openBot","companion").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             Thread.sleep(1700);screenshot("root-04-own-conversation");ins.runOnMainSync(chat::finish);

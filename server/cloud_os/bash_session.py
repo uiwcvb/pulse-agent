@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import os
 import re
@@ -127,7 +128,13 @@ class CloudBashSession:
                 f'    unset __DS_ACTIVE_ID\n'
                 f'    printf \'\\n__DS_END_%s__\\n\' "$__cid"\n'
                 f'    rm -f "{st}/cmd_${{__cid}}.sh" 2>/dev/null || true\n'
-                f'    printf \'{{"exit_code":%d,"cwd":"%s"}}\\n\' "$__ec" "$(pwd)" > "{st}/bash_done_${{__cid}}.tmp"\n'
+                f'    local __cwd="$(pwd)"\n'
+                f'    __cwd="${{__cwd//\\\\/\\\\\\\\}}"\n'
+                f'    __cwd="${{__cwd//\\"/\\\\\\"}}"\n'
+                f'    __cwd="${{__cwd//$\'\\t\'/\\\\t}}"\n'
+                f'    __cwd="${{__cwd//$\'\\r\'/}}"\n'
+                f'    __cwd="${{__cwd//$\'\\n\'/\\\\n}}"\n'
+                f'    printf \'{{"exit_code":%d,"cwd":"%s"}}\\n\' "$__ec" "$__cwd" > "{st}/bash_done_${{__cid}}.tmp"\n'
                 f'    mv -f "{st}/bash_done_${{__cid}}.tmp" "{st}/bash_done_${{__cid}}" 2>/dev/null || true\n'
                 f'  fi\n'
                 f'}}\n'
@@ -168,6 +175,17 @@ class CloudBashSession:
                 if self._active_proc.poll() is None:
                     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                         os.killpg(self._active_proc_pgid, signal.SIGTERM)
+                    await asyncio.sleep(0.2)
+                    if self._active_proc.poll() is None:
+                        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                            self._active_proc.kill()
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(self._active_proc.wait, 1.5)
+            elif self._active_proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    self._active_proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self._active_proc.wait, 1.5)
         self._active_cmd_id = None
         self._active_proc = None
         self._active_proc_pgid = None
@@ -204,10 +222,14 @@ class CloudBashSession:
         if not log_path.exists():
             return '', start_offset
         try:
-            data = log_path.read_bytes()
-            if len(data) <= start_offset:
-                return '', start_offset
-            return data[start_offset:].decode('utf-8', errors='replace'), len(data)
+            with log_path.open('rb') as f:
+                f.seek(0, io.SEEK_END)
+                total_len = f.tell()
+                if total_len <= start_offset:
+                    return '', start_offset
+                f.seek(max(0, start_offset), io.SEEK_SET)
+                chunk = f.read()
+            return chunk.decode('utf-8', errors='replace'), total_len
         except Exception:
             return '', start_offset
 

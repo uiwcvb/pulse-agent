@@ -43,6 +43,8 @@ final class DisplayInputHelper {
     private static Method sInjectInputEventMethod, sSetDisplayIdMethod;
     static Object sPowerManager;
     static Method sUserActivityMethod;
+    private static volatile long sLastPokeUptime = 0L;
+    private static final long POKE_THROTTLE_MS = 8_000L;
 
     static {
         try {
@@ -141,7 +143,7 @@ final class DisplayInputHelper {
     }
 
     static int[] computeAdaptiveDisplaySpec(DisplayManager dm, String tierInput) {
-        String tier = (tierInput == null || tierInput.isEmpty()) ? "compact" : tierInput.trim().toLowerCase();
+        String tier = (tierInput == null || tierInput.isEmpty()) ? "compact" : tierInput.trim().toLowerCase(java.util.Locale.ROOT);
         int rw = 1080, rh = 2400, realDpi = 480;
         try {
             Display mainDisp = dm != null ? dm.getDisplay(Display.DEFAULT_DISPLAY) : null;
@@ -242,8 +244,35 @@ final class DisplayInputHelper {
         }
     }
 
+    static boolean invokeUserActivityIfInteractive(Object powerManager, Method userActivityMethod, int displayId, long nowUptime) {
+        if (powerManager == null || userActivityMethod == null) return false;
+        try {
+            Object inter = powerManager.getClass().getMethod("isInteractive").invoke(powerManager);
+            if (!(inter instanceof Boolean) || !((Boolean) inter)) {
+                return false; // NEVER wake a sleeping/locked screen
+            }
+            userActivityMethod.invoke(powerManager, Display.DEFAULT_DISPLAY, nowUptime, 0 /* USER_ACTIVITY_EVENT_OTHER */, 0);
+            if (displayId > 0) {
+                try { userActivityMethod.invoke(powerManager, displayId, nowUptime, 0, 0); } catch (Throwable ignored) {}
+            }
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     static void pokeDisplayAwake(int displayId) {
-        // Intentionally no-op: FLAG_ALWAYS_UNLOCKED on VirtualDisplay keeps rendering active without waking physical backlight.
+        pokeDisplayAwake(displayId, false);
+    }
+
+    static void pokeDisplayAwake(int displayId, boolean force) {
+        long now = SystemClock.uptimeMillis();
+        if (!force && sLastPokeUptime != 0L && (now - sLastPokeUptime < POKE_THROTTLE_MS)) {
+            return;
+        }
+        if (invokeUserActivityIfInteractive(sPowerManager, sUserActivityMethod, displayId, now)) {
+            sLastPokeUptime = now;
+        }
     }
 
     static void ensureAwakeAndUnlocked(int displayId) {
@@ -583,7 +612,6 @@ final class DisplayInputHelper {
         String pkg = parts[0];
         Display0Snapshot snap = snapshotDisplay0BeforeLaunch(pkg);
         int existingVirtualTaskId = -1;
-        boolean useMultipleTaskFlags = false;
 
         try {
             if (snap.atm != null && !"dev.bubuki.proactive".equals(pkg)) {
@@ -621,50 +649,60 @@ final class DisplayInputHelper {
             throw new Exception("该应用 (" + pkg + ") 当前正在手机主屏或小窗运行，为保护主屏小窗不掉入虚拟屏、不变全屏，已跳过抢占");
         }
 
-        boolean omitWindowingMode = snap.existingMainTaskId > 0;
-        if (snap.existingMainTaskId > 0 && !"dev.bubuki.proactive".equals(pkg)) {
+        boolean isSelfHome = "dev.bubuki.proactive".equals(pkg);
+        if (snap.existingMainTaskId > 0 && !isSelfHome) {
+            String multiFlagsHex = launchFlagsHex(false, true);
+            String zeroTouchOut = shell(
+                "am", "start", "--display", String.valueOf(displayId),
+                "--user", String.valueOf(userId), "-f", multiFlagsHex, "-n", component
+            );
+            for (int i = 0; i < 4 && !pkg.equals(topPackageOnDisplay(displayId)); i++) {
+                try { Thread.sleep(50L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
+            if (pkg.equals(topPackageOnDisplay(displayId))) {
+                DisplayTaskContainment.guardAndContainLaunchOnDisplay(snap.atm, displayId, pkg, snap.mainBeforeTaskId, snap.mainBeforePkg, snap.preLaunchMainTaskIds);
+                return "launched_isolated_multi_task_on_virtual_display (" + displayId + ")";
+            }
             try {
-                if (DisplayTaskContainment.invokeMoveRootTaskToDisplay(snap.atm, snap.existingMainTaskId, displayId, true)) {
+                if (DisplayTaskContainment.invokeMoveRootTaskToDisplay(snap.atm, snap.existingMainTaskId, displayId, false)) {
                     DisplayTaskContainment.invokeMoveTaskToFront(snap.atm, snap.existingMainTaskId, displayId);
                     for (int i = 0; i < 4 && !pkg.equals(topPackageOnDisplay(displayId)); i++) Thread.sleep(45L);
                     DisplayTaskContainment.restoreMainDisplayForegroundIfNeeded(snap.atm, snap.mainBeforeTaskId, snap.mainBeforePkg, pkg);
                     if (pkg.equals(topPackageOnDisplay(displayId))) {
-                        return "pre_migrated_dormant_task_to_virtual_display (" + snap.existingMainTaskId + ")";
+                        return "migrated_dormant_task_to_virtual_display (" + snap.existingMainTaskId + ")";
                     }
                 }
             } catch (Throwable ignored) {}
-            // Pre-migration did not complete cleanly; fall back to MULTIPLE_TASK without forcing Display 0 fullscreen.
-            useMultipleTaskFlags = true;
-        }
-
-        String flagsHex = "dev.bubuki.proactive".equals(pkg)
-            ? "0x14000000"
-            : (useMultipleTaskFlags ? "0x18000000" : "0x10200000");
-        // Omit --windowingMode 1 when an existing Display 0 task exists so singleTask routing never forces it fullscreen.
-        String output = omitWindowingMode
-            ? shell(
-                "am", "start", "--display", String.valueOf(displayId),
-                "--user", String.valueOf(userId), "-f", flagsHex, "-n", component
-            )
-            : shell(
-                "am", "start", "--display", String.valueOf(displayId), "--windowingMode", "1",
-                "--user", String.valueOf(userId), "-f", flagsHex, "-n", component
-            );
-        if (output.contains("Error") || output.contains("Exception") || output.contains("does not exist") || output.contains("Permission Denial") || output.contains("Unknown option")) {
-            if (output.contains("Unknown option")) {
-                output = shell(
-                    "am", "start", "--display", String.valueOf(displayId),
-                    "--user", String.valueOf(userId), "-f", flagsHex, "-n", component
-                );
-            }
+            // Fall through using alt component resolution / containment with multi-task flags.
+            String output = zeroTouchOut;
             if (output.contains("Error") || output.contains("Exception") || output.contains("does not exist") || output.contains("Permission Denial")) {
                 String altComp = resolveEnabledLauncherComponent(pkg, userId);
                 if (!altComp.isEmpty() && !altComp.equals(component)) {
                     output = shell(
                         "am", "start", "--display", String.valueOf(displayId),
-                        "--user", String.valueOf(userId), "-f", flagsHex, "-n", altComp
+                        "--user", String.valueOf(userId), "-f", multiFlagsHex, "-n", altComp
                     );
                 }
+            }
+            DisplayTaskContainment.guardAndContainLaunchOnDisplay(snap.atm, displayId, pkg, snap.mainBeforeTaskId, snap.mainBeforePkg, snap.preLaunchMainTaskIds);
+            if ((output.contains("Error") || output.contains("Exception")) && !pkg.equals(topPackageOnDisplay(displayId))) {
+                throw new Exception(output.substring(0, Math.min(300, output.length())));
+            }
+            return output;
+        }
+
+        String flagsHex = launchFlagsHex(isSelfHome, false);
+        String output = shell(
+            "am", "start", "--display", String.valueOf(displayId),
+            "--user", String.valueOf(userId), "-f", flagsHex, "-n", component
+        );
+        if (output.contains("Error") || output.contains("Exception") || output.contains("does not exist") || output.contains("Permission Denial")) {
+            String altComp = resolveEnabledLauncherComponent(pkg, userId);
+            if (!altComp.isEmpty() && !altComp.equals(component)) {
+                output = shell(
+                    "am", "start", "--display", String.valueOf(displayId),
+                    "--user", String.valueOf(userId), "-f", flagsHex, "-n", altComp
+                );
             }
         }
         DisplayTaskContainment.guardAndContainLaunchOnDisplay(snap.atm, displayId, pkg, snap.mainBeforeTaskId, snap.mainBeforePkg, snap.preLaunchMainTaskIds);
@@ -672,6 +710,12 @@ final class DisplayInputHelper {
             throw new Exception(output.substring(0, Math.min(300, output.length())));
         }
         return output;
+    }
+
+    static String launchFlagsHex(boolean isSelfHome, boolean preferMultipleTask) {
+        if (isSelfHome) return "0x14010000"; // NEW_TASK | CLEAR_TOP | NO_ANIMATION
+        if (preferMultipleTask) return "0x18010000"; // NEW_TASK | MULTIPLE_TASK | NO_ANIMATION
+        return "0x10210000"; // NEW_TASK | RESET_TASK_IF_NEEDED | NO_ANIMATION
     }
 
     static String openUriOnDisplay(int displayId, String uri, int userId) throws Exception {
@@ -744,13 +788,11 @@ final class DisplayInputHelper {
                 thread = ctor.newInstance();
                 Field sCur = at.getDeclaredField("sCurrentActivityThread"); sCur.setAccessible(true); sCur.set(null, thread);
                 Field mSys = at.getDeclaredField("mSystemThread"); mSys.setAccessible(true); mSys.setBoolean(thread, true);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    try {
-                        Class<?> cc = Class.forName("android.app.ConfigurationController"), internal = Class.forName("android.app.ActivityThreadInternal");
-                        Constructor<?> ccCtor = cc.getDeclaredConstructor(internal); ccCtor.setAccessible(true);
-                        Field mCc = at.getDeclaredField("mConfigurationController"); mCc.setAccessible(true); mCc.set(thread, ccCtor.newInstance(thread));
-                    } catch (Throwable ignored) {}
-                }
+                try {
+                    Class<?> cc = Class.forName("android.app.ConfigurationController"), internal = Class.forName("android.app.ActivityThreadInternal");
+                    Constructor<?> ccCtor = cc.getDeclaredConstructor(internal); ccCtor.setAccessible(true);
+                    Field mCc = at.getDeclaredField("mConfigurationController"); mCc.setAccessible(true); mCc.set(thread, ccCtor.newInstance(thread));
+                } catch (Throwable ignored) {}
                 try {
                     Class<?> abd = Class.forName("android.app.ActivityThread$AppBindData");
                     Constructor<?> abdCtor = abd.getDeclaredConstructor(); abdCtor.setAccessible(true);

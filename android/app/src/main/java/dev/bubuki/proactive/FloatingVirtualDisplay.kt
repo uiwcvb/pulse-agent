@@ -50,46 +50,6 @@ import kotlin.math.roundToInt
  *   - cycleSizeTier(context) / currentTier() / isPreviewVisible()
  *   - onWorkspaceStateChanged(context, state) / computeAdaptiveLayout(...)
  */
-internal fun shouldAutoCloseVirtualDisplay(phase: String, displayJson: String): Boolean {
-    val dispObj = runCatching { JSONObject(displayJson) }.getOrNull() ?: return false
-    return dispObj.optBoolean("explicit_destroy", false)
-}
-
-internal enum class OverlayMode(val label: String) {
-    HIDDEN("隐藏"),
-    MINI("小窗挂起"),
-    EXPANDED("展开操作"),
-    EDGE_BUBBLE("贴边气泡"),
-}
-
-internal enum class OverlayDrawer {
-    NONE,
-    APP_PICKER,
-    INPUT_BAR,
-}
-
-internal data class OverlayUiState(
-    val mode: OverlayMode = OverlayMode.HIDDEN,
-    val drawer: OverlayDrawer = OverlayDrawer.NONE,
-    val userDismissed: Boolean = false,
-) {
-    val expanded: Boolean get() = mode == OverlayMode.EXPANDED
-    val dockedAsEdgeBubble: Boolean get() = mode == OverlayMode.EDGE_BUBBLE
-    val pickingApp: Boolean get() = mode == OverlayMode.EXPANDED && drawer == OverlayDrawer.APP_PICKER
-    val inputBarOpen: Boolean get() = mode == OverlayMode.EXPANDED && drawer == OverlayDrawer.INPUT_BAR
-}
-
-internal fun reduceOverlayTransition(
-    current: OverlayUiState,
-    targetMode: OverlayMode,
-    targetDrawer: OverlayDrawer = OverlayDrawer.NONE,
-    userClosed: Boolean = current.userDismissed,
-): OverlayUiState = OverlayUiState(
-    mode = targetMode,
-    drawer = if (targetMode == OverlayMode.EXPANDED) targetDrawer else OverlayDrawer.NONE,
-    userDismissed = userClosed,
-)
-
 object FloatingVirtualDisplay {
     enum class SizeTier(val rpcName: String, val badge: String, val portraitFrac: Float, val landscapeFrac: Float) {
         COMPACT("compact", "S", 0.44f, 0.54f),
@@ -101,17 +61,20 @@ object FloatingVirtualDisplay {
             LARGE -> COMPACT }
     }
     internal val mainHandler = Handler(Looper.getMainLooper())
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    internal val overlayScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var watchJob: Job? = null
     internal var windowManager: WindowManager? = null
     internal var rootView: FrameLayout? = null
     internal var params: WindowManager.LayoutParams? = null
+    private val stateLock = Any()
     // Single source of truth for floating window state (legacy booleans are read-only projections).
     @Volatile private var uiState: OverlayUiState = OverlayUiState()
     internal val expanded: Boolean get() = uiState.expanded
     internal val fullStage: Boolean get() = false
     internal val minimizedToPill: Boolean get() = uiState.dockedAsEdgeBubble
     internal val dockedAsEdgeBubble: Boolean get() = uiState.dockedAsEdgeBubble
+    internal val uiPickingApp: Boolean get() = uiState.pickingApp
+    internal val uiInputBarOpen: Boolean get() = uiState.inputBarOpen
     private val pickingApp: Boolean get() = uiState.pickingApp
     private val inputBarOpen: Boolean get() = uiState.inputBarOpen
     private val userDismissed: Boolean get() = uiState.userDismissed
@@ -125,35 +88,59 @@ object FloatingVirtualDisplay {
     internal var springAnimator: ValueAnimator? = null
     private val _overlayModeFlow = MutableStateFlow(OverlayMode.HIDDEN)
     internal val overlayModeFlow: StateFlow<OverlayMode> = _overlayModeFlow.asStateFlow()
-    private fun transitionState(
+    internal fun transitionState(
         mode: OverlayMode,
         drawer: OverlayDrawer = OverlayDrawer.NONE,
-        userClosed: Boolean = uiState.userDismissed,
+        userClosed: Boolean? = null,
     ) {
-        val next = reduceOverlayTransition(uiState, mode, drawer, userClosed)
+        val next = synchronized(stateLock) {
+            val resolvedClosed = userClosed ?: uiState.userDismissed
+            reduceOverlayTransition(uiState, mode, drawer, resolvedClosed).also { uiState = it }
+        }
         if (next.drawer != OverlayDrawer.APP_PICKER) {
             drawerSearchFocused = false
-            appDrawerController?.clearSearchFocus()
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                appDrawerController?.clearSearchFocus()
+            } else {
+                mainHandler.post { appDrawerController?.clearSearchFocus() }
+            }
         }
-        uiState = next
         _userDismissed.value = next.userDismissed
         _overlayModeFlow.value = next.mode
     }
     internal fun currentOverlayMode(): OverlayMode = uiState.mode
-    private var screenImageView: ImageView? = null
-    private var touchIndicatorView: View? = null
-    private var emptyHintView: TextView? = null
-    private var waitingCapsuleView: TextView? = null
-    private var inlineInputBar: View? = null
-    private var inlineInputField: EditText? = null
-    private var bottomLeftRow: View? = null
-    private var appDrawerController: VirtualDisplayAppDrawer.DrawerController? = null
+    internal fun promoteTierOnWaitingExpandIfCompact(phase: String) {
+        if (phase == "waiting_user" && sizeTier == SizeTier.COMPACT) {
+            sizeTier = SizeTier.MEDIUM
+            customWidthFraction = null
+        }
+    }
+    internal var screenImageView: ImageView? = null
+    internal var touchIndicatorView: View? = null
+    internal var emptyHintView: TextView? = null
+    internal var waitingCapsuleView: TextView? = null
+    internal var inlineInputBar: View? = null
+    internal var inlineInputField: EditText? = null
+    internal var bottomLeftRow: View? = null
+    internal var appDrawerController: VirtualDisplayAppDrawer.DrawerController? = null
     private var sizeTierButton: PipVectorIconButton? = null
     private var sizeTierBadgeView: TextView? = null
-    private var outerBorderDrawable: GradientDrawable? = null
-    private var lastBorderColor: Int = 0
-    private var lastRenderedAppsKey: Int = -1
+    internal var outerBorderDrawable: GradientDrawable? = null
+    internal var lastBorderColor: Int = 0
+    internal var lastRenderedAppsKey: Int = -1
     private var lastTouchShownTime: Long = 0L
+    internal fun clearChildViewRefs() {
+        screenImageView = null
+        touchIndicatorView = null
+        emptyHintView = null
+        waitingCapsuleView = null
+        inlineInputBar = null
+        inlineInputField = null
+        bottomLeftRow = null
+        appDrawerController = null
+        sizeTierButton = null
+        sizeTierBadgeView = null
+    }
     @JvmStatic
     fun currentTier(): SizeTier = sizeTier
     @Volatile private var inAppPreviewVisible: Boolean = false
@@ -174,7 +161,7 @@ object FloatingVirtualDisplay {
             sizeTierButton?.setBadgeText(sizeTier.badge)
             sizeTierBadgeView?.text = sizeTier.badge
             transitionSizeAndRebuild(context.applicationContext, RootPhoneHarness.changes.value) }
-        scope.launch(Dispatchers.IO) {
+        overlayScope.launch(Dispatchers.IO) {
             runCatching {
                 RootPhoneHarness.command(
                     context.applicationContext,
@@ -184,6 +171,7 @@ object FloatingVirtualDisplay {
     @Volatile private var lastDecodedB64: String = ""
     @Volatile internal var currentBitmap: Bitmap? = null
     @Volatile private var isDecodingFrame: Boolean = false
+    @Volatile private var pendingFrameB64: String? = null
     @Volatile internal var dockPillOnLeft: Boolean = false
     private val _overlayVisible = MutableStateFlow(false)
     val overlayVisible: StateFlow<Boolean> = _overlayVisible.asStateFlow()
@@ -208,8 +196,18 @@ object FloatingVirtualDisplay {
     }
     @Volatile private var dismissedUntilElapsed = 0L
     @JvmStatic
+    fun markUserDismissedFor(durationMs: Long) {
+        dismissedUntilElapsed = android.os.SystemClock.elapsedRealtime() + durationMs.coerceAtLeast(0L)
+        synchronized(stateLock) {
+            uiState = uiState.copy(userDismissed = true)
+        }
+        _userDismissed.value = true
+    }
+    @JvmStatic
     fun resetUserDismissed() {
-        uiState = uiState.copy(userDismissed = false)
+        synchronized(stateLock) {
+            uiState = uiState.copy(userDismissed = false)
+        }
         _userDismissed.value = false
         dismissedUntilElapsed = 0L
     }
@@ -259,18 +257,27 @@ object FloatingVirtualDisplay {
             }
         }
     }
-    private fun handleUserPowerClose(context: Context) {
+    internal fun handleUserPowerClose(context: Context) {
+        val appCtx = context.applicationContext
+        markUserDismissedFor(60_000L)
         hide()
-        dismissedUntilElapsed = android.os.SystemClock.elapsedRealtime() + 60_000L
-        AgentForegroundService.onUserForceClosedVirtualDisplay(context)
-        scope.launch(Dispatchers.IO) {
-            runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "release").put("user_close", true).put("destroy", true)) }
+        AgentForegroundService.onUserForceClosedVirtualDisplay(appCtx)
+        overlayScope.launch(Dispatchers.IO) {
+            runCatching { RootPhoneHarness.command(appCtx, JSONObject().put("op", "release").put("user_close", true).put("destroy", true)) }
         }
     }
     @JvmStatic
     fun hide() {
-        transitionState(OverlayMode.HIDDEN, OverlayDrawer.NONE, userClosed = true)
+        val next = synchronized(stateLock) {
+            reduceOverlayTransition(uiState, OverlayMode.HIDDEN, OverlayDrawer.NONE, userClosed = true).also {
+                uiState = it
+            }
+        }
+        drawerSearchFocused = false
+        _userDismissed.value = next.userDismissed
+        _overlayModeFlow.value = next.mode
         mainHandler.post {
+            appDrawerController?.clearSearchFocus()
             removeWindow()
         } }
     @JvmStatic
@@ -325,6 +332,16 @@ object FloatingVirtualDisplay {
                 transitionSizeAndRebuild(appCtx, RootPhoneHarness.changes.value)
             }
         } }
+    @JvmStatic fun syncKeepScreenOn(context: Context) {
+        val appCtx = context.applicationContext
+        mainHandler.post {
+            val container = rootView ?: return@post; val lp = params ?: return@post
+            val wm = windowManager ?: appCtx.getSystemService(WindowManager::class.java).also { windowManager = it } ?: return@post
+            val want = RootPhoneHarness.shouldKeepScreenOn(expanded)
+            val newFlags = if (want) lp.flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON else lp.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
+            if (newFlags != lp.flags) { lp.flags = newFlags; runCatching { wm.updateViewLayout(container, lp) } }
+        }
+    }
     internal fun onWorkspaceStateChanged(context: Context, state: RootPhoneState) {
         val appCtx = context.applicationContext
         mainHandler.post {
@@ -345,7 +362,7 @@ object FloatingVirtualDisplay {
         } }
     private fun ensureWatching(context: Context) {
         if (watchJob?.isActive == true) return
-        watchJob = scope.launch {
+        watchJob = overlayScope.launch {
             RootPhoneHarness.changes.collect { state ->
                 val dispObj = runCatching { JSONObject(state.display) }.getOrNull()
                 val created = dispObj?.optBoolean("created") == true
@@ -361,25 +378,19 @@ object FloatingVirtualDisplay {
             } }
     }
     private fun removeWindow() {
+        watchJob?.cancel()
+        watchJob = null
         springAnimator?.cancel()
         springAnimator = null
         val view = rootView
         val wm = windowManager
         rootView = null
         params = null
-        screenImageView = null
-        touchIndicatorView = null
-        emptyHintView = null
-        waitingCapsuleView = null
-        inlineInputBar = null
-        inlineInputField = null
-        bottomLeftRow = null
-        appDrawerController = null
+        clearChildViewRefs()
         outerBorderDrawable = null
-        sizeTierButton = null
-        sizeTierBadgeView = null
         currentBitmap = null
         lastDecodedB64 = ""
+        pendingFrameB64 = null
         isDecodingFrame = false
         lastRenderedAppsKey = -1
         _overlayVisible.value = false
@@ -411,7 +422,8 @@ object FloatingVirtualDisplay {
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        if (RootPhoneHarness.shouldKeepScreenOn(expanded)) WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON else 0,
                     PixelFormat.TRANSLUCENT
                 ).apply {
                     gravity = Gravity.TOP or Gravity.START
@@ -420,7 +432,7 @@ object FloatingVirtualDisplay {
                 val container = object : FrameLayout(context) {
                     override fun onConfigurationChanged(newConfig: android.content.res.Configuration?) {
                         super.onConfigurationChanged(newConfig)
-                        transitionSizeAndRebuild(context, RootPhoneHarness.changes.value)
+                        transitionSizeAndRebuild(context.applicationContext, RootPhoneHarness.changes.value)
                     }
                 }
                 params = lp
@@ -432,7 +444,7 @@ object FloatingVirtualDisplay {
                     runCatching {
                         context.applicationContext.startForegroundService(Intent(context.applicationContext, RootPhoneService::class.java))
                     }
-                    if (!animationsOff(context)) {
+                    if (!animationsOff(context) && !PowerSaveController.isPowerSaveActive(context)) {
                         val animTarget = container.getChildAt(0) ?: container
                         animTarget.alpha = 0f
                         animTarget.scaleX = 0.90f
@@ -442,13 +454,15 @@ object FloatingVirtualDisplay {
                             .scaleX(1f)
                             .scaleY(1f)
                             .setDuration(220L)
-                            .setInterpolator(android.view.animation.OvershootInterpolator(0.75f))
+                            .setInterpolator(android.view.animation.PathInterpolator(0.22f, 1f, 0.32f, 1f))
                             .start()
                     }
                 }.onFailure { err ->
                     android.util.Log.e("FloatingVD", "wm.addView failed", err)
                     rootView = null
                     params = null
+                    clearChildViewRefs()
+                    outerBorderDrawable = null
                     _overlayVisible.value = false
                     return }
             }
@@ -459,338 +473,8 @@ object FloatingVirtualDisplay {
     }
     @SuppressLint("ClickableViewAccessibility")
     private fun rebuildViewHierarchy(context: Context, container: FrameLayout, state: RootPhoneState) {
-        container.removeAllViews()
-        screenImageView = null
-        touchIndicatorView = null
-        emptyHintView = null
-        waitingCapsuleView = null
-        inlineInputBar = null
-        inlineInputField = null
-        bottomLeftRow = null
-        appDrawerController = null
-        sizeTierButton = null
-        sizeTierBadgeView = null
-        val layout = computeAdaptiveLayout(context, state, expanded, false)
-        if (overlayMode == OverlayMode.EDGE_BUBBLE) {
-            val bubble = createPearlEdgeBubbleView(
-                context = context,
-                state = state,
-                previewBitmap = currentBitmap,
-                dockLeft = dockPillOnLeft,
-                dp = { v -> dp(context, v) },
-                onRestore = {
-                    transitionState(OverlayMode.EXPANDED, OverlayDrawer.NONE, userClosed = false)
-                    RootPhoneHarness.onPreviewVisibilityChanged(context)
-                    val cur = RootPhoneHarness.changes.value
-                    transitionSizeAndRebuild(context, cur)
-                    val dispObj = runCatching { JSONObject(cur.display) }.getOrNull()
-                    if (dispObj?.optBoolean("hasPromotedTask", false) == true) {
-                        scope.launch(Dispatchers.IO) {
-                            runCatching {
-                                RootPhoneHarness.command(context, JSONObject().put("op", "pull_back").put("manual", true))
-                                if (RootPhoneHarness.changes.value.phase == "waiting_user") {
-                                    RootPhoneHarness.resume(context)
-                                }
-                            }
-                        }
-                    }
-                },
-                onClose = { handleUserPowerClose(context) }
-            )
-            container.addView(bubble, FrameLayout.LayoutParams(-1, -1))
-            return
-        }
-        val pad = layout.framePadPx
-        val outerRadius = layout.outerRadiusPx
-        val innerRadius = layout.innerRadiusPx
-        val pearlFrame = FrameLayout(context).apply {
-            setPadding(pad, pad, pad, pad)
-            val bg = GradientDrawable().apply {
-                setColor(PEARL_WHITE_FILL_INT)
-                cornerRadius = outerRadius
-                setStroke(dp(context, 0.9f).coerceAtLeast(1), borderColorFor(state)) }
-            outerBorderDrawable = bg
-            background = bg
-            elevation = dp(context, if (expanded) 20 else 13).toFloat() }
-        val innerBox = FrameLayout(context).apply {
-            val innerBg = GradientDrawable().apply {
-                setColor(0xFF101218.toInt())
-                cornerRadius = innerRadius }
-            val innerRim = GradientDrawable().apply {
-                setColor(Color.TRANSPARENT)
-                cornerRadius = innerRadius
-                setStroke(1, PEARL_INNER_HAIRLINE_INT) }
-            background = LayerDrawable(arrayOf(innerBg, innerRim))
-            clipToOutline = true
-            outlineProvider = object : android.view.ViewOutlineProvider() {
-                override fun getOutline(view: View, outline: android.graphics.Outline) {
-                    outline.setRoundRect(0, 0, view.width, view.height, innerRadius) }
-            } }
-        val img = ImageView(context).apply {
-            scaleType = ImageView.ScaleType.FIT_XY }
-        screenImageView = img
-        val dotSize = layout.touchDotSizePx
-        val coreSize = (dotSize / 4).coerceAtLeast(dp(context, 3))
-        val touchDot = FrameLayout(context).apply {
-            visibility = View.GONE
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0x18FFFFFF)
-                setStroke(dp(context, 0.75f).coerceAtLeast(1), 0xCCFFFFFF.toInt()) }
-            val centerCore = View(context).apply {
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(0xE6FFFFFF.toInt()) }
-            }
-            addView(centerCore, FrameLayout.LayoutParams(coreSize, coreSize, Gravity.CENTER)) }
-        touchIndicatorView = touchDot
-        val hint = TextView(context).apply {
-            text = if (expanded) "轻触选择应用启动" else "虚拟屏"
-            textSize = layout.hintSp
-            setTextColor(0x99FFFFFF.toInt())
-            gravity = Gravity.CENTER
-            setPadding(dp(context, 8), dp(context, 8), dp(context, 8), dp(context, 8))
-            if (expanded) {
-                setOnClickListener {
-                    transitionState(OverlayMode.EXPANDED, OverlayDrawer.APP_PICKER)
-                    lastRenderedAppsKey = -1
-                    scope.launch(Dispatchers.IO) {
-                        runCatching { RootPhoneHarness.listLaunchableApps(context) }
-                    }
-                    updateWindowContent(context, RootPhoneHarness.changes.value)
-                }
-            } }
-        emptyHintView = hint
-        if (!expanded) {
-            innerBox.addView(img, FrameLayout.LayoutParams(-1, -1))
-            innerBox.addView(touchDot, FrameLayout.LayoutParams(dotSize, dotSize))
-            innerBox.addView(hint, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
-            val miniBtnSize = dp(context, 20)
-            val miniHangBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.DOCK_PILL) {
-                minimizeToSidePill(context)
-            }.apply { contentDescription = "挂起虚拟屏" }
-            innerBox.addView(miniHangBtn, FrameLayout.LayoutParams(miniBtnSize, miniBtnSize, Gravity.TOP or Gravity.START).apply {
-                leftMargin = dp(context, 4)
-                topMargin = dp(context, 4)
-            })
-            val miniCloseBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.POWER_CLOSE, isDanger = true) {
-                handleUserPowerClose(context)
-            }.apply { contentDescription = "关闭虚拟屏" }
-            innerBox.addView(miniCloseBtn, FrameLayout.LayoutParams(miniBtnSize, miniBtnSize, Gravity.TOP or Gravity.END).apply {
-                rightMargin = dp(context, 4)
-                topMargin = dp(context, 4)
-            })
-            val waitTag = TextView(context).apply {
-                text = "点击拉大接管"
-                textSize = layout.capsuleSp
-                setTextColor(Color.BLACK)
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(context, 7), dp(context, 2), dp(context, 7), dp(context, 2))
-                background = GradientDrawable().apply {
-                    setColor(0xFFFF9F0A.toInt())
-                    cornerRadius = dp(context, 8).toFloat() }
-                visibility = if (state.phase == "waiting_user") View.VISIBLE else View.GONE }
-            waitingCapsuleView = waitTag
-            innerBox.addView(waitTag, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                bottomMargin = dp(context, 5)
-            })
-            attachSpringDragAndTap(context, pearlFrame, dockOnEdge = true, onTap = {
-                transitionState(OverlayMode.EXPANDED, OverlayDrawer.NONE, userClosed = false)
-                val cur = RootPhoneHarness.changes.value
-                if (cur.phase == "waiting_user" && sizeTier == SizeTier.COMPACT) {
-                    sizeTier = SizeTier.MEDIUM
-                    customWidthFraction = null
-                }
-                transitionSizeAndRebuild(context, cur)
-            })
-        } else {
-            sizeTierButton = null
-            val screenStage = FrameLayout(context)
-            attachExpandedScreenTouchAndDrag(context, img, 0)
-            screenStage.addView(img, FrameLayout.LayoutParams(-1, -1))
-            screenStage.addView(touchDot, FrameLayout.LayoutParams(dotSize, dotSize))
-            screenStage.addView(hint, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
-            val drawerCtrl = VirtualDisplayAppDrawer.createDrawerView(
-                context = context,
-                dp = { v -> dp(context, v) },
-                topInsetPx = dp(context, 38),
-                cornerRadiusPx = 0f,
-                onLaunchApp = { component ->
-                    transitionState(OverlayMode.EXPANDED, OverlayDrawer.NONE)
-                    lastRenderedAppsKey = -1
-                    scope.launch(Dispatchers.IO) {
-                        runCatching {
-                            RootPhoneHarness.command(
-                                context,
-                                JSONObject().put("op", "launch").put("component", component).put("manual", true)) }
-                    }
-                    updateWindowContent(context, RootPhoneHarness.changes.value)
-                },
-                onClose = {
-                    transitionState(OverlayMode.EXPANDED, OverlayDrawer.NONE)
-                    lastRenderedAppsKey = -1
-                    updateWindowContent(context, RootPhoneHarness.changes.value)
-                },
-                onSearchFocusRequested = {
-                    drawerSearchFocused = true
-                    updateWindowContent(context, RootPhoneHarness.changes.value)
-                })
-            drawerCtrl.rootView.visibility = if (pickingApp) View.VISIBLE else View.GONE
-            appDrawerController = drawerCtrl
-            screenStage.addView(drawerCtrl.rootView, FrameLayout.LayoutParams(-1, -1))
-            innerBox.addView(screenStage, FrameLayout.LayoutParams(-1, -1))
-
-            // Overlaid floating translucent chrome (Mi-style minimal top bar: 应用 | draggable grabber | 全屏 & ✕)
-            val grabberHandle = createTopGrabberHandle(context) { v -> dp(context, v) }
-            attachSpringDragAndTap(context, grabberHandle, onTap = null, dockOnEdge = true)
-            innerBox.addView(grabberHandle, FrameLayout.LayoutParams(dp(context, 108), dp(context, 28), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
-
-            val toolCapsule = createExpandedToolCapsule(
-                context = context,
-                sigma = layout.sigma,
-                dp = { v -> dp(context, v) },
-                onToggleApps = {
-                    val nextDrawer = if (pickingApp) OverlayDrawer.NONE else OverlayDrawer.APP_PICKER
-                    transitionState(OverlayMode.EXPANDED, nextDrawer)
-                    lastRenderedAppsKey = -1
-                    if (pickingApp && RootPhoneHarness.changes.value.apps.isEmpty()) {
-                        scope.launch(Dispatchers.IO) { runCatching { RootPhoneHarness.listLaunchableApps(context) } }
-                    }
-                    updateWindowContent(context, RootPhoneHarness.changes.value)
-                }
-            )
-            sizeTierBadgeView = null
-            innerBox.addView(toolCapsule, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
-                topMargin = dp(context, 7)
-                leftMargin = dp(context, 6)
-            })
-
-            val controlCapsule = createExpandedControlCapsule(
-                context = context,
-                sigma = layout.sigma,
-                dp = { v -> dp(context, v) },
-                onPromoteFullscreen = {
-                    minimizeToSidePill(context)
-                    scope.launch(Dispatchers.IO) {
-                        runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "promote").put("manual", true)) }
-                    }
-                },
-                onClose = { handleUserPowerClose(context) }
-            )
-            innerBox.addView(controlCapsule, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
-                topMargin = dp(context, 7)
-                rightMargin = dp(context, 6)
-            })
-
-            val bottomCapsule = TextView(context).apply {
-                text = if (state.phase == "waiting_user") "我处理好了，继续" else "‹ 返回"
-                textSize = if (state.phase == "waiting_user") (layout.capsuleSp + 0.5f) else layout.capsuleSp
-                gravity = Gravity.CENTER
-                setTextColor(if (state.phase == "waiting_user") Color.BLACK else 0xF2FFFFFF.toInt())
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(layout.capsulePadHPx, layout.capsulePadVPx, layout.capsulePadHPx, layout.capsulePadVPx)
-                background = GradientDrawable().apply {
-                    setColor(if (state.phase == "waiting_user") 0xFFFF9F0A.toInt() else 0xBF18181E.toInt())
-                    cornerRadius = dp(context, 12 * layout.sigma).toFloat()
-                    setStroke(1, 0x38FFFFFF) }
-                setOnClickListener {
-                    val cur = RootPhoneHarness.changes.value
-                    if (cur.phase == "waiting_user") {
-                        runCatching { RootPhoneHarness.resume(context) }
-                    } else if (pickingApp) {
-                        transitionState(OverlayMode.EXPANDED, OverlayDrawer.NONE)
-                        lastRenderedAppsKey = -1
-                        updateWindowContent(context, cur)
-                    } else {
-                        scope.launch(Dispatchers.IO) {
-                            runCatching {
-                                RootPhoneHarness.command(context, JSONObject().put("op", "key").put("key", "back").put("manual", true)) }
-                        } }
-                } }
-            waitingCapsuleView = bottomCapsule
-
-            val imeToggleBtn = TextView(context).apply {
-                text = "⌨ 输入"
-                textSize = layout.capsuleSp
-                gravity = Gravity.CENTER
-                setTextColor(0xF2FFFFFF.toInt())
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(context, 9f * layout.sigma), layout.capsulePadVPx, dp(context, 9f * layout.sigma), layout.capsulePadVPx)
-                background = GradientDrawable().apply {
-                    setColor(0xBF18181E.toInt())
-                    cornerRadius = dp(context, 12 * layout.sigma).toFloat()
-                    setStroke(1, 0x38FFFFFF)
-                }
-                setOnClickListener {
-                    val nextDrawer = if (inputBarOpen) OverlayDrawer.NONE else OverlayDrawer.INPUT_BAR
-                    transitionState(OverlayMode.EXPANDED, nextDrawer)
-                    updateWindowContent(context, RootPhoneHarness.changes.value)
-                    if (inputBarOpen) {
-                        mainHandler.postDelayed({
-                            inlineInputField?.let { ed ->
-                                ed.requestFocus()
-                                context.getSystemService(InputMethodManager::class.java)?.showSoftInput(ed, InputMethodManager.SHOW_IMPLICIT)
-                            }
-                        }, 80L)
-                    }
-                }
-            }
-            val resizeGrip = ResizeGripView(context)
-            val gripSize = dp(context, 26 * layout.sigma).coerceIn(dp(context, 22), dp(context, 34))
-            attachCornerResizeTouch(context, resizeGrip)
-
-            val bottomRow = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                addView(bottomCapsule)
-                addView(imeToggleBtn, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(context, 6) })
-            }
-            val bottomScroll = android.widget.HorizontalScrollView(context).apply {
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-                addView(bottomRow)
-                visibility = if (inputBarOpen) View.GONE else View.VISIBLE
-            }
-            bottomLeftRow = bottomScroll
-            innerBox.addView(bottomScroll, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM or Gravity.START).apply {
-                leftMargin = dp(context, 8)
-                rightMargin = gripSize + dp(context, 8)
-                bottomMargin = dp(context, 7)
-            })
-
-            val (imeBar, imeEdit) = createInlineImeInputBar(
-                context = context,
-                sigma = layout.sigma,
-                dp = { v -> dp(context, v) },
-                onSend = { text ->
-                    scope.launch(Dispatchers.IO) {
-                        runCatching {
-                            RootPhoneHarness.command(
-                                context,
-                                JSONObject().put("op", "text").put("text", text).put("manual", true).put("skip_tree", true)
-                            )
-                        }
-                    }
-                },
-                onClose = {
-                    transitionState(OverlayMode.EXPANDED, OverlayDrawer.NONE)
-                    updateWindowContent(context, RootPhoneHarness.changes.value)
-                }
-            )
-            imeBar.visibility = if (inputBarOpen) View.VISIBLE else View.GONE
-            inlineInputBar = imeBar
-            inlineInputField = imeEdit
-            innerBox.addView(imeBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
-                leftMargin = dp(context, 7)
-                rightMargin = dp(context, 7)
-                bottomMargin = dp(context, 7)
-            })
-            innerBox.addView(resizeGrip, FrameLayout.LayoutParams(gripSize, gripSize, Gravity.BOTTOM or Gravity.END))
-        }
-        lastBorderColor = borderColorFor(state)
-        lastRenderedAppsKey = -1
-        pearlFrame.addView(innerBox, FrameLayout.LayoutParams(-1, -1))
-        container.addView(pearlFrame, FrameLayout.LayoutParams(-1, -1)) }
+        rebuildViewHierarchyImpl(context, container, state)
+    }
     internal fun transitionSizeAndRebuild(context: Context, state: RootPhoneState) {
         val appCtx = context.applicationContext
         mainHandler.post {
@@ -896,36 +580,20 @@ object FloatingVirtualDisplay {
                 val dotRadius = dp(context, 6)
                 val px = (state.lastTouchX.toFloat() / dispW * imgView.width).roundToInt() - dotRadius
                 val py = (state.lastTouchY.toFloat() / dispH * imgView.height).roundToInt() - dotRadius
-                dot.translationX = px.toFloat()
-                dot.translationY = py.toFloat()
-                dot.scaleX = 0.85f
-                dot.scaleY = 0.85f
-                dot.visibility = View.VISIBLE
-                dot.alpha = 0.92f
-                dot.animate().alpha(0f).scaleX(1.18f).scaleY(1.18f).setDuration(360L).withEndAction { dot.visibility = View.GONE }.start() }
-            if (!minimizedToPill && !dockedAsEdgeBubble && !userDismissed && state.image.isNotBlank() && state.image != lastDecodedB64 && !isDecodingFrame) {
-                isDecodingFrame = true
-                lastDecodedB64 = state.image
-                val b64 = state.image
-                scope.launch(Dispatchers.Default) {
-                    try {
-                        val bmp = runCatching {
-                            val bytes = Base64.decode(b64, Base64.DEFAULT)
-                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        }.getOrNull()
-                        if (bmp != null) {
-                            withContext(Dispatchers.Main) {
-                                currentBitmap = bmp
-                                screenImageView?.setImageBitmap(bmp)
-                                emptyHintView?.visibility = View.GONE
-                                val (tw, th) = computeWindowSizePx(context, state, expanded, minimizedToPill)
-                                if (abs(lp.width - tw) > 1 || abs(lp.height - th) > 1) {
-                                    lp.width = tw
-                                    lp.height = th
-                                    if (rootView === container) runCatching { wm.updateViewLayout(container, lp) } }
-                            } }
-                    } finally {
-                        isDecodingFrame = false }
+                if (!animationsOff(context) && !PowerSaveController.isPowerSaveActive(context)) {
+                    dot.translationX = px.toFloat()
+                    dot.translationY = py.toFloat()
+                    dot.scaleX = 0.90f
+                    dot.scaleY = 0.90f
+                    dot.visibility = View.VISIBLE
+                    dot.alpha = 0.92f
+                    dot.animate().alpha(0f).scaleX(1.18f).scaleY(1.18f).setDuration(360L).withEndAction { dot.visibility = View.GONE }.start()
+                } }
+            if (!minimizedToPill && !dockedAsEdgeBubble && !userDismissed && state.image.isNotBlank() && state.image != lastDecodedB64) {
+                if (isDecodingFrame) {
+                    pendingFrameB64 = state.image
+                } else {
+                    kickFrameDecode(context, container, lp, wm, state, state.image)
                 }
             } else if (state.image.isBlank()) {
                 if (currentBitmap == null) {
@@ -938,28 +606,70 @@ object FloatingVirtualDisplay {
             inlineInputBar?.visibility = if (expanded && inputBarOpen) View.VISIBLE else View.GONE
             bottomLeftRow?.visibility = if (expanded && !inputBarOpen) View.VISIBLE else View.GONE
             val needFocusable = expanded && (inputBarOpen || (pickingApp && drawerSearchFocused))
-            val curNotFocusable = (lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0
-            if (needFocusable == curNotFocusable) {
-                lp.flags = if (needFocusable) {
-                    lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-                } else {
-                    lp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE }
-                runCatching { wm.updateViewLayout(container, lp) } }
+            val wantKeepOn = RootPhoneHarness.shouldKeepScreenOn(expanded)
+            var newFlags = if (needFocusable) lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv() else lp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            newFlags = if (wantKeepOn) newFlags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON else newFlags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
+            if (newFlags != lp.flags) { lp.flags = newFlags; runCatching { wm.updateViewLayout(container, lp) } }
             val appsKey = if (expanded && pickingApp) (state.apps.hashCode() * 31 + (state.currentPackage?.hashCode() ?: 0)) else -1
             if (expanded && pickingApp && drawer != null && appsKey != lastRenderedAppsKey) {
                 lastRenderedAppsKey = appsKey
                 if (state.apps.isEmpty()) {
-                    scope.launch(Dispatchers.IO) {
+                    overlayScope.launch(Dispatchers.IO) {
                         runCatching { RootPhoneHarness.listLaunchableApps(context) } }
                 }
                 drawer.updateApps(state.apps, state.currentPackage) }
             val (targetW, targetH) = computeWindowSizePx(context, state, expanded, minimizedToPill)
-            if (abs(lp.width - targetW) > 1 || abs(lp.height - targetH) > 1) {
+            if (springAnimator?.isRunning != true && (abs(lp.width - targetW) > 1 || abs(lp.height - targetH) > 1)) {
                 lp.width = targetW
                 lp.height = targetH
                 runCatching { wm.updateViewLayout(container, lp) } }
         }.onFailure { err ->
             android.util.Log.w("FloatingVD", "updateWindowContent failed", err)
+        }
+    }
+
+    private fun kickFrameDecode(
+        context: Context,
+        container: FrameLayout,
+        lp: WindowManager.LayoutParams,
+        wm: WindowManager,
+        state: RootPhoneState,
+        b64: String,
+    ) {
+        isDecodingFrame = true
+        lastDecodedB64 = b64
+        overlayScope.launch(Dispatchers.Default) {
+            try {
+                val bmp = runCatching {
+                    val bytes = Base64.decode(b64, Base64.DEFAULT)
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                }.getOrNull()
+                if (bmp != null) {
+                    withContext(Dispatchers.Main) {
+                        if (rootView !== container) return@withContext
+                        currentBitmap = bmp
+                        screenImageView?.setImageBitmap(bmp)
+                        emptyHintView?.visibility = View.GONE
+                        val (tw, th) = computeWindowSizePx(context, state, expanded, minimizedToPill)
+                        if (springAnimator?.isRunning != true && (abs(lp.width - tw) > 1 || abs(lp.height - th) > 1)) {
+                            lp.width = tw
+                            lp.height = th
+                            runCatching { wm.updateViewLayout(container, lp) }
+                        }
+                    }
+                }
+            } finally {
+                isDecodingFrame = false
+                val next = pendingFrameB64
+                pendingFrameB64 = null
+                if (!next.isNullOrBlank() && next != lastDecodedB64 && !minimizedToPill && !dockedAsEdgeBubble && !userDismissed) {
+                    mainHandler.post {
+                        if (rootView === container && !isDecodingFrame && !minimizedToPill && !dockedAsEdgeBubble && !userDismissed) {
+                            kickFrameDecode(context, container, lp, wm, RootPhoneHarness.changes.value, next)
+                        }
+                    }
+                }
+            }
         }
     }
 }

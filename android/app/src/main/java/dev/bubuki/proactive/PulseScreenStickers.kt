@@ -39,10 +39,13 @@ import kotlin.math.roundToInt
 internal fun TelegramActionChip(icon: String, label: String, color: Color, onClick: () -> Unit) {
     val haptics = LocalHapticFeedback.current
     Row(
-        Modifier.iosPressScale(0.93f) {
-            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-            onClick()
-        },
+        Modifier.heightIn(min = 40.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .iosPressScale(0.93f) {
+                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onClick()
+            }
+            .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
@@ -53,18 +56,32 @@ internal fun TelegramActionChip(icon: String, label: String, color: Color, onCli
 
 @Composable
 internal fun PulseStickerThumb(model: NativePulseModel, stickerPath: String, size: Dp = 56.dp) {
-    var bmp by remember(stickerPath) { mutableStateOf<ImageBitmap?>(null) }
-    LaunchedEffect(stickerPath) {
-        model.loadStickerBitmap(stickerPath) { loaded -> bmp = loaded }
+    val c = LocalPulsePalette.current
+    val fullUrl = remember(stickerPath, model.ui.serverUrl) { resolveWorkspaceMediaUrl(stickerPath, model.ui.serverUrl) }
+    var bmp by remember(fullUrl) { mutableStateOf(PulseMediaCache.getMemoryCached(fullUrl)) }
+    var failed by remember(fullUrl) { mutableStateOf(false) }
+    var retryNonce by remember(fullUrl) { mutableIntStateOf(0) }
+    LaunchedEffect(fullUrl, retryNonce) {
+        if (bmp != null || fullUrl.isBlank()) return@LaunchedEffect
+        failed = false
+        val loaded = model.loadMediaBitmap(stickerPath)
+        if (loaded != null) bmp = loaded else failed = true
     }
-    Box(Modifier.size(size), contentAlignment = Alignment.Center) {
-        bmp?.let { image ->
-            Image(
-                bitmap = image,
+    Box(
+        Modifier.size(size)
+            .clip(RoundedCornerShape(8.dp))
+            .then(if (failed && bmp == null) Modifier.clickable { retryNonce++ } else Modifier),
+        contentAlignment = Alignment.Center
+    ) {
+        when {
+            bmp != null -> Image(
+                bitmap = bmp!!,
                 contentDescription = "贴纸预览",
                 modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(8.dp)),
                 contentScale = ContentScale.Fit
             )
+            failed -> PulseIcon("refresh", c.muted, Modifier.size(18.dp))
+            else -> Box(Modifier.fillMaxSize().background(c.fill.copy(alpha = 0.4f)))
         }
     }
 }
@@ -72,50 +89,84 @@ internal fun PulseStickerThumb(model: NativePulseModel, stickerPath: String, siz
 @Composable
 internal fun PulseStickerImage(model: NativePulseModel, stickerPath: String) {
     val c = LocalPulsePalette.current
-    var bmp by remember(stickerPath) { mutableStateOf<ImageBitmap?>(null) }
+    val fullUrl = remember(stickerPath, model.ui.serverUrl) { resolveWorkspaceMediaUrl(stickerPath, model.ui.serverUrl) }
+    var bmp by remember(fullUrl) { mutableStateOf(PulseMediaCache.getMemoryCached(fullUrl)) }
+    var failed by remember(fullUrl) { mutableStateOf(false) }
+    var retryNonce by remember(fullUrl) { mutableIntStateOf(0) }
     var showLightbox by remember { mutableStateOf(false) }
     val isSticker = stickerPath.contains("/stickers/")
-    LaunchedEffect(stickerPath) {
-        model.loadStickerBitmap(stickerPath) { loaded -> bmp = loaded }
+    val reduceMotion = rememberReducedMotion()
+    LaunchedEffect(fullUrl, retryNonce) {
+        if (bmp != null || fullUrl.isBlank()) return@LaunchedEffect
+        failed = false
+        val loaded = model.loadMediaBitmap(stickerPath)
+        if (loaded != null) bmp = loaded else failed = true
     }
     val popScale by animateFloatAsState(
-        targetValue = if (bmp != null) 1f else 0.82f,
-        animationSpec = spring(dampingRatio = 0.68f, stiffness = 420f),
+        targetValue = if (bmp != null || reduceMotion) 1f else 0.92f,
+        animationSpec = if (reduceMotion) snap() else spring(dampingRatio = 0.78f, stiffness = 420f),
         label = "sticker_pop"
     )
-    bmp?.let { image ->
-        if (isSticker) {
-            Image(
-                bitmap = image,
-                contentDescription = "表情贴纸",
-                modifier = Modifier
-                    .size(136.dp)
-                    .graphicsLayer {
-                        scaleX = popScale
-                        scaleY = popScale
-                    }
-                    .clip(RoundedCornerShape(14.dp)),
-                contentScale = ContentScale.Fit
-            )
-        } else {
-            Image(
-                bitmap = image,
-                contentDescription = "AI返回图片",
-                modifier = Modifier
-                    .widthIn(min = 120.dp, max = 248.dp)
-                    .heightIn(min = 80.dp, max = 268.dp)
-                    .graphicsLayer {
-                        scaleX = popScale
-                        scaleY = popScale
-                    }
-                    .clip(RoundedCornerShape(16.dp))
-                    .border(0.6.dp, c.line.copy(alpha = 0.6f), RoundedCornerShape(16.dp))
-                    .clickable { showLightbox = true },
-                contentScale = ContentScale.Fit
-            )
-            if (showLightbox) {
-                PulseMediaLightboxDialog(model = model, rawPath = stickerPath, bitmap = image, onDismiss = { showLightbox = false })
+    if (isSticker) {
+        Box(
+            Modifier.size(136.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .then(if (failed && bmp == null) Modifier.background(c.surface).clickable { retryNonce++ } else Modifier),
+            contentAlignment = Alignment.Center
+        ) {
+            when {
+                bmp != null -> Image(
+                    bitmap = bmp!!,
+                    contentDescription = "表情贴纸",
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = popScale
+                            scaleY = popScale
+                        },
+                    contentScale = ContentScale.Fit
+                )
+                failed -> Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    PulseIcon("refresh", c.muted, Modifier.size(22.dp))
+                    Text("点击重试", color = c.muted, fontSize = 11.sp)
+                }
+                else -> CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = c.accent)
             }
+        }
+    } else {
+        Box(
+            Modifier
+                .widthIn(min = 120.dp, max = 248.dp)
+                .heightIn(min = 112.dp, max = 268.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .then(if (bmp == null) Modifier.size(width = 196.dp, height = 148.dp).background(c.surface) else Modifier)
+                .border(0.6.dp, c.line.copy(alpha = 0.6f), RoundedCornerShape(16.dp))
+                .clickable(enabled = bmp != null || failed) {
+                    if (bmp != null) showLightbox = true else retryNonce++
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            when {
+                bmp != null -> Image(
+                    bitmap = bmp!!,
+                    contentDescription = "AI返回图片",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .graphicsLayer {
+                            scaleX = popScale
+                            scaleY = popScale
+                        },
+                    contentScale = ContentScale.Fit
+                )
+                failed -> Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    PulseIcon("refresh", c.muted, Modifier.size(22.dp))
+                    Text("图片加载失败 · 点击重试", color = c.muted, fontSize = 11.5.sp)
+                }
+                else -> CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = c.accent)
+            }
+        }
+        if (showLightbox && bmp != null) {
+            PulseMediaLightboxDialog(model = model, rawPath = stickerPath, bitmap = bmp!!, onDismiss = { showLightbox = false })
         }
     }
 }
@@ -129,9 +180,11 @@ internal fun PulseMediaLightboxDialog(
 ) {
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = true)
     ) {
         var lbShown by remember { mutableStateOf(false) }
+        var zoomScale by remember { mutableFloatStateOf(1f) }
+        var panOffset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
         LaunchedEffect(Unit) { lbShown = true }
         val reduceLb = LocalReduceMotion.current
         val lbAlpha by animateFloatAsState(if (lbShown || reduceLb) 1f else 0f, tween(180), label = "lb_alpha")
@@ -142,50 +195,106 @@ internal fun PulseMediaLightboxDialog(
         )
         Box(
             Modifier.fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.92f * lbAlpha))
-                .clickable { onDismiss() },
+                .background(Color.Black.copy(alpha = 0.94f * lbAlpha))
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = { onDismiss() },
+                        onDoubleTap = {
+                            if (zoomScale > 1.05f) {
+                                zoomScale = 1f
+                                panOffset = androidx.compose.ui.geometry.Offset.Zero
+                            } else {
+                                zoomScale = 2.5f
+                            }
+                        }
+                    )
+                },
             contentAlignment = Alignment.Center
         ) {
             Image(
                 bitmap = bitmap,
                 contentDescription = "全屏大图预览",
-                modifier = Modifier.fillMaxWidth(0.95f)
-                    .fillMaxHeight(0.84f)
+                modifier = Modifier.fillMaxSize()
+                    .pointerInput(Unit) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            val nextScale = (zoomScale * zoom).coerceIn(1f, 4f)
+                            zoomScale = nextScale
+                            panOffset = if (nextScale > 1.02f) {
+                                androidx.compose.ui.geometry.Offset(
+                                    (panOffset.x + pan.x).coerceIn(-size.width * 0.8f, size.width * 0.8f),
+                                    (panOffset.y + pan.y).coerceIn(-size.height * 0.8f, size.height * 0.8f)
+                                )
+                            } else {
+                                androidx.compose.ui.geometry.Offset.Zero
+                            }
+                        }
+                    }
                     .graphicsLayer {
                         alpha = lbAlpha
-                        scaleX = lbScale
-                        scaleY = lbScale
+                        scaleX = lbScale * zoomScale
+                        scaleY = lbScale * zoomScale
+                        translationX = panOffset.x
+                        translationY = panOffset.y
                     },
                 contentScale = ContentScale.Fit
             )
+            Box(
+                Modifier.align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(top = 20.dp, end = 16.dp)
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.2f))
+                    .iosPressScale(0.92f) { onDismiss() },
+                contentAlignment = Alignment.Center
+            ) {
+                PulseIcon("close", Color.White, Modifier.size(18.dp))
+            }
             Row(
-                Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                Modifier.align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(start = 16.dp, end = 16.dp, bottom = 44.dp)
+                    .clip(RoundedCornerShape(26.dp))
+                    .background(Color(0xCC1C1C1E))
+                    .border(0.6.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(26.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {}
+                    )
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
-                    Modifier.clip(RoundedCornerShape(20.dp))
-                        .background(Color.White.copy(alpha = 0.18f))
-                        .iosPressScale(0.95f) {
-                            val rawUrl = resolveWorkspaceMediaUrl(rawPath, model.ui.serverUrl)
-                            val token = model.currentDeviceToken()
-                            val full = if (rawUrl.startsWith(model.ui.serverUrl.trimEnd('/')) && token.isNotBlank() && !rawUrl.contains("token=")) {
-                                val sep = if (rawUrl.contains('?')) '&' else '?'
-                                "$rawUrl${sep}token=${android.net.Uri.encode(token)}"
-                            } else rawUrl
-                            onDismiss()
-                            if (full.isNotBlank()) model.openLink(full)
-                        }
-                        .padding(horizontal = 16.dp, vertical = 9.dp)
+                    Modifier.heightIn(min = 42.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color.White.copy(alpha = 0.14f))
+                        .iosPressScale(0.95f) { model.saveBitmapToGallery(bitmap, rawPath) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Text("在浏览器打开", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    Text("保存相册", color = Color.White, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
                 }
                 Box(
-                    Modifier.clip(RoundedCornerShape(20.dp))
-                        .background(Color.White.copy(alpha = 0.25f))
-                        .clickable { onDismiss() }
-                        .padding(horizontal = 18.dp, vertical = 9.dp)
+                    Modifier.heightIn(min = 42.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color.White.copy(alpha = 0.14f))
+                        .iosPressScale(0.95f) { model.shareBitmapImage(bitmap, rawPath) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Text("关闭", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("分享", color = Color.White, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
+                }
+                Box(
+                    Modifier.heightIn(min = 42.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color.White.copy(alpha = 0.24f))
+                        .iosPressScale(0.95f) { onDismiss() }
+                        .padding(horizontal = 18.dp, vertical = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("关闭", color = Color.White, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -199,7 +308,10 @@ internal fun PulseUserMediaGrid(model: NativePulseModel, paths: List<String>, al
     val c = LocalPulsePalette.current
     if (distinct.size == 1) {
         val single = distinct.first()
-        var bmp by remember(single) { mutableStateOf<ImageBitmap?>(null) }
+        val singleUrl = remember(single, model.ui.serverUrl) { resolveWorkspaceMediaUrl(single, model.ui.serverUrl) }
+        var bmp by remember(singleUrl) { mutableStateOf(PulseMediaCache.getMemoryCached(singleUrl)) }
+        var failed by remember(singleUrl) { mutableStateOf(false) }
+        var retryNonce by remember(singleUrl) { mutableIntStateOf(0) }
         var showLb by remember { mutableStateOf(false) }
         val reduceMotion = LocalReduceMotion.current
         val imgAlpha by animateFloatAsState(
@@ -207,17 +319,23 @@ internal fun PulseUserMediaGrid(model: NativePulseModel, paths: List<String>, al
             animationSpec = if (reduceMotion) snap() else tween(160),
             label = "single_img_fade"
         )
-        LaunchedEffect(single) {
-            model.loadStickerBitmap(single) { loaded -> bmp = loaded }
+        LaunchedEffect(singleUrl, retryNonce) {
+            if (bmp != null || singleUrl.isBlank()) return@LaunchedEffect
+            failed = false
+            val loaded = model.loadMediaBitmap(single)
+            if (loaded != null) bmp = loaded else failed = true
         }
         Box(
             Modifier
                 .widthIn(min = 128.dp, max = 232.dp)
-                .heightIn(min = 96.dp, max = 248.dp)
+                .heightIn(min = 112.dp, max = 248.dp)
+                .then(if (bmp == null) Modifier.size(width = 196.dp, height = 148.dp) else Modifier)
                 .clip(RoundedCornerShape(16.dp))
                 .background(c.surface)
                 .border(0.7.dp, c.line.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
-                .iosPressScale(0.97f, enabled = bmp != null) { showLb = true },
+                .iosPressScale(0.97f, enabled = bmp != null || failed) {
+                    if (bmp != null) showLb = true else retryNonce++
+                },
             contentAlignment = Alignment.Center
         ) {
             if (bmp != null) {
@@ -227,6 +345,15 @@ internal fun PulseUserMediaGrid(model: NativePulseModel, paths: List<String>, al
                     modifier = Modifier.clip(RoundedCornerShape(16.dp)).graphicsLayer { alpha = imgAlpha },
                     contentScale = ContentScale.Fit
                 )
+            } else if (failed) {
+                Column(
+                    Modifier.padding(horizontal = 14.dp, vertical = 18.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    PulseIcon("refresh", c.muted, Modifier.size(20.dp))
+                    Text("图片加载失败 · 点击重试", color = c.muted, fontSize = 11.5.sp)
+                }
             } else {
                 Row(
                     Modifier.padding(horizontal = 14.dp, vertical = 18.dp),
@@ -243,46 +370,63 @@ internal fun PulseUserMediaGrid(model: NativePulseModel, paths: List<String>, al
         }
         return
     }
+    val rowChunks = remember(distinct) { distinct.chunked(2) }
     Column(
         verticalArrangement = Arrangement.spacedBy(6.dp),
         horizontalAlignment = if (alignEnd) Alignment.End else Alignment.Start
     ) {
-        distinct.chunked(2).forEach { rowPaths ->
+        rowChunks.forEach { rowPaths ->
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 rowPaths.forEach { imgPath ->
-                    var bmp by remember(imgPath) { mutableStateOf<ImageBitmap?>(null) }
-                    var showLb by remember { mutableStateOf(false) }
-                    val reduceMotion = LocalReduceMotion.current
-                    val gridAlpha by animateFloatAsState(
-                        targetValue = if (bmp != null) 1f else 0f,
-                        animationSpec = if (reduceMotion) snap() else tween(160),
-                        label = "grid_img_fade"
-                    )
-                    LaunchedEffect(imgPath) {
-                        model.loadStickerBitmap(imgPath) { loaded -> bmp = loaded }
-                    }
-                    Box(
-                        Modifier
-                            .size(114.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(c.surface)
-                            .border(0.7.dp, c.line.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
-                            .iosPressScale(0.96f, enabled = bmp != null) { showLb = true },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (bmp != null) {
-                            Image(
-                                bitmap = bmp!!,
-                                contentDescription = imgPath.substringAfterLast('/'),
-                                modifier = Modifier.fillMaxSize().graphicsLayer { alpha = gridAlpha },
-                                contentScale = ContentScale.Crop
-                            )
-                        } else {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = c.accent)
+                    key(imgPath) {
+                        val gridUrl = remember(imgPath, model.ui.serverUrl) { resolveWorkspaceMediaUrl(imgPath, model.ui.serverUrl) }
+                        var bmp by remember(gridUrl) { mutableStateOf(PulseMediaCache.getMemoryCached(gridUrl)) }
+                        var failed by remember(gridUrl) { mutableStateOf(false) }
+                        var retryNonce by remember(gridUrl) { mutableIntStateOf(0) }
+                        var showLb by remember { mutableStateOf(false) }
+                        val reduceMotion = LocalReduceMotion.current
+                        val gridAlpha by animateFloatAsState(
+                            targetValue = if (bmp != null) 1f else 0f,
+                            animationSpec = if (reduceMotion) snap() else tween(160),
+                            label = "grid_img_fade"
+                        )
+                        LaunchedEffect(gridUrl, retryNonce) {
+                            if (bmp != null || gridUrl.isBlank()) return@LaunchedEffect
+                            failed = false
+                            val loaded = model.loadMediaBitmap(imgPath)
+                            if (loaded != null) bmp = loaded else failed = true
                         }
-                    }
-                    if (showLb && bmp != null) {
-                        PulseMediaLightboxDialog(model = model, rawPath = imgPath, bitmap = bmp!!, onDismiss = { showLb = false })
+                        Box(
+                            Modifier
+                                .size(114.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(c.surface)
+                                .border(0.7.dp, c.line.copy(alpha = 0.55f), RoundedCornerShape(14.dp))
+                                .iosPressScale(0.96f, enabled = bmp != null || failed) {
+                                    if (bmp != null) showLb = true else retryNonce++
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            when {
+                                bmp != null -> Image(
+                                    bitmap = bmp!!,
+                                    contentDescription = imgPath.substringAfterLast('/'),
+                                    modifier = Modifier.fillMaxSize().graphicsLayer { alpha = gridAlpha },
+                                    contentScale = ContentScale.Crop
+                                )
+                                failed -> Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    PulseIcon("refresh", c.muted, Modifier.size(18.dp))
+                                    Text("点击重试", color = c.muted, fontSize = 10.5.sp)
+                                }
+                                else -> CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = c.accent)
+                            }
+                        }
+                        if (showLb && bmp != null) {
+                            PulseMediaLightboxDialog(model = model, rawPath = imgPath, bitmap = bmp!!, onDismiss = { showLb = false })
+                        }
                     }
                 }
             }
@@ -307,7 +451,6 @@ internal fun PulseFileAttachmentCard(
     fileSize: Long = 0L
 ) {
     val c = LocalPulsePalette.current
-    val s = model.ui
     val fileName = displayName.ifBlank { path.substringAfterLast('/') }.ifBlank { "未命名文件" }
     val ext = fileName.substringAfterLast('.', "").uppercase(java.util.Locale.ROOT).take(5)
     var downloading by remember(path) { mutableStateOf(false) }
@@ -343,22 +486,22 @@ internal fun PulseFileAttachmentCard(
     Row(
         Modifier
             .widthIn(min = 210.dp, max = 278.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(if (s.dark) c.surface else Color.White)
-            .border(0.8.dp, if (s.dark) Color(0x28FFFFFF) else Color(0x1E000000), RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(16.dp))
+            .background(c.surface)
+            .border(0.5.dp, c.line.copy(alpha = 0.72f), RoundedCornerShape(16.dp))
             .iosPressScale(0.97f, enabled = !downloading) {
                 model.downloadAndOpenWorkspaceFile(path, fileName) { busy -> downloading = busy }
             }
-            .padding(horizontal = 11.dp, vertical = 10.dp),
+            .padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Box(
             Modifier
                 .size(42.dp)
-                .clip(RoundedCornerShape(11.dp))
+                .clip(RoundedCornerShape(8.dp))
                 .background(badgeBg.copy(alpha = 0.14f))
-                .border(0.8.dp, badgeBg.copy(alpha = 0.28f), RoundedCornerShape(11.dp)),
+                .border(0.5.dp, badgeBg.copy(alpha = 0.28f), RoundedCornerShape(8.dp)),
             contentAlignment = Alignment.Center
         ) {
             if (downloading) {
@@ -389,7 +532,8 @@ internal fun PulseFileAttachmentCard(
                 color = if (downloading) c.accent else c.muted,
                 fontSize = 11.sp,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                style = TextStyle(fontFeatureSettings = "tnum")
             )
         }
         Box(

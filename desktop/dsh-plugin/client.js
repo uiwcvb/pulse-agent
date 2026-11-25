@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
     var state = {
       bots: DEFAULT_BOTS.slice(), activeBotId: "pc_engineer", viewActive: false, fullWorkspace: true,
       theme: savedTheme, themeManual: savedThemeManual, paneWidth: 420, botSearch: "", botFilter: "all", botSwitcherOpen: false,
-      pinBarExpanded: false, messages: [], messagesEpoch: 1, streamsByBot: {}, sendingByBot: {}, botContextById: {},
+      pinBarExpanded: false, messages: [], messagesEpoch: 1, syncGen: 0, streamsByBot: {}, sendingByBot: {}, botContextById: {},
       vpsOnline: true, rttMs: 0, phoneOnline: false, editingMsgId: null, editingText: "", replyingToMsg: null,
       pendingAttachments: [], uploadingCount: 0, slashMenuOpen: false, lightboxUrl: "", toastMsg: "",
       studioOpen: false, studioMode: "edit", editBotName: "", editBotDesc: "", editBotColor: "#0A84FF",
@@ -48,9 +48,11 @@ window.__ModuleLoader__.load({
       vaultSelectedPath: "", vaultSelectedContent: "", vaultLoading: false, vaultStatusMsg: "",
       expandedProcessIds: {},
       compactBusy: false, whaleAvatarUrl: "", lastStreamSig: "", lastLiveSig: "", isComposing: false,
-      lastCompositionEndAt: 0, recordingVoice: false, transcribingVoice: false, voiceStatusHint: ""
+      lastCompositionEndAt: 0, recordingVoice: false, transcribingVoice: false, voiceStatusHint: "",
+      stickerOpen: false, stickerPacks: [], stickerLoading: false, activeStickerPackId: "",
+      slashActiveIdx: 0, syncInFlight: false, paneSkipped: false, unreadWhileScrolledUp: false
     };
-    var voiceRecorder = { stream: null, audioCtx: null, source: null, processor: null, chunks: [] }, toastTimer = null;
+    var voiceRecorder = { stream: null, audioCtx: null, source: null, processor: null, chunks: [] }, toastTimer = null, syncKickFn = null;
 
     function R() { return window.__DSB_RENDER__ || null; }
     function escapeHtml(s) { return R() ? R().escapeHtml(s) : String(s === null || s === undefined ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
@@ -83,9 +85,27 @@ window.__ModuleLoader__.load({
     function showToast(msg) {
       state.toastMsg = String(msg || "");
       var el = document.getElementById("dsb-toast-el");
-      if (el) { el.textContent = state.toastMsg; el.style.display = state.toastMsg ? "block" : "none"; }
+      if (el) {
+        if (state.toastMsg) { el.textContent = state.toastMsg; el.classList.add("is-visible"); }
+        else el.classList.remove("is-visible");
+      }
       if (toastTimer) clearTimeout(toastTimer);
-      toastTimer = setTimeout(function () { state.toastMsg = ""; var e2 = document.getElementById("dsb-toast-el"); if (e2) e2.style.display = "none"; }, 2400);
+      toastTimer = setTimeout(function () { state.toastMsg = ""; var e2 = document.getElementById("dsb-toast-el"); if (e2) e2.classList.remove("is-visible"); }, 2400);
+    }
+    function toggleTheme() {
+      if (!state.themeManual) { state.themeManual = true; state.theme = "dark"; try { window.localStorage.setItem("dsb_theme", "dark"); } catch (e) {} }
+      else if (state.theme === "dark") { state.themeManual = true; state.theme = "light"; try { window.localStorage.setItem("dsb_theme", "light"); } catch (e) {} }
+      else { state.themeManual = false; try { window.localStorage.removeItem("dsb_theme"); } catch (e) {} }
+      applyLayoutClasses(); renderHeaderAndPins();
+      showToast(!state.themeManual ? "外观：跟随系统" : (state.theme === "dark" ? "外观：深色" : "外观：浅色"));
+    }
+    function runCompact() {
+      if (state.compactBusy) return; state.compactBusy = true; renderHeaderAndPins();
+      apiCall("/local/infinite-chat/compact", "POST", { bot_id: state.activeBotId }).then(function (r) {
+        state.compactBusy = false;
+        if (!r || r.ok === false) { renderHeaderAndPins(); showToast("上下文浓缩失败: " + ((r && r.error) || "网络异常")); return; }
+        applySyncPayload(r); renderChatStream(true); showToast("上下文浓缩归档完成");
+      });
     }
     function U() { return window.__DSB_CLIENT_UI__ || null; }
     function uiCtx() {
@@ -93,9 +113,13 @@ window.__ModuleLoader__.load({
         state: state, apiCall: apiCall, showToast: showToast, autoFitTextarea: autoFitTextarea,
         renderComposerBanners: renderComposerBanners, updateComposerButtons: updateComposerButtons,
         renderSheets: renderSheets, renderHeaderAndPins: renderHeaderAndPins,
-        renderHomeRail: renderHomeRail, renderRightLauncher: renderRightLauncher, getActiveBot: getActiveBot,
+        renderRightLauncher: renderRightLauncher, getActiveBot: getActiveBot,
         escapeHtml: escapeHtml, getRoomMessages: getRoomMessages, friendlyToolLabel: friendlyToolLabel,
-        renderBotAvatarSvg: renderBotAvatarSvg, PRESET_COLORS: PRESET_COLORS,
+        renderBotAvatarSvg: renderBotAvatarSvg, renderSingleMessageHtml: renderSingleMessageHtml,
+        renderChatStream: renderChatStream, submitTurn: submitTurn, selectBot: selectBot,
+        openBotStudio: openBotStudio, openVaultSheet: openVaultSheet, toggleTheme: toggleTheme,
+        runCompact: runCompact, R: R, PRESET_COLORS: PRESET_COLORS, SHAPE_OPTIONS: SHAPE_OPTIONS,
+        SLASH_COMMANDS: SLASH_COMMANDS,
       };
     }
     function apiCall(localPath, method, body) {
@@ -166,10 +190,13 @@ window.__ModuleLoader__.load({
     var renderRightLauncher = renderNativeSidebarMount;
     function resolveHostTheme() {
       if (state.themeManual) return state.theme;
-      if (typeof document !== "undefined" && document.body) {
-        return document.body.hasAttribute("data-ds-dark-theme") ? "dark" : "light";
+      if (typeof document !== "undefined" && document.body && document.body.hasAttribute("data-ds-dark-theme")) {
+        return "dark";
       }
-      return state.theme || "dark";
+      if (typeof window !== "undefined" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+        return "dark";
+      }
+      return "light";
     }
     function applyLayoutClasses() {
       renderNativeSidebarMount();
@@ -183,6 +210,8 @@ window.__ModuleLoader__.load({
           document.body.appendChild(pane);
         }
         pane.setAttribute("data-theme", state.theme);
+        if (state.themeManual) pane.setAttribute("data-theme-manual", "1");
+        else pane.removeAttribute("data-theme-manual");
         pane.classList.toggle("is-embedded", embedded);
         pane.classList.toggle("is-open", Boolean(state.viewActive));
       }
@@ -207,7 +236,6 @@ window.__ModuleLoader__.load({
         ta.style.height = Math.min(148, Math.max(22, ta.scrollHeight)) + "px";
       }
     }
-    function renderHomeRail() {}
     function renderHeaderAndPins() {
       var bot = getActiveBot();
       var ctx = state.botContextById[bot.id] || {};
@@ -220,24 +248,22 @@ window.__ModuleLoader__.load({
       var modelLabel = (bot.model || "DeepSeek Bot").split("/").pop();
       var tokSummary = curTok > 0 ? (formatCompactTokens(curTok) + "/" + formatCompactTokens(maxTok)) : "--";
       var subText = isBusy
-        ? (liveSt && liveSt.tool ? "执行 · " + friendlyToolLabel(liveSt.tool, {}) : "思考中…")
+        ? (liveSt && liveSt.tool ? "执行 · " + friendlyToolLabel(liveSt.tool, liveSt.tool_args || liveSt.args || liveSt.arguments || {}) : "思考中…")
         : (tokSummary + (hitPct > 0 ? " · 缓存" + hitPct + "%" : "") + (tps > 0 ? " · " + tps.toFixed(0) + "t/s" : "") + (!state.vpsOnline ? " · 离线" : ""));
 
       var statusEl = document.getElementById("dsb-head-status");
       if (statusEl) {
-        statusEl.textContent = subText;
-        statusEl.title = modelLabel + " · 上下文 " + curTok + " / " + maxTok + (hitPct > 0 ? " · 缓存命中 " + hitPct + "%" : "");
+        statusEl.textContent = !state.vpsOnline ? "离线 · 点击重连" : subText;
+        statusEl.title = !state.vpsOnline ? "网关与云端断开，点击立即重连" : (modelLabel + " · 上下文 " + curTok + " / " + maxTok + (hitPct > 0 ? " · 缓存命中 " + hitPct + "%" : ""));
         statusEl.classList.toggle("is-live", isBusy);
+        statusEl.classList.toggle("is-offline", !state.vpsOnline);
       }
       var fillEl = document.getElementById("dsb-ctx-fill");
       if (fillEl) fillEl.style.width = Math.min(100, Math.round((curTok / maxTok) * 100)) + "%";
-      var thBtn = document.getElementById("dsb-btn-theme");
-      if (thBtn) {
-        thBtn.innerHTML = iconSvg(state.theme === "dark" ? "sun" : "moon", 15);
-        thBtn.title = state.theme === "dark" ? "切换浅色模式" : "切换深色模式";
+      var morePop = document.getElementById("dsb-more-pop");
+      if (morePop && R() && R().buildHeaderMoreMenuHtml) {
+        morePop.innerHTML = R().buildHeaderMoreMenuHtml(state);
       }
-      var cpBtn = document.getElementById("dsb-btn-compact");
-      if (cpBtn) cpBtn.innerHTML = state.compactBusy ? '<span class="dsb-mini-spin"></span>' : iconSvg("compress", 15);
 
       var qEl = document.getElementById("dsb-quick-bots");
       if (qEl && R() && R().buildHeaderBotPillsHtml) {
@@ -253,7 +279,7 @@ window.__ModuleLoader__.load({
           var latestPin = String((pins[pins.length - 1] && pins[pins.length - 1].text) || "").replace(/^\[来源:[^\]]+\]\s*/, "");
           var rows = state.pinBarExpanded ? ('<div class="dsb-pin-list">' + pins.map(function (p) {
             var cleanP = String(p.text || "").replace(/^\[来源:[^\]]+\]\s*/, "");
-            return '<div class="dsb-pin-row"><span>' + escapeHtml(cleanP) + '</span><button type="button" class="dsb-icon-btn" style="width:20px;height:20px;" data-unpin-id="' + escapeHtml(p.id || p.text) + '" title="移除置顶">' + iconSvg("close", 12) + "</button></div>";
+            return '<div class="dsb-pin-row"><span>' + escapeHtml(cleanP) + '</span><button type="button" class="dsb-icon-btn" style="width:28px;height:28px;" aria-label="移除置顶记忆" data-unpin-id="' + escapeHtml(p.id || p.text) + '" title="移除置顶">' + iconSvg("close", 12) + "</button></div>";
           }).join("") + "</div>") : "";
           pinBar.innerHTML = '<div class="dsb-pin-head" data-toggle-pinbar="1"><span class="dsb-pin-badge">' + iconSvg("pin", 13) + "<span>置顶记忆 #" + pins.length + '</span></span><span class="dsb-pin-preview">' + escapeHtml(latestPin) + "</span>" + iconSvg("chevron", 13) + "</div>" + rows;
         }
@@ -263,56 +289,38 @@ window.__ModuleLoader__.load({
     function renderSingleMessageHtml(m) {
       if (!R()) return '<div class="dsb-msg-row"><div class="dsb-bubble">' + escapeHtml(m && m.text) + "</div></div>";
       var parsed = (m && m.role === "user" && m.kind !== "bot_message") ? parseUserQuoteAndAttachments(m.text) : null;
-      return R().buildMessageRowHtml(m, parsed, Boolean(m && m.id && state.expandedProcessIds[m.id]));
+      return R().buildMessageRowHtml(m, parsed, state.expandedProcessIds);
     }
 
     function renderChatStream(forceScroll) {
-      var historyEl = document.getElementById("dsb-history-box");
-      var liveEl = document.getElementById("dsb-live-box");
-      var scrollEl = document.getElementById("dsb-chat-scroll");
+      var historyEl = document.getElementById("dsb-history-box"), liveEl = document.getElementById("dsb-live-box"), scrollEl = document.getElementById("dsb-chat-scroll");
       if (!historyEl || !liveEl || !scrollEl) return;
       var nearBottom = forceScroll || (scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120);
-      var bot = getActiveBot();
-      var roomMsgs = getRoomMessages(bot.id);
-      var histSig = bot.id + "|" + state.messagesEpoch + "|" + roomMsgs.map(function (m) {
-        var vLen = Array.isArray(m.variants) ? m.variants.length : 0;
-        var vIdx = m.active_variant_idx !== undefined ? m.active_variant_idx : -1;
-        var cLen = Array.isArray(m.choices) ? m.choices.length : 0;
-        return [m.id, m.text.length, m.text.slice(0, 12), (m.thought || "").length, (m.tool_trace || []).length, (m.turn_steps || []).length, (m.timeline || []).length, m.tps || 0, vLen, vIdx, cLen].join(":");
-      }).join(",");
-      if (histSig !== state.lastStreamSig) {
-        state.lastStreamSig = histSig;
-        if (!roomMsgs.length) {
-          historyEl.innerHTML = '<div class="dsb-empty-state">' + renderBotAvatarSvg(bot, 48) +
-            '<div class="dsb-empty-title">' + escapeHtml(bot.name) + '</div><div class="dsb-empty-sub">' +
-            escapeHtml(bot.description || "独立会话与专属思维链空间，支持拖拽/粘贴图片、引用回复与跨端协同。") + "</div></div>";
-        } else {
-          historyEl.innerHTML = roomMsgs.map(function (m) { return renderSingleMessageHtml(m); }).join("");
+      var bot = getActiveBot(), roomMsgs = getRoomMessages(bot.id), histAddedNew = false;
+      if (U() && U().reconcileChatHistory) {
+        histAddedNew = U().reconcileChatHistory(uiCtx(), historyEl, roomMsgs, bot).addedNew;
+      } else {
+        var histSig = bot.id + "|" + state.messagesEpoch + "|" + roomMsgs.map(function (m) { return [m.id, m.text.length, m.text.slice(0, 12), (m.timeline || []).length].join(":"); }).join(",");
+        if (histSig !== state.lastStreamSig) {
+          state.lastStreamSig = histSig; histAddedNew = roomMsgs.length > 0;
+          historyEl.innerHTML = roomMsgs.length ? roomMsgs.map(renderSingleMessageHtml).join("") : ('<div class="dsb-empty-state">' + renderBotAvatarSvg(bot, 48) + '<div class="dsb-empty-title">' + escapeHtml(bot.name) + '</div><div class="dsb-empty-sub">' + escapeHtml(bot.description || "") + "</div></div>");
         }
       }
-
-      var liveSt = state.streamsByBot[bot.id];
-      var isSending = Boolean(state.sendingByBot[bot.id]);
+      var liveSt = state.streamsByBot[bot.id], isSending = Boolean(state.sendingByBot[bot.id]), liveChanged = false;
       var liveSig = JSON.stringify(liveSt || null) + "|" + isSending;
       if (liveSig !== state.lastLiveSig) {
-        state.lastLiveSig = liveSig;
+        state.lastLiveSig = liveSig; liveChanged = Boolean(liveSt || isSending);
         if (liveSt || isSending) {
-          var stText = liveSt ? String(liveSt.text || "").trim() : "";
-          var stThought = liveSt ? String(liveSt.thought || "").trim() : "";
-          var stStepText = liveSt ? String(liveSt.step_text || "").trim() : "";
-          var stTrace = liveSt && Array.isArray(liveSt.trace) ? liveSt.trace : [];
-          var stTurnSteps = liveSt && Array.isArray(liveSt.turn_steps) ? liveSt.turn_steps : [];
-          var stTool = liveSt ? String(liveSt.tool || "") : "";
-          var stTimeline = liveSt && Array.isArray(liveSt.timeline) ? liveSt.timeline : [];
+          var stText = liveSt ? String(liveSt.text || "").trim() : "", stThought = liveSt ? String(liveSt.thought || "").trim() : "", stStepText = liveSt ? String(liveSt.step_text || "").trim() : "";
+          var stTrace = liveSt && Array.isArray(liveSt.trace) ? liveSt.trace : [], stTool = liveSt ? String(liveSt.tool || "") : "", stTimeline = liveSt && Array.isArray(liveSt.timeline) ? liveSt.timeline : [];
           var liveBodyHtml = (R() && R().renderUnifiedTimelineBodyHtml && (stTimeline.length || stTrace.length || stThought || stText))
-            ? R().renderUnifiedTimelineBodyHtml(stTimeline, stThought, stText, stTrace, true)
+            ? R().renderUnifiedTimelineBodyHtml(stTimeline, stThought, stText, stTrace, true, "live", state.expandedProcessIds)
             : ('<div style="font-size:13px;color:var(--dsb-muted);">' + escapeHtml(stStepText || stTool || "正在思考…") + "</div>");
           liveEl.innerHTML = '<div class="dsb-msg-row is-ai"><div class="dsb-bubble">' + liveBodyHtml + "</div></div>";
-        } else {
-          liveEl.innerHTML = "";
-        }
+        } else liveEl.innerHTML = "";
       }
-      if (nearBottom) scrollEl.scrollTop = scrollEl.scrollHeight;
+      if (nearBottom) { scrollEl.scrollTop = scrollEl.scrollHeight; state.unreadWhileScrolledUp = false; }
+      if (U() && U().updateScrollBottomPill) U().updateScrollBottomPill(uiCtx(), !nearBottom && (histAddedNew || liveChanged));
     }
 
     function renderComposerBanners() {
@@ -321,10 +329,10 @@ window.__ModuleLoader__.load({
       if (bannerBox) {
         var parts = [];
         if (state.editingMsgId) {
-          parts.push('<div class="dsb-ctx-banner"><span style="font-weight:600;color:var(--dsb-accent);">编辑重发</span><span class="dsb-ctx-banner-txt">' + escapeHtml(state.editingText) + '</span><button type="button" class="dsb-icon-btn" style="width:22px;height:22px;" data-cancel-edit="1">' + iconSvg("close", 13) + "</button></div>");
+          parts.push('<div class="dsb-ctx-banner"><span style="font-weight:600;color:var(--dsb-accent);">编辑重发</span><span class="dsb-ctx-banner-txt">' + escapeHtml(state.editingText) + '</span><button type="button" class="dsb-icon-btn" style="width:28px;height:28px;" aria-label="取消编辑" data-cancel-edit="1">' + iconSvg("close", 13) + "</button></div>");
         } else if (state.replyingToMsg) {
           var who = state.replyingToMsg.role === "user" ? "我" : (getActiveBot().name || "助理");
-          parts.push('<div class="dsb-ctx-banner"><span style="font-weight:600;color:var(--dsb-accent);">引用 ' + escapeHtml(who) + '</span><span class="dsb-ctx-banner-txt">' + escapeHtml(String(state.replyingToMsg.text || "").replace(/\s+/g, " ").slice(0, 90)) + '</span><button type="button" class="dsb-icon-btn" style="width:22px;height:22px;" data-cancel-reply="1">' + iconSvg("close", 13) + "</button></div>");
+          parts.push('<div class="dsb-ctx-banner"><span style="font-weight:600;color:var(--dsb-accent);">引用 ' + escapeHtml(who) + '</span><span class="dsb-ctx-banner-txt">' + escapeHtml(String(state.replyingToMsg.text || "").replace(/\s+/g, " ").slice(0, 90)) + '</span><button type="button" class="dsb-icon-btn" style="width:28px;height:28px;" aria-label="取消引用" data-cancel-reply="1">' + iconSvg("close", 13) + "</button></div>");
         }
         if (state.pendingAttachments.length) {
           parts.push('<div class="dsb-att-strip">' + state.pendingAttachments.map(function (a, idx) {
@@ -353,22 +361,22 @@ window.__ModuleLoader__.load({
         }
         bannerBox.innerHTML = parts.join("");
       }
-      if (slashEl) {
+      var slashEl = document.getElementById("dsb-slash-pop"), taEl = document.getElementById("dsb-chat-input");
+      if (U() && U().renderSlashMenu) {
+        U().renderSlashMenu(uiCtx(), taEl ? taEl.value : "", SLASH_COMMANDS);
+      } else if (slashEl) {
         slashEl.style.display = state.slashMenuOpen ? "block" : "none";
-        if (state.slashMenuOpen) {
-          slashEl.innerHTML = SLASH_COMMANDS.map(function (sc) {
-            return '<button type="button" class="dsb-slash-item" data-pick-slash="' + escapeHtml(sc.cmd) + '"><span class="dsb-slash-cmd">' + escapeHtml(sc.cmd.trim()) + '</span><span style="color:var(--dsb-muted);font-size:11.5px;">' + escapeHtml(sc.desc) + "</span></button>";
-          }).join("");
-        }
       }
       updateComposerButtons();
     }
     function updateComposerButtons() {
-      var bot = getActiveBot();
-      var isBusy = Boolean(state.streamsByBot[bot.id] || state.sendingByBot[bot.id]);
+      var bot = getActiveBot(), isBusy = Boolean(state.streamsByBot[bot.id] || state.sendingByBot[bot.id]);
+      var ta = document.getElementById("dsb-chat-input");
+      var hasDraft = Boolean((ta && ta.value.trim()) || state.pendingAttachments.length);
       var sendBtn = document.getElementById("dsb-send-btn");
       if (sendBtn) {
         sendBtn.classList.toggle("is-stop", isBusy);
+        sendBtn.classList.toggle("is-idle", !isBusy && !hasDraft);
         sendBtn.type = isBusy ? "button" : "submit";
         sendBtn.title = isBusy ? "立即停止生成" : "发送消息 (Enter)";
         sendBtn.innerHTML = isBusy ? iconSvg("stop", 15) : iconSvg("send", 16);
@@ -386,69 +394,65 @@ window.__ModuleLoader__.load({
     function openVaultSheet(initialPath, initialTab) { if (U() && U().openVaultSheet) U().openVaultSheet(uiCtx(), initialPath, initialTab); }
     function loadVaultFile(relPath) { if (U() && U().loadVaultFile) U().loadVaultFile(uiCtx(), relPath); }
     function renderSheets() {
-      var host = document.getElementById("dsb-sheet-host");
-      if (!host) return;
-      if (!state.studioOpen && !state.vaultOpen) { host.innerHTML = ""; return; }
-      if (!R()) return;
-      host.innerHTML = state.studioOpen ? R().buildStudioSheetHtml(state, getActiveBot(), PRESET_COLORS, SHAPE_OPTIONS) : R().buildVaultSheetHtml(state);
+      if (U() && U().renderSheets) { U().renderSheets(uiCtx()); return; }
     }
 
     // === [10. Turn Submission, Sync Loop & Event Delegation] ===
-    function submitTurn() {
-      var ta = document.getElementById("dsb-chat-input");
-      if (!ta) return;
-      var raw = String(ta.value || "").trim();
-      var readyAtts = state.pendingAttachments.filter(function (a) { return !a.uploading && a.path; });
+    function submitTurn(opts) {
+      var ta = document.getElementById("dsb-chat-input"), hasOv = Boolean(opts && opts.overrideText);
+      if (!ta && !hasOv) return;
+      var raw = hasOv ? String(opts.overrideText).trim() : String(ta.value || "").trim();
+      var readyAtts = hasOv ? [] : state.pendingAttachments.filter(function (a) { return !a.uploading && a.path; });
       if (!raw && !readyAtts.length) return;
-      if (state.uploadingCount > 0) { showToast("附件正在上传，请稍候…"); return; }
+      if (!hasOv && state.uploadingCount > 0) { showToast("附件正在上传，请稍候…"); return; }
 
-      var bot = getActiveBot();
-      var finalText = raw || "请查看这些附件。";
-      if (state.replyingToMsg && !state.editingMsgId) {
+      var bot = getActiveBot(), finalText = raw || "请查看这些附件。";
+      if (!hasOv && state.replyingToMsg && !state.editingMsgId) {
         var qWho = state.replyingToMsg.role === "user" ? "我" : bot.name;
         var qLine = String(state.replyingToMsg.text || "").replace(/\s+/g, " ").trim().slice(0, 120);
         finalText = "> [" + qWho + "] " + qLine + "\n\n" + finalText;
       }
-      if (readyAtts.length) {
+      if (!hasOv && readyAtts.length) {
         finalText += "\n\n附件（工作区相对路径，可直接读取或分析）：\n" + readyAtts.map(function (a) { return a.path; }).join("\n");
       }
 
-      var editId = state.editingMsgId;
-      ta.value = ""; autoFitTextarea(ta);
-      state.editingMsgId = null; state.editingText = ""; state.replyingToMsg = null;
-      if (U() && U().revokeItemThumb) state.pendingAttachments.forEach(U().revokeItemThumb);
-      state.pendingAttachments = []; state.slashMenuOpen = false; state.sendingByBot[bot.id] = true;
+      var editId = hasOv ? null : state.editingMsgId;
+      if (!hasOv && ta) {
+        ta.value = ""; autoFitTextarea(ta);
+        state.editingMsgId = null; state.editingText = ""; state.replyingToMsg = null;
+        if (U() && U().revokeItemThumb) state.pendingAttachments.forEach(U().revokeItemThumb);
+        state.pendingAttachments = []; state.slashMenuOpen = false;
+      }
+      state.sendingByBot[bot.id] = true;
       renderComposerBanners(); renderRightLauncher();
+      if (typeof syncKickFn === "function") syncKickFn(240);
 
+      state.syncGen = (state.syncGen || 0) + 1;
       if (!editId) {
         var optimisticId = "pc-" + Date.now();
         var roomNow = getRoomMessages(bot.id);
         var maxRoomSeq = roomNow.reduce(function (mx, item) { return Math.max(mx, Number((item && (item.order_seq || item.seq)) || 0)); }, 0);
         var nowMsOpt = Date.now();
+        var stickerVal = (opts && (opts.sticker || opts.stickerUrl)) ? String(opts.sticker || opts.stickerUrl) : "";
         state.messages.push({
-          id: optimisticId, client_msg_id: optimisticId, role: "user", kind: "chat", text: finalText, bot_id: bot.id,
+          id: optimisticId, client_msg_id: optimisticId, role: "user", kind: "chat", text: finalText,
+          sticker: (opts && opts.stickerUrl) ? String(opts.stickerUrl) : stickerVal, bot_id: bot.id,
           source: "pc", order_seq: maxRoomSeq > 0 ? (maxRoomSeq + 0.01) : 0, created: nowMsOpt,
           time: new Date(nowMsOpt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
         });
         renderChatStream(true);
-        apiCall("/local/infinite-chat/send", "POST", { bot_id: bot.id, text: finalText, client_msg_id: optimisticId }).then(function (res) {
+        apiCall("/local/infinite-chat/send", "POST", { bot_id: bot.id, text: finalText, ...(stickerVal ? { sticker: stickerVal } : {}), client_msg_id: optimisticId }).then(function (res) {
           delete state.sendingByBot[bot.id];
-          if (!res || res.ok === false) {
-            showToast("发送失败: " + ((res && res.error) || "连接异常"));
-            updateComposerButtons();
-          }
-          applySyncPayload(res);
-          renderChatStream(true);
+          if (!res || res.ok === false) { showToast("发送失败: " + ((res && res.error) || "连接异常")); updateComposerButtons(); }
+          state.syncGen = (state.syncGen || 0) + 1;
+          applySyncPayload(res); renderChatStream(true);
         });
       } else {
         apiCall("/local/infinite-chat/edit", "POST", { bot_id: bot.id, message_id: editId, text: finalText }).then(function (res) {
           delete state.sendingByBot[bot.id];
-          if (!res || res.ok === false) {
-            showToast("编辑重发失败: " + ((res && res.error) || "连接异常"));
-            updateComposerButtons();
-          }
-          applySyncPayload(res);
-          renderChatStream(true);
+          if (!res || res.ok === false) { showToast("编辑重发失败: " + ((res && res.error) || "连接异常")); updateComposerButtons(); }
+          state.syncGen = (state.syncGen || 0) + 1;
+          applySyncPayload(res); renderChatStream(true);
         });
       }
     }
@@ -460,24 +464,33 @@ window.__ModuleLoader__.load({
       if (Array.isArray(res.messages)) state.messages = res.messages;
       if (res.messages_epoch) state.messagesEpoch = Number(res.messages_epoch) || 1;
       if (res.streams_by_bot && typeof res.streams_by_bot === "object") state.streamsByBot = res.streams_by_bot;
-      renderRightLauncher(); renderHomeRail(); renderHeaderAndPins(); updateComposerButtons();
+      renderRightLauncher(); renderHeaderAndPins(); updateComposerButtons();
     }
 
     function syncNow(force) {
-      if (!state.viewActive && !force) return;
+      if (state.syncInFlight) return;
+      if (!state.viewActive && !force && !Object.keys(state.sendingByBot).length && !Object.keys(state.streamsByBot).length) return;
+      state.syncInFlight = true;
+      var reqGen = (state.syncGen = (state.syncGen || 0) + 1);
       apiCall("/local/infinite-chat/sync", "POST", { force: Boolean(force) }).then(function (res) {
+        if (reqGen !== state.syncGen) return;
         applySyncPayload(res);
         renderChatStream(false);
+      }).finally(function () {
+        state.syncInFlight = false;
+        if (typeof syncKickFn === "function") syncKickFn();
       });
     }
 
     function selectBot(botId) {
       if (!botId) return;
+      state.syncGen = (state.syncGen || 0) + 1;
       state.activeBotId = botId; state.botSwitcherOpen = false; state.editingMsgId = null; state.replyingToMsg = null;
+      state.unreadWhileScrolledUp = false; state.lastStreamSig = ""; state.lastLiveSig = "";
       apiCall("/local/bots/select", "POST", { bot_id: botId }).then(function (r) {
         if (r && r.ok === false && r.error) showToast("切换助理同步失败: " + r.error);
       });
-      renderRightLauncher(); renderHomeRail(); renderHeaderAndPins(); renderComposerBanners(); renderChatStream(true);
+      renderRightLauncher(); renderHeaderAndPins(); renderComposerBanners(); renderChatStream(true);
     }
 
     function ensureDomMounted(slotHostEl) {
@@ -499,29 +512,31 @@ window.__ModuleLoader__.load({
                 '<div class="dsb-brand-chip" title="DSB · DeepSeek Bot">' + brandBadge + '<span class="dsb-brand-word">DSB</span></div>' +
                 '<span class="dsb-head-sep" aria-hidden="true"></span>' +
                 '<div class="dsb-nav-pills" id="dsb-quick-bots"></div>' +
-                '<button type="button" class="dsb-add-bot-mini" data-open-create-bot="1" title="新建专属助理">' + iconSvg("plus", 14) + '</button>' +
               '</div>' +
               '<div class="dsb-head-right">' +
-                '<span class="dsb-head-status" id="dsb-head-status"></span>' +
+                '<button type="button" class="dsb-head-status" id="dsb-head-status"></button>' +
                 '<div class="dsb-head-actions">' +
-                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-theme" title="切换日夜主题">' + iconSvg("sun", 15) + '</button>' +
-                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-files" title="跨端文件 (本机 / VPS / 云电脑)">' + iconSvg("paperclip", 15) + '</button>' +
-                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-vault" title="记忆金库与置顶规则">' + iconSvg("vault", 15) + '</button>' +
-                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-studio" title="助理设置">' + iconSvg("sliders", 15) + '</button>' +
-                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-compact" title="浓缩归档上下文 (/compact)">' + iconSvg("compress", 15) + '</button>' +
+                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-vault" title="记忆金库与跨端文件" aria-label="记忆金库与跨端文件">' + iconSvg("vault", 15) + '</button>' +
+                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-studio" title="助理设置" aria-label="助理设置">' + iconSvg("sliders", 15) + '</button>' +
+                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-more" popovertarget="dsb-more-pop" aria-haspopup="true" aria-controls="dsb-more-pop" title="更多操作与主题 (Ctrl+K)" aria-label="更多操作">' + iconSvg("more", 15) + '</button>' +
                   '<span class="dsb-act-sep" aria-hidden="true"></span>' +
-                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-close" title="隐藏工作台">' + iconSvg("close", 15) + '</button>' +
+                  '<button type="button" class="dsb-icon-btn" id="dsb-btn-close" title="隐藏工作台" aria-label="隐藏工作台">' + iconSvg("close", 15) + '</button>' +
                 '</div>' +
               '</div>' +
+              '<div id="dsb-more-pop" class="dsb-more-pop" popover="auto" aria-label="更多操作"></div>' +
               '<div class="dsb-ctx-hairline"><div class="dsb-ctx-hairline-fill" id="dsb-ctx-fill" style="width:0%"></div></div>' +
             '</header>' +
             '<div class="dsb-pin-bar" id="dsb-pin-bar" style="display:none;"></div>' +
             '<div class="dsb-chat-scroll" id="dsb-chat-scroll"><div class="dsb-chat-inner"><div id="dsb-history-box" style="display:flex;flex-direction:column;gap:20px;"></div><div id="dsb-live-box"></div></div></div>' +
-            '<div class="dsb-composer-wrap"><div class="dsb-slash-pop" id="dsb-slash-pop" style="display:none;"></div><form id="dsb-composer-form" class="dsb-composer-inner"><div id="dsb-composer-banners" style="display:flex;flex-direction:column;gap:5px;"></div>' +
-              '<div class="dsb-composer-row"><input id="dsb-file-picker" type="file" multiple style="display:none;"/><button type="button" class="dsb-tool-circle" id="dsb-attach-btn" title="上传图片或文件附件">' + iconSvg("paperclip", 16) + '</button>' +
-              '<div class="dsb-input-capsule"><label for="dsb-chat-input" class="dsb-sr-only">输入消息</label><textarea id="dsb-chat-input" rows="1" placeholder="发消息、粘贴截图，输入 / 唤出指令…"></textarea></div>' +
-              '<button type="button" class="dsb-tool-circle" id="dsb-mic-btn" title="语音听写">' + iconSvg("mic", 16) + '</button><button type="submit" class="dsb-send-circle" id="dsb-send-btn" title="发送消息">' + iconSvg("send", 16) + '</button></div></form></div>' +
-            '<div id="dsb-toast-el" class="dsb-toast" style="display:none;"></div><div id="dsb-sheet-host"></div>' +
+            '<button type="button" class="dsb-scroll-bottom" id="dsb-scroll-bottom-btn" aria-label="回到底部">' + iconSvg("arrowDown", 13) + '<span data-sb-label="1">回到底部</span></button>' +
+            '<div class="dsb-composer-wrap"><div class="dsb-slash-pop" id="dsb-slash-pop" role="listbox" style="display:none;"></div><div id="dsb-sticker-pop" class="dsb-sticker-pop" popover="auto" aria-label="表情贴纸选择"></div>' +
+              '<form id="dsb-composer-form" class="dsb-composer-inner"><div id="dsb-composer-banners" style="display:flex;flex-direction:column;gap:5px;"></div>' +
+              '<div class="dsb-composer-row"><input id="dsb-file-picker" type="file" multiple style="display:none;"/><button type="button" class="dsb-tool-circle" id="dsb-attach-btn" title="上传图片或文件附件" aria-label="上传附件">' + iconSvg("paperclip", 16) + '</button>' +
+              '<button type="button" class="dsb-tool-circle" id="dsb-sticker-btn" popovertarget="dsb-sticker-pop" aria-haspopup="true" aria-expanded="false" aria-controls="dsb-sticker-pop" title="发送表情贴纸" aria-label="发送表情贴纸">' + iconSvg("smile", 16) + '</button>' +
+              '<div class="dsb-input-capsule"><label for="dsb-chat-input" class="dsb-sr-only">输入消息</label><textarea id="dsb-chat-input" rows="1" placeholder="发消息、粘贴截图，/ 指令，Ctrl+K 快捷面板…"></textarea></div>' +
+              '<button type="button" class="dsb-tool-circle" id="dsb-mic-btn" title="语音听写" aria-label="语音听写">' + iconSvg("mic", 16) + '</button><button type="submit" class="dsb-send-circle" id="dsb-send-btn" title="发送消息" aria-label="发送消息">' + iconSvg("send", 16) + '</button></div></form></div>' +
+            '<span id="dsb-sr-status" class="dsb-sr-only" role="status" aria-live="polite"></span>' +
+            '<div id="dsb-toast-el" class="dsb-toast"></div>' +
           '</div>';
         (slotHostEl || document.body).appendChild(pane);
         bindPaneDomEvents(pane);
@@ -534,31 +549,79 @@ window.__ModuleLoader__.load({
     function bindPaneDomEvents(pane) {
       if (!pane || pane.getAttribute("data-dsb-bound") === "1") return;
       pane.setAttribute("data-dsb-bound", "1");
+      if (U() && U().ensureStickerToggleBound) U().ensureStickerToggleBound(uiCtx());
 
       pane.addEventListener("toggle", function (ev) {
         var dt = ev.target;
-        if (dt && dt.classList && dt.classList.contains("dsb-turn-process")) {
-          var mid = dt.getAttribute("data-turn-mid");
-          if (mid) {
-            if (dt.open) state.expandedProcessIds[mid] = true;
-            else delete state.expandedProcessIds[mid];
+        if (!dt || !dt.classList) return;
+        var pKey = dt.getAttribute("data-proc-key");
+        if (pKey) { if (dt.open) state.expandedProcessIds[pKey] = true; else delete state.expandedProcessIds[pKey]; }
+        if (dt.id === "dsb-more-pop" && ev.newState === "open") {
+          var mb = document.getElementById("dsb-btn-more");
+          if (R() && R().buildHeaderMoreMenuHtml) dt.innerHTML = R().buildHeaderMoreMenuHtml(state);
+          if (mb && mb.getBoundingClientRect) {
+            var r = mb.getBoundingClientRect();
+            dt.style.top = Math.round(r.bottom + 6) + "px";
+            dt.style.right = Math.max(10, Math.round(window.innerWidth - r.right)) + "px";
+            dt.style.left = "auto";
           }
         }
       }, true);
+      pane.addEventListener("contentvisibilityautostatechange", function (ev) {
+        state.paneSkipped = Boolean(ev && ev.skipped);
+        if (!state.paneSkipped && typeof syncKickFn === "function") { syncNow(false); syncKickFn(); }
+      });
 
-      // IME-safe Enter Submit (`ime-safe-enter-submit`) + Auto-fit (`form-fields-automatically-fit-contents`) + Clipboard Image Paste
-      var formEl = document.getElementById("dsb-composer-form");
-      var taEl = document.getElementById("dsb-chat-input");
+      var formEl = document.getElementById("dsb-composer-form"), taEl = document.getElementById("dsb-chat-input"), scrollEl = document.getElementById("dsb-chat-scroll");
+      if (scrollEl) {
+        scrollEl.addEventListener("scroll", function () { if (U() && U().updateScrollBottomPill) U().updateScrollBottomPill(uiCtx(), false); }, { passive: true });
+      }
       taEl.addEventListener("compositionstart", function () { state.isComposing = true; });
       taEl.addEventListener("compositionend", function (ev) { state.isComposing = false; state.lastCompositionEndAt = ev.timeStamp || performance.now(); });
       taEl.addEventListener("keydown", function (ev) {
-        if (ev.key === "Escape") {
-          if (state.slashMenuOpen) { state.slashMenuOpen = false; renderComposerBanners(); return; }
-          if (state.editingMsgId || state.replyingToMsg) { state.editingMsgId = null; state.replyingToMsg = null; renderComposerBanners(); return; }
-        }
-        if (ev.key !== "Enter" || ev.shiftKey) return;
         var justEndedIme = ((ev.timeStamp || performance.now()) - state.lastCompositionEndAt) < 50;
-        if (ev.isComposing || state.isComposing || ev.keyCode === 229 || justEndedIme) return;
+        var inIme = ev.isComposing || state.isComposing || ev.keyCode === 229 || justEndedIme;
+        if (ev.key === "Escape") {
+          if (state.stickerOpen && U() && U().closeStickerPicker) { U().closeStickerPicker(uiCtx()); return; }
+          if (state.slashMenuOpen) { state.slashMenuOpen = false; renderComposerBanners(); return; }
+          if (state.editingMsgId || state.replyingToMsg) { state.editingMsgId = null; state.editingText = ""; state.replyingToMsg = null; renderComposerBanners(); return; }
+          if (state.studioOpen || state.vaultOpen) { state.studioOpen = false; state.vaultOpen = false; renderSheets(); return; }
+          return;
+        }
+        if (state.slashMenuOpen && !inIme) {
+          var filteredCmds = (U() && U().getFilteredSlashCommands) ? U().getFilteredSlashCommands(taEl.value, SLASH_COMMANDS) : SLASH_COMMANDS;
+          if (filteredCmds.length && (ev.key === "ArrowDown" || ev.key === "ArrowUp")) {
+            ev.preventDefault();
+            var delta = ev.key === "ArrowDown" ? 1 : -1;
+            state.slashActiveIdx = (state.slashActiveIdx + delta + filteredCmds.length) % filteredCmds.length;
+            if (U() && U().renderSlashMenu) U().renderSlashMenu(uiCtx(), taEl.value, SLASH_COMMANDS);
+            return;
+          }
+          if (filteredCmds.length && (ev.key === "Tab" || (ev.key === "Enter" && !ev.shiftKey))) {
+            ev.preventDefault();
+            var picked = filteredCmds[Math.max(0, Math.min(filteredCmds.length - 1, state.slashActiveIdx))];
+            if (picked) {
+              state.slashMenuOpen = false;
+              taEl.value = picked.cmd; autoFitTextarea(taEl); renderComposerBanners();
+              if (picked.cmd.slice(-1) !== " ") submitTurn(); else taEl.focus();
+            }
+            return;
+          }
+        }
+        if (ev.key === "ArrowUp" && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !inIme && !taEl.value.trim()) {
+          var rm = getRoomMessages(state.activeBotId), lastUser = null;
+          for (var ui = rm.length - 1; ui >= 0; ui--) {
+            if (rm[ui] && rm[ui].role === "user" && rm[ui].kind !== "bot_message") { lastUser = rm[ui]; break; }
+          }
+          if (lastUser) {
+            ev.preventDefault();
+            var ce = parseUserQuoteAndAttachments(lastUser.text).body || lastUser.text;
+            state.editingMsgId = lastUser.id; state.editingText = ce; state.replyingToMsg = null;
+            taEl.value = ce; autoFitTextarea(taEl); renderComposerBanners();
+          }
+          return;
+        }
+        if (ev.key !== "Enter" || ev.shiftKey || inIme) return;
         ev.preventDefault();
         var curBot = getActiveBot();
         if (state.streamsByBot[curBot.id] || state.sendingByBot[curBot.id]) return;
@@ -566,9 +629,10 @@ window.__ModuleLoader__.load({
       });
       taEl.addEventListener("input", function () {
         autoFitTextarea(taEl);
-        var v = taEl.value;
-        var wantSlash = v.indexOf("/") === 0 && v.indexOf(" ") === -1 && v.length <= 14;
-        if (wantSlash !== state.slashMenuOpen) { state.slashMenuOpen = wantSlash; renderComposerBanners(); }
+        var v = taEl.value, wantSlash = v.indexOf("/") === 0 && v.indexOf(" ") === -1 && v.length <= 14;
+        if (wantSlash) state.slashActiveIdx = 0;
+        if (wantSlash || wantSlash !== state.slashMenuOpen) { state.slashMenuOpen = wantSlash; renderComposerBanners(); }
+        else updateComposerButtons();
       });
       taEl.addEventListener("paste", function (ev) {
         var items = ev.clipboardData && ev.clipboardData.items;
@@ -630,49 +694,75 @@ window.__ModuleLoader__.load({
 
       pane.addEventListener("click", function (ev) {
         var t = ev.target;
-        var togProc = t.closest("[data-toggle-turn-mid]");
-        if (togProc) {
-          var procCard = togProc.closest(".dsb-turn-process");
-          var midProc = togProc.getAttribute("data-toggle-turn-mid");
-          if (procCard) {
-            var nowOpen = procCard.classList.toggle("is-open");
-            if (midProc) {
-              if (nowOpen) state.expandedProcessIds[midProc] = true;
-              else delete state.expandedProcessIds[midProc];
-            }
+        var mPopOpen = document.getElementById("dsb-more-pop");
+        if (mPopOpen && mPopOpen.classList.contains("is-open") && !t.closest("#dsb-more-pop") && !t.closest("#dsb-btn-more")) mPopOpen.classList.remove("is-open");
+        if (state.stickerOpen && !t.closest("#dsb-sticker-pop") && !t.closest("#dsb-sticker-btn") && U() && U().closeStickerPicker) U().closeStickerPicker(uiCtx());
+        if (t.closest("#dsb-sticker-btn")) {
+          if (U() && U().ensureStickerToggleBound) U().ensureStickerToggleBound(uiCtx());
+          if (!Object.prototype.hasOwnProperty.call(HTMLElement.prototype, "popover")) {
+            if (U() && U().toggleStickerPicker) U().toggleStickerPicker(uiCtx()); else showToast("表情模块加载中");
+          } else if (!U()) showToast("表情模块加载中");
+          return;
+        }
+        var stkPackBtn = t.closest("[data-sticker-pack]");
+        if (stkPackBtn) { state.activeStickerPackId = stkPackBtn.getAttribute("data-sticker-pack") || ""; if (U() && U().renderStickerPopover) U().renderStickerPopover(uiCtx()); return; }
+        var sendStkBtn = t.closest("[data-send-sticker]");
+        if (sendStkBtn) { if (U() && U().sendStickerCode) U().sendStickerCode(uiCtx(), sendStkBtn.getAttribute("data-send-sticker"), sendStkBtn.getAttribute("data-sticker-url")); return; }
+        if (t.closest("#dsb-scroll-bottom-btn")) {
+          var scEl = document.getElementById("dsb-chat-scroll");
+          if (scEl) {
+            var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+            try { scEl.scrollTo({ top: scEl.scrollHeight, behavior: reduce ? "auto" : "smooth" }); } catch (e) { scEl.scrollTop = scEl.scrollHeight; }
+            state.unreadWhileScrolledUp = false; if (U() && U().updateScrollBottomPill) U().updateScrollBottomPill(uiCtx(), false);
           }
+          return;
+        }
+        if (t.closest("#dsb-head-status")) {
+          if (!state.vpsOnline) apiCall("/local/reconnect", "POST", {}).then(function () { showToast("正在重连云端中枢…"); syncNow(true); });
+          else openBotStudio("edit");
+          return;
+        }
+        var starterBtn = t.closest("[data-send-starter]");
+        if (starterBtn) {
+          var sp = starterBtn.getAttribute("data-send-starter") || "";
+          if (sp) { if (/[：:]$/.test(sp.trim())) { taEl.value = sp; autoFitTextarea(taEl); taEl.focus(); renderComposerBanners(); } else { taEl.value = sp; submitTurn(); } }
+          return;
+        }
+        if (t.closest("#dsb-btn-more") && !Object.prototype.hasOwnProperty.call(HTMLElement.prototype, "popover")) {
+          var mp = document.getElementById("dsb-more-pop"), mb2 = document.getElementById("dsb-btn-more");
+          if (mp && mb2) {
+            if (R() && R().buildHeaderMoreMenuHtml) mp.innerHTML = R().buildHeaderMoreMenuHtml(state);
+            var r2 = mb2.getBoundingClientRect();
+            mp.style.top = Math.round(r2.bottom + 6) + "px"; mp.style.right = Math.max(10, Math.round(window.innerWidth - r2.right)) + "px"; mp.style.left = "auto";
+            mp.classList.toggle("is-open");
+          }
+          return;
+        }
+        var moreActBtn = t.closest("[data-more-act]");
+        if (moreActBtn) {
+          var mAct = moreActBtn.getAttribute("data-more-act"), mPop = document.getElementById("dsb-more-pop");
+          if (mPop) { if (typeof mPop.hidePopover === "function") try { mPop.hidePopover(); } catch (e) {} mPop.classList.remove("is-open"); }
+          if (mAct === "theme") toggleTheme();
+          else if (mAct === "files") openVaultSheet("", "files");
+          else if (mAct === "compact") runCompact();
+          else if (mAct === "create") openBotStudio("create");
+          else if (mAct === "cmdk" && U() && U().openCommandPalette) U().openCommandPalette(uiCtx());
           return;
         }
         var imgEl = t.closest("[data-lightbox-src]"), copyCodeBtn = t.closest("[data-copy-code]");
         if (imgEl) { openLightbox(imgEl.getAttribute("data-lightbox-src")); return; }
         var dlFileBtn = t.closest("[data-dl-file]");
-        if (dlFileBtn) {
-          ev.stopPropagation();
-          var card = dlFileBtn.closest("[data-open-file]");
-          if (U() && U().triggerFileDownload) U().triggerFileDownload(dlFileBtn.getAttribute("data-dl-file"), card ? card.getAttribute("data-file-name") : "");
-          return;
-        }
+        if (dlFileBtn) { ev.stopPropagation(); var card = dlFileBtn.closest("[data-open-file]"); if (U() && U().triggerFileDownload) U().triggerFileDownload(dlFileBtn.getAttribute("data-dl-file"), card ? card.getAttribute("data-file-name") : ""); return; }
         var openFileCard = t.closest("[data-open-file]");
-        if (openFileCard) {
-          if (U() && U().openFilePreview) {
-            U().openFilePreview(escapeHtml, openFileCard.getAttribute("data-open-file"), openFileCard.getAttribute("data-file-name"), openFileCard.getAttribute("data-file-ext"), openFileCard.getAttribute("data-download-url"));
-          }
+        if (openFileCard) { if (U() && U().openFilePreview) U().openFilePreview(escapeHtml, openFileCard.getAttribute("data-open-file"), openFileCard.getAttribute("data-file-name"), openFileCard.getAttribute("data-file-ext"), openFileCard.getAttribute("data-download-url")); return; }
+        if (copyCodeBtn) {
+          var codeTxt = decodeURIComponent(copyCodeBtn.getAttribute("data-copy-code") || "");
+          if (U() && U().copyTextWithFeedback) U().copyTextWithFeedback(uiCtx(), copyCodeBtn, codeTxt, "代码已复制");
+          else { navigator.clipboard.writeText(codeTxt); showToast("代码已复制"); }
           return;
         }
-        if (copyCodeBtn) { navigator.clipboard.writeText(decodeURIComponent(copyCodeBtn.getAttribute("data-copy-code") || "")); showToast("代码已复制"); return; }
-        if (t.closest("#dsb-btn-theme")) { state.themeManual = true; state.theme = state.theme === "dark" ? "light" : "dark"; try { window.localStorage.setItem("dsb_theme", state.theme); } catch (e) {} applyLayoutClasses(); renderHeaderAndPins(); return; }
-        if (t.closest("#dsb-btn-files")) { openVaultSheet("", "files"); return; }
         if (t.closest("#dsb-btn-vault")) { openVaultSheet("", "notes"); return; }
         if (t.closest("#dsb-btn-studio")) { openBotStudio("edit"); return; }
-        if (t.closest("#dsb-btn-compact")) {
-          if (state.compactBusy) return; state.compactBusy = true; renderHeaderAndPins();
-          apiCall("/local/infinite-chat/compact", "POST", { bot_id: state.activeBotId }).then(function (r) {
-            state.compactBusy = false;
-            if (!r || r.ok === false) { renderHeaderAndPins(); showToast("上下文浓缩失败: " + ((r && r.error) || "网络异常")); return; }
-            applySyncPayload(r); renderChatStream(true); showToast("上下文浓缩归档完成");
-          });
-          return;
-        }
         if (t.closest("#dsb-btn-close")) { closeWorkspacePanel(); return; }
         if (t.closest("#dsb-attach-btn")) { filePicker.click(); return; }
         if (t.closest("#dsb-mic-btn")) { toggleVoiceDictation(); return; }
@@ -682,7 +772,7 @@ window.__ModuleLoader__.load({
           updateComposerButtons(); renderChatStream(false); return;
         }
         var selBot = t.closest("[data-select-bot]"); if (selBot) { selectBot(selBot.getAttribute("data-select-bot")); return; }
-        var fltBtn = t.closest("[data-bot-filter]"); if (fltBtn) { state.botFilter = fltBtn.getAttribute("data-bot-filter"); renderHomeRail(); return; }
+        if (t.closest("[data-bot-filter]")) return;
         if (t.closest("[data-open-create-bot]")) { openBotStudio("create"); return; }
         if (t.closest("[data-toggle-pinbar]")) { state.pinBarExpanded = !state.pinBarExpanded; renderHeaderAndPins(); return; }
         var unpinBtn = t.closest("[data-unpin-id]");
@@ -703,142 +793,49 @@ window.__ModuleLoader__.load({
         if (t.closest("[data-cancel-edit]")) { state.editingMsgId = null; state.editingText = ""; taEl.value = ""; autoFitTextarea(taEl); renderComposerBanners(); return; }
         if (t.closest("[data-cancel-reply]")) { state.replyingToMsg = null; renderComposerBanners(); return; }
         var rmAtt = t.closest("[data-rm-att]");
-        if (rmAtt) {
-          var rmIdx = Number(rmAtt.getAttribute("data-rm-att"));
-          if (U() && U().removePendingAttachment) U().removePendingAttachment(uiCtx(), rmIdx);
-          else { state.pendingAttachments.splice(rmIdx, 1); renderComposerBanners(); }
-          return;
-        }
-        var retryAtt = t.closest("[data-retry-att]");
-        if (retryAtt) {
-          if (U() && U().retryAttachment) U().retryAttachment(uiCtx(), Number(retryAtt.getAttribute("data-retry-att")));
-          return;
-        }
-        var prevAtt = t.closest("[data-preview-att]");
-        if (prevAtt) {
-          var pItem = state.pendingAttachments[Number(prevAtt.getAttribute("data-preview-att"))];
-          if (pItem && pItem.thumbUrl) openLightbox(pItem.thumbUrl);
-          return;
-        }
+        if (rmAtt) { var rmIdx = Number(rmAtt.getAttribute("data-rm-att")); if (U() && U().removePendingAttachment) U().removePendingAttachment(uiCtx(), rmIdx); else { state.pendingAttachments.splice(rmIdx, 1); renderComposerBanners(); } return; }
+        var retryAtt = t.closest("[data-retry-att]"); if (retryAtt) { if (U() && U().retryAttachment) U().retryAttachment(uiCtx(), Number(retryAtt.getAttribute("data-retry-att"))); return; }
+        var prevAtt = t.closest("[data-preview-att]"); if (prevAtt) { var pItem = state.pendingAttachments[Number(prevAtt.getAttribute("data-preview-att"))]; if (pItem && pItem.thumbUrl) openLightbox(pItem.thumbUrl); return; }
         var choiceBtn = t.closest("[data-send-choice]"); if (choiceBtn) { taEl.value = choiceBtn.getAttribute("data-send-choice") || ""; submitTurn(); return; }
-
-        var swVarBtn = t.closest("[data-switch-variant]");
-        if (swVarBtn) {
-          var vMid = swVarBtn.getAttribute("data-mid"), vIdx = Number(swVarBtn.getAttribute("data-vidx"));
-          var targetM = state.messages.find(function (x) { return x && x.id === vMid; });
-          if (targetM && Array.isArray(targetM.variants) && targetM.variants[vIdx]) {
-            var selV = targetM.variants[vIdx];
-            targetM.active_variant_idx = vIdx;
-            targetM.text = String(selV.text || "");
-            targetM.thought = String(selV.thought || "");
-            targetM.tool_trace = Array.isArray(selV.trace) ? selV.trace : [];
-            targetM.turn_steps = Array.isArray(selV.turn_steps) ? selV.turn_steps : [];
-            targetM.timeline = Array.isArray(selV.timeline) ? selV.timeline : [];
-            targetM.sticker = String(selV.sticker || "");
-            targetM.attachments = Array.isArray(selV.attachments) ? selV.attachments : [];
-            targetM.choices = Array.isArray(selV.choices) ? selV.choices : [];
-            targetM.tps = Number(selV.tps || 0);
-            targetM.ttft_ms = Number(selV.ttft_ms || 0);
-            targetM.cache_hit_pct = Number(selV.cache_hit_pct || 0);
-            state.lastStreamSig = "";
-            renderChatStream(false);
-          }
-          apiCall("/local/infinite-chat/variant", "POST", { bot_id: state.activeBotId, message_id: vMid, variant_idx: vIdx }).then(function (r) {
-            if (!r || r.ok === false) { showToast("切换版本失败: " + ((r && r.error) || "网络异常")); return; }
-            applySyncPayload(r);
-            renderChatStream(false);
-          });
-          return;
-        }
-
+        var swVarBtn = t.closest("[data-switch-variant]"); if (swVarBtn && U() && U().switchMessageVariantLocal) { U().switchMessageVariantLocal(uiCtx(), swVarBtn); return; }
         var actBtn = t.closest("[data-act]");
         if (actBtn) {
           var act = actBtn.getAttribute("data-act"), mid = actBtn.getAttribute("data-mid"), msgObj = state.messages.find(function (x) { return x.id === mid; });
           if (!msgObj) return;
-          if (act === "copy") { navigator.clipboard.writeText(msgObj.text || ""); showToast("已复制到剪贴板"); }
+          if (act === "copy") { if (U() && U().copyTextWithFeedback) U().copyTextWithFeedback(uiCtx(), actBtn, msgObj.text || "", "已复制到剪贴板"); else { navigator.clipboard.writeText(msgObj.text || ""); showToast("已复制到剪贴板"); } }
           else if (act === "reply") { state.replyingToMsg = msgObj; state.editingMsgId = null; renderComposerBanners(); taEl.focus(); }
           else if (act === "edit") { var cleanEdit = parseUserQuoteAndAttachments(msgObj.text).body || msgObj.text; state.editingMsgId = msgObj.id; state.editingText = cleanEdit; state.replyingToMsg = null; taEl.value = cleanEdit; autoFitTextarea(taEl); renderComposerBanners(); taEl.focus(); }
           else if (act === "reroll") { state.sendingByBot[state.activeBotId] = true; updateComposerButtons(); apiCall("/local/infinite-chat/reroll", "POST", { bot_id: state.activeBotId, message_id: msgObj.id }).then(function (r) { delete state.sendingByBot[state.activeBotId]; if (!r || r.ok === false) showToast("重发失败: " + ((r && r.error) || "网络异常")); applySyncPayload(r); renderChatStream(true); }); }
           else if (act === "pin") { apiCall("/local/vault", "POST", { op: "pin", text: String(msgObj.text || "").slice(0, 360) }).then(function (r) { if (!r || r.ok === false) { showToast("置顶失败: " + ((r && r.error) || "网络异常")); return; } if (Array.isArray(r.pins)) state.vaultPinned = r.pins; renderHeaderAndPins(); showToast("已钉入跨端置顶记忆"); }); }
           return;
         }
-
-        // Sheet actions
-        var closeS = t.closest("[data-close-sheet]");
-        if (closeS && (closeS.getAttribute("data-close-sheet") !== "mask" || t === closeS)) { state.studioOpen = false; state.vaultOpen = false; renderSheets(); renderHeaderAndPins(); return; }
-
-        var pickCol = t.closest("[data-pick-color]"); if (pickCol) { syncStudioDraftFromInputs(); state.editBotColor = pickCol.getAttribute("data-pick-color"); renderSheets(); return; }
-        var pickSh = t.closest("[data-pick-shape]"); if (pickSh) { syncStudioDraftFromInputs(); state.editBotShape = pickSh.getAttribute("data-pick-shape"); renderSheets(); return; }
-        if (t.closest("[data-export-bot]")) { if (R() && R().exportBotArchive) R().exportBotArchive(apiCall, state.activeBotId, showToast); return; }
-        if (t.closest("[data-import-bot]")) {
-          if (R() && R().pickAndImportBotArchive) R().pickAndImportBotArchive(apiCall, function (r) {
-            if (r && Array.isArray(r.bots)) state.bots = r.bots; if (r && r.active_bot_id) state.activeBotId = r.active_bot_id; if (r && Array.isArray(r.messages)) state.messages = r.messages;
-            state.studioOpen = false; renderSheets(); renderRightLauncher(); renderHomeRail(); renderHeaderAndPins(); renderChatStream(true);
-          }, showToast);
-          return;
-        }
-        if (t.closest("[data-save-bot]")) {
-          syncStudioDraftFromInputs(); if (!state.editBotName.trim()) { showToast("请输入助理名称"); return; }
-          var isCr = state.studioMode === "create";
-          apiCall(isCr ? "/local/bots/create" : "/local/bots/update", "POST", {
-            bot_id: isCr ? "" : state.activeBotId, name: state.editBotName.trim(), description: state.editBotDesc.trim(),
-            color: state.editBotColor, shape: state.editBotShape, instructions: state.editBotPersona, persona: state.editBotPersona, model: state.editBotModel, curiosity_enabled: state.editBotCuriosity
-          }).then(function (r) {
-            if (!r || r.ok === false) { showToast("保存失败: " + ((r && r.error) || "网络异常")); return; }
-            if (Array.isArray(r.bots)) state.bots = r.bots; if (isCr && r.bot && r.bot.id) state.activeBotId = r.bot.id;
-            state.studioOpen = false; renderSheets(); renderRightLauncher(); renderHomeRail(); renderHeaderAndPins(); renderChatStream(true);
-            showToast(r.cloud_warning ? "本地已保存（云端同步异常: " + r.cloud_warning + "）" : (isCr ? "已创建新助理" : "助理设定已保存"));
-          });
-          return;
-        }
-        if (t.closest("[data-delete-bot]")) {
-          apiCall("/local/bots/delete", "POST", { bot_id: state.activeBotId }).then(function (r) {
-            if (!r || r.ok === false) { showToast("删除失败: " + ((r && r.error) || "操作失败")); return; }
-            if (Array.isArray(r.bots)) state.bots = r.bots; state.activeBotId = r.active_bot_id || "pc_engineer";
-            state.studioOpen = false; renderSheets(); renderRightLauncher(); renderHomeRail(); renderHeaderAndPins(); renderChatStream(true); showToast("助理已删除");
-          });
-          return;
-        }
-        var vTab = t.closest("[data-vault-tab]"); if (vTab) { state.vaultTab = vTab.getAttribute("data-vault-tab"); if (state.vaultTab === "files") loadSharedFiles(); else renderSheets(); return; }
-        if (t.closest("[data-refresh-files]")) { loadSharedFiles(); return; }
-        var syncBtn = t.closest("[data-sync-file]");
-        if (syncBtn) {
-          var dir = syncBtn.getAttribute("data-sync-file"), sp = syncBtn.getAttribute("data-sync-path"); state.vaultStatusMsg = "正在同步 " + sp + "…"; renderSheets();
-          apiCall("/local/files/sync", "POST", { direction: dir, path: sp }).then(function (r) {
-            state.vaultStatusMsg = r && r.ok ? "同步完成: " + (r.workspace_path || r.name || sp) : "同步失败: " + ((r && r.error) || "unknown");
-            showToast(r && r.ok ? "跨端文件同步成功" : state.vaultStatusMsg); loadSharedFiles();
-          });
-          return;
-        }
-        var vPath = t.closest("[data-vault-path]"); if (vPath) { loadVaultFile(vPath.getAttribute("data-vault-path")); return; }
-        if (t.closest("[data-save-vault]")) {
-          var ed = document.getElementById("dsb-vault-editor"); if (!ed || !state.vaultSelectedPath) return; state.vaultSelectedContent = ed.value;
-          apiCall("/local/vault", "POST", { op: "write", path: state.vaultSelectedPath, content: ed.value }).then(function (r) {
-            state.vaultStatusMsg = r && r.ok ? "已保存 " + new Date().toLocaleTimeString("zh-CN", { hour12: false }) : "保存失败: " + ((r && r.error) || "网络异常");
-            renderSheets(); showToast(r && r.ok ? "记忆文档已保存" : state.vaultStatusMsg);
-          });
-          return;
-        }
-        if (t.closest("[data-add-pin]")) {
-          var pinInp = document.getElementById("dsb-new-pin-inp"), pTxt = pinInp ? pinInp.value.trim() : ""; if (!pTxt) return;
-          apiCall("/local/vault", "POST", { op: "pin", text: pTxt }).then(function (r) {
-            if (!r || r.ok === false) { showToast("添加置顶失败: " + ((r && r.error) || "网络异常")); return; }
-            if (Array.isArray(r.pins)) state.vaultPinned = r.pins; renderHeaderAndPins(); renderSheets(); showToast("已添加置顶记忆");
-          });
-        }
+        if (U() && U().handleSheetClickAction && U().handleSheetClickAction(uiCtx(), t)) return;
       });
       applyLayoutClasses(); renderHeaderAndPins(); renderComposerBanners();
     }
     function syncStudioDraftFromInputs() { if (U() && U().syncStudioDraftFromInputs) U().syncStudioDraftFromInputs(state); }
     function openLightbox(src) { if (U() && U().openLightbox) U().openLightbox(escapeHtml, src); }
-    var assetsLoading = false;
+    var assetsLoading = false, assetsRetryTimer = null;
+    function isStylesLoaded() {
+      var el = document.getElementById("dsb-companion-styles");
+      return Boolean(el && el.getAttribute("data-loaded") === "1");
+    }
     function loadUiAssets() {
       if (assetsLoading) return; assetsLoading = true;
       apiCall("/local/ui-assets", "GET", null).then(function (r) {
         assetsLoading = false;
-        if (r && r.css) injectStyles(r.css);
+        if (r && r.ok !== false && r.css) {
+          if (assetsRetryTimer) { clearTimeout(assetsRetryTimer); assetsRetryTimer = null; }
+          injectStyles(r.css);
+        } else if (state.viewActive && !assetsRetryTimer) {
+          assetsRetryTimer = setTimeout(function () {
+            assetsRetryTimer = null;
+            if (state.viewActive && (!isStylesLoaded() || !window.__DSB_RENDER__ || !window.__DSB_CLIENT_UI__)) loadUiAssets();
+          }, 1800);
+        }
         if (r && r.render_js && !window.__DSB_RENDER__) { var s = document.createElement("script"); s.textContent = r.render_js; document.head.appendChild(s); }
         if (r && r.client_ui_js && !window.__DSB_CLIENT_UI__) { var s2 = document.createElement("script"); s2.textContent = r.client_ui_js; document.head.appendChild(s2); }
+        if (U() && U().ensureStickerToggleBound) U().ensureStickerToggleBound(uiCtx());
         if (r && r.data_url) state.whaleAvatarUrl = r.data_url;
         var oldPane = document.getElementById("dsb-split-pane");
         if (oldPane && window.__DSB_RENDER__ && !oldPane.querySelector("svg")) oldPane.remove();
@@ -884,11 +881,13 @@ window.__ModuleLoader__.load({
               loadUiAssets();
               syncNow(true);
               renderChatStream(true);
+              if (typeof syncKickFn === "function") syncKickFn(50);
               return function () {
                 if (activeSlotHost === hostEl) activeSlotHost = null;
                 state.viewActive = false;
                 var pane = document.getElementById("dsb-split-pane");
                 if (pane) pane.classList.remove("is-open");
+                if (typeof syncKickFn === "function") syncKickFn();
               };
             }, []);
             return React.createElement("div", {
@@ -909,7 +908,7 @@ window.__ModuleLoader__.load({
         hostLayout = (ctx && ctx.layout) || null;
         renderNativeSidebarMount();
         registerDshNativeSlots(ctx);
-        var themeObs = null;
+        var themeObs = null, themeMql = null;
         if (typeof MutationObserver !== "undefined" && document.body) {
           themeObs = new MutationObserver(function () {
             if (!state.themeManual) {
@@ -919,19 +918,63 @@ window.__ModuleLoader__.load({
           });
           themeObs.observe(document.body, { attributes: true, attributeFilter: ["data-ds-dark-theme"] });
         }
+        var onMqlChange = function () {
+          if (!state.themeManual) { applyLayoutClasses(); renderHeaderAndPins(); }
+        };
+        if (typeof window !== "undefined" && window.matchMedia) {
+          themeMql = window.matchMedia("(prefers-color-scheme: dark)");
+          if (themeMql && typeof themeMql.addEventListener === "function") themeMql.addEventListener("change", onMqlChange);
+        }
         var boot = function () { renderNativeSidebarMount(); loadUiAssets(); };
         if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else setTimeout(boot, 30);
-        var tick = 0, timer = setInterval(function () {
-          tick++;
-          renderNativeSidebarMount();
-          if ((!window.__DSB_RENDER__ || !window.__DSB_CLIENT_UI__) && tick % 3 === 0) loadUiAssets();
-          if (state.viewActive || Object.keys(state.sendingByBot).length > 0 || Object.keys(state.streamsByBot).length > 0) syncNow(false);
-        }, 1200);
-        window.__dsbTimer = timer;
+        var syncTimer = null;
+        var scheduleNextSync = function (overrideMs) {
+          if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+          var hidden = (typeof document !== "undefined" && document.hidden) || state.paneSkipped;
+          var hasActive = Object.keys(state.sendingByBot).length > 0 || Object.keys(state.streamsByBot).length > 0;
+          if (hidden || (!state.viewActive && !hasActive)) return;
+          var delay = typeof overrideMs === "number" ? overrideMs : (hasActive ? 240 : 2400);
+          syncTimer = setTimeout(function () {
+            syncTimer = null;
+            renderNativeSidebarMount();
+            if ((!isStylesLoaded() || !window.__DSB_RENDER__ || !window.__DSB_CLIENT_UI__) && !assetsLoading) loadUiAssets();
+            syncNow(false);
+          }, delay);
+        };
+        syncKickFn = scheduleNextSync;
+        var onVisChange = function () {
+          if (typeof document !== "undefined" && !document.hidden) { syncNow(false); scheduleNextSync(60); }
+          else if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+        };
+        var onDocKeyDown = function (ev) {
+          if ((ev.ctrlKey || ev.metaKey) && String(ev.key || "").toLowerCase() === "k" && state.viewActive) {
+            ev.preventDefault();
+            if (U() && U().openCommandPalette) U().openCommandPalette(uiCtx());
+            return;
+          }
+          if (ev.key === "Escape" && state.viewActive && (state.studioOpen || state.vaultOpen)) {
+            state.studioOpen = false; state.vaultOpen = false; renderSheets(); renderHeaderAndPins();
+          }
+        };
+        if (typeof document !== "undefined") {
+          document.addEventListener("visibilitychange", onVisChange);
+          document.addEventListener("keydown", onDocKeyDown);
+        }
+        window.__dsbTimer = syncTimer;
         var dispose = function () {
-          clearInterval(timer);
-          if (window.__dsbTimer === timer) window.__dsbTimer = null;
+          if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+          if (assetsRetryTimer) { clearTimeout(assetsRetryTimer); assetsRetryTimer = null; }
+          syncKickFn = null;
+          voiceRecorder.cancelled = true;
+          if (U() && U().stopVoiceRecorder) U().stopVoiceRecorder(uiCtx(), voiceRecorder);
+          if (typeof document !== "undefined") {
+            document.removeEventListener("visibilitychange", onVisChange);
+            document.removeEventListener("keydown", onDocKeyDown);
+          }
           if (themeObs) { try { themeObs.disconnect(); } catch (e) {} themeObs = null; }
+          if (themeMql && typeof themeMql.removeEventListener === "function") {
+            try { themeMql.removeEventListener("change", onMqlChange); } catch (e) {}
+          }
         };
         if (ctx && typeof ctx.effect === "function") ctx.effect(function () { return dispose; });
         else if (ctx && typeof ctx.on === "function") ctx.on("dispose", dispose);

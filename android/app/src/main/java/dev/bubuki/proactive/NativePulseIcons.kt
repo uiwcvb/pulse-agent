@@ -1,12 +1,6 @@
 package dev.bubuki.proactive
 
 import android.graphics.Paint
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.keyframes
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -69,7 +63,8 @@ private val nativePaths = mapOf(
     "hide" to "M3.5 3.5L20.5 20.5M10.6 5.2L12 5C18 5 21.5 12 21.5 12L18.8 15.3M6.6 6.6C4.2 8.9 2.5 12 2.5 12C2.5 12 6 19 12 19C14.7 19 17 17.7 17 17.7",
     "vault" to "M12 3.5L20.5 8L12 12.5L3.5 8L12 3.5ZM3.5 12L12 16.5L20.5 12M3.5 16L12 20.5L20.5 16",
     "moon" to "M20.2 13.4C16.5 14.3 10.2 10.5 11.1 3.8C2.4 4.7 1.4 19.2 12.2 20.4C18.5 20.4 19.8 15.5 20.2 13.4Z",
-    "bell" to "M5.5 10C5.5 2 18.5 2 18.5 10C18.5 16.2 21 16.8 21 16.8H3C3 16.8 5.5 16.2 5.5 10M9.5 19.5C9.5 22.5 14.5 22.5 14.5 19.5"
+    "bell" to "M5.5 10C5.5 2 18.5 2 18.5 10C18.5 16.2 21 16.8 21 16.8H3C3 16.8 5.5 16.2 5.5 10M9.5 19.5C9.5 22.5 14.5 22.5 14.5 19.5",
+    "share" to "M7.5 8.5H17.5L14.2 5.2M16.5 15.5H6.5L9.8 18.8"
 )
 
 @Composable

@@ -455,3 +455,107 @@ def test_enqueue_chat_preempts_slow_curiosity_without_killing_scheduler(tmp_path
     asyncio.run(run())
     last_bot_msg = [m for m in store.state["messages"] if m.get("role") == "assistant"][-1]
     assert "立刻插队处理喵" in last_bot_msg["text"]
+
+
+def test_sticker_protocol_rewrite_resolver_timeline_and_user_enqueue(tmp_path, monkeypatch):
+    from brain import Brain
+    from escalation import Escalation
+    from harness import Harness
+    from storage import Store
+    from vault_manager import Vault
+
+    monkeypatch.setenv("AGENT_TOKEN", "test-private-token")
+    store = Store(tmp_path)
+    store.update_config({"api_key": "sk-test", "default_model": "deepseek-chat", "enabled": True})
+    vault = Vault(tmp_path / "memory_vault")
+    harness = Harness(tmp_path / "workspace", store=store, vault=vault)
+    events = []
+
+    async def pub(ev):
+        events.append(ev)
+
+    harness.extension_registry.register_sticker_pack(
+        "fubuki",
+        "白上吹雪表情包",
+        {
+            "wink": {"label": "眨眼得意", "file": "wink.png"},
+            "comfy": {"label": "裹被子贴贴", "file": "comfy.png"},
+            "smug": {"label": "得意大笑", "file": "smug.png"},
+        },
+        enabled=True,
+    )
+    brain = Brain(store, vault, harness, pub, Escalation(store, vault, pub))
+
+    # 1. Strict 3-tier resolver & complete stickers array in summary()
+    reg = harness.extension_registry
+    assert reg.resolve_sticker_info("wink")["url"] == "/stickers/fubuki/wink.png"
+    assert reg.resolve_sticker_info("fubuki/wink")["code"] == "wink"
+    assert reg.resolve_sticker_info("wink.png")["code"] == "wink"
+    assert reg.resolve_sticker_info("眨眼得意")["code"] == "wink"
+    assert reg.resolve_sticker_info("[表情：裹被子贴贴]")["code"] == "comfy"
+    assert reg.resolve_sticker_info("<sticker:comfy>")["code"] == "comfy"
+    # Reject 1-char false positives
+    assert reg.resolve_sticker_info("笑") is None
+    assert reg.resolve_sticker_info("一") is None
+
+    packs = reg.summary()["sticker_packs"]
+    assert len(packs) == 1
+    assert isinstance(packs[0]["stickers"], list) and len(packs[0]["stickers"]) == 3
+    assert packs[0]["stickers"][0]["code"] == "wink"
+    assert packs[0]["stickers"][0]["url"] == "/stickers/fubuki/wink.png"
+
+    # 2. Prompt uses native reply(op="sticker", code=...) instead of teaching XML tags
+    hint = reg.sticker_prompt_hint()
+    assert 'reply(op="sticker"' in hint
+    assert "严禁在正文中手写" in hint
+    assert "可在回复末尾顺手附带一个表情包标签" not in hint
+
+    # 3. Trailing partial control tag stripping preserves math comparisons
+    assert brain.strip_trailing_partial_control_tag("剩下的交给余。<s") == "剩下的交给余。"
+    assert brain.strip_trailing_partial_control_tag("剩下的交给余。<st") == "剩下的交给余。"
+    assert brain.strip_trailing_partial_control_tag("剩下的交给余。<sticker:co") == "剩下的交给余。"
+    assert brain.strip_trailing_partial_control_tag("价格在 a < 5 且 1 < 2 之间") == "价格在 a < 5 且 1 < 2 之间"
+
+    async def fake_complete(messages, tools=None, big=False):
+        return {"role": "assistant", "content": "好的喵～", "tool_calls": []}
+
+    brain.complete = fake_complete
+
+    async def scenario():
+        # 4. Native reply(op="sticker", ...) tool call + invalid code error handling
+        res_ok = await brain._tool_reply({"op": "sticker", "code": "comfy"})
+        assert res_ok["ok"] is True and res_ok["sticker"] == "/stickers/fubuki/comfy.png"
+        res_bad = await brain._tool_reply({"op": "sticker", "code": "笑"})
+        assert res_bad["ok"] is False and "available_codes" in res_bad
+
+        # 5. emit() strips legacy <sticker:...> from text, llm_text, AND timeline, while queueing sticker URL
+        brain.pending_sticker_var.set("")
+        brain.pending_stickers_var.set(())
+        emitted = await brain.emit(
+            "剩下的交给余，主人去睡吧。<sticker:comfy>",
+            "chat",
+            timeline=[
+                {"type": "tool", "tool": "web", "status": "done"},
+                {"type": "text", "text": "剩下的交给余，主人去睡吧。<sticker:comfy>"},
+            ],
+        )
+        assert "<sticker" not in emitted["text"]
+        assert "<sticker" not in emitted["llm_text"]
+        assert emitted["sticker"] == "/stickers/fubuki/comfy.png"
+        assert "<sticker" not in emitted["timeline"][1]["text"]
+        assert emitted["timeline"][1]["text"] == "剩下的交给余，主人去睡吧。"
+
+        # 6. enqueue_chat recognizes user sticker messages [sticker:wink] and [表情: 眨眼得意]
+        enq1 = await brain.enqueue_chat("[sticker:wink]", bot_id="companion", source="phone")
+        assert enq1["user_message"]["sticker"] == "/stickers/fubuki/wink.png"
+        assert "眨眼得意" in enq1["user_message"]["llm_text"]
+        for t in list(brain.queued_tasks_by_node_bot.get("phone:companion") or ()):
+            await t
+
+        enq2 = await brain.enqueue_chat("[表情: 眨眼得意]", bot_id="companion", source="phone")
+        assert enq2["user_message"]["sticker"] == "/stickers/fubuki/wink.png"
+        assert "眨眼得意" in enq2["user_message"]["llm_text"]
+        for t in list(brain.queued_tasks_by_node_bot.get("phone:companion") or ()):
+            await t
+
+    asyncio.run(scenario())

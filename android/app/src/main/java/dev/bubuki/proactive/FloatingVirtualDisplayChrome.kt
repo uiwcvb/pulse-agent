@@ -405,10 +405,9 @@ internal fun PearlEdgeBubbleComposable(
         }
         ComposePipCircleButton(
             modifier = Modifier
-                .align(Alignment.TopEnd)
-                .size(18.dp)
-                .semantics { contentDescription = "关闭虚拟屏" },
+                .align(Alignment.TopEnd),
             isDanger = true,
+            contentLabel = "关闭虚拟屏",
             onClick = onClose
         ) {
             val strokeW = 1.3.dp.toPx()
@@ -433,8 +432,8 @@ internal fun BoxScope.ExpandedFloatingChromeComposable(
         Modifier
             .align(Alignment.TopCenter)
             .padding(top = 4.dp)
-            .width(34.dp)
-            .height(3.5.dp)
+            .width(36.dp)
+            .height(4.dp)
             .clip(CircleShape)
             .background(Color(0xD8FFFFFF))
             .border(0.5.dp, Color(0x38000000), CircleShape)
@@ -445,7 +444,7 @@ internal fun BoxScope.ExpandedFloatingChromeComposable(
             .padding(start = 6.dp, top = 7.dp)
             .clip(RoundedCornerShape(15.dp))
             .background(Color(0xC218181E))
-            .border(0.75.dp, Color(0x42FFFFFF), RoundedCornerShape(15.dp))
+            .border(0.5.dp, Color(0x42FFFFFF), RoundedCornerShape(15.dp))
             .padding(horizontal = 4.dp, vertical = 2.5.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -459,7 +458,7 @@ internal fun BoxScope.ExpandedFloatingChromeComposable(
                 .background(Color(0x28FFFFFF))
                 .clickable(onClick = onToggleApps)
                 .semantics { contentDescription = "虚拟屏应用抽屉" }
-                .padding(horizontal = 7.dp, vertical = 2.5.dp)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
         )
     }
     Row(
@@ -468,7 +467,7 @@ internal fun BoxScope.ExpandedFloatingChromeComposable(
             .padding(end = 6.dp, top = 7.dp)
             .clip(RoundedCornerShape(15.dp))
             .background(Color(0xC218181E))
-            .border(0.75.dp, Color(0x42FFFFFF), RoundedCornerShape(15.dp))
+            .border(0.5.dp, Color(0x42FFFFFF), RoundedCornerShape(15.dp))
             .padding(horizontal = 4.dp, vertical = 2.5.dp),
         horizontalArrangement = Arrangement.spacedBy(3.5.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -483,11 +482,12 @@ internal fun BoxScope.ExpandedFloatingChromeComposable(
                 .background(Color(0x28FFFFFF))
                 .clickable(onClick = onPromoteFullscreen)
                 .semantics { contentDescription = "全屏虚拟屏" }
-                .padding(horizontal = 6.5.dp, vertical = 2.5.dp)
+                .padding(horizontal = 7.dp, vertical = 4.dp)
         )
         ComposePipCircleButton(
-            modifier = Modifier.size(19.dp).semantics { contentDescription = "关闭虚拟屏" },
+            modifier = Modifier.size(28.dp),
             isDanger = true,
+            contentLabel = "关闭虚拟屏",
             onClick = onClose
         ) {
             val strokeW = 1.4.dp.toPx()
@@ -619,7 +619,7 @@ internal fun InAppVirtualAppDrawerOverlay(
             .padding(start = 8.dp, end = 8.dp, top = 36.dp, bottom = 8.dp)
     ) {
         Row(Modifier.fillMaxWidth().padding(bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("虚拟屏应用 (${apps.size})", color = Color(0xFFF8FAFC), fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
+            Text("虚拟屏应用 (${apps.size})", color = Color(0xFFF8FAFC), fontSize = 11.5.sp, fontWeight = FontWeight.Bold, style = TextStyle(fontFeatureSettings = "tnum"))
             Spacer(Modifier.weight(1f))
             Text(
                 "返回画面 ✕",

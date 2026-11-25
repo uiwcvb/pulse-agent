@@ -6,12 +6,40 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.*;
 import org.json.JSONObject;
 
-/** Root or Wireless-ADB (uid 0 / uid 2000) authorized paste into isolated VirtualDisplay only. */
+/** Root or Wireless-ADB / Shizuku (uid 0 / uid 2000) authorized paste into isolated VirtualDisplay only. */
 final class RootClipboard {
+    private static volatile String sExplicitApkPath = "";
+    static void setApkPath(String path) { sExplicitApkPath = path != null ? path.trim() : ""; }
     RootClipboard(Context ignored){}
     private static boolean isPrivilegedUid() {
         int u = android.os.Process.myUid();
         return u == 0 || u == 2000;
+    }
+    private static String resolveBrokerClasspath() {
+        String explicit = sExplicitApkPath;
+        if (explicit != null && !explicit.isEmpty()) return explicit;
+        String env = System.getenv("CLASSPATH");
+        if (env != null && (env.endsWith(".apk") || env.contains("dev.bubuki.proactive"))) return env;
+        try {
+            Context sys = DisplayRuntime.systemContext();
+            if (sys != null && sys.getPackageManager() != null) {
+                String src = sys.getPackageManager().getApplicationInfo("dev.bubuki.proactive", 0).sourceDir;
+                if (src != null && !src.isEmpty()) {
+                    sExplicitApkPath = src;
+                    return src;
+                }
+            }
+        } catch (Throwable ignored) {}
+        if (env != null && !env.isEmpty()) return env;
+        String prop = System.getProperty("java.class.path", "");
+        return prop != null ? prop : "";
+    }
+    private static ProcessBuilder createBrokerProcessBuilder() {
+        ProcessBuilder pb = new ProcessBuilder("/system/bin/app_process", "/system/bin", "dev.bubuki.proactive.RootClipboardBroker")
+            .redirectError(new File("/dev/null"));
+        String cp = resolveBrokerClasspath();
+        if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
+        return pb;
     }
     private static String line(BufferedReader input)throws Exception {
         FutureTask<String> read=new FutureTask<>(input::readLine);Thread reader=new Thread(read,"pulse-clipboard-reply");reader.setDaemon(true);reader.start();
@@ -27,11 +55,7 @@ final class RootClipboard {
             DisplayInputHelper.injectClearField(displayId);
         }
         if (text == null || text.isEmpty()) return;
-        ProcessBuilder pb = new ProcessBuilder("/system/bin/app_process","/system/bin","dev.bubuki.proactive.RootClipboardBroker").redirectError(new File("/dev/null"));
-        String cp = System.getenv("CLASSPATH");
-        if (cp == null || cp.isEmpty()) cp = System.getProperty("java.class.path", "");
-        if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
-        java.lang.Process broker=pb.start();
+        java.lang.Process broker=createBrokerProcessBuilder().start();
         try(BufferedReader in=new BufferedReader(new InputStreamReader(broker.getInputStream(),StandardCharsets.UTF_8));BufferedWriter out=new BufferedWriter(new OutputStreamWriter(broker.getOutputStream(),StandardCharsets.UTF_8))){
             out.write(new JSONObject().put("op","paste").put("text",text).toString()+"\n");out.flush();line(in);
             try{
@@ -48,11 +72,7 @@ final class RootClipboard {
 
     String getText() throws Exception {
         if (!isPrivilegedUid()) throw new SecurityException("只允许特权会话读取剪贴板");
-        ProcessBuilder pb = new ProcessBuilder("/system/bin/app_process", "/system/bin", "dev.bubuki.proactive.RootClipboardBroker").redirectError(new File("/dev/null"));
-        String cp = System.getenv("CLASSPATH");
-        if (cp == null || cp.isEmpty()) cp = System.getProperty("java.class.path", "");
-        if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
-        java.lang.Process broker = pb.start();
+        java.lang.Process broker = createBrokerProcessBuilder().start();
         try (BufferedReader in = new BufferedReader(new InputStreamReader(broker.getInputStream(), StandardCharsets.UTF_8));
              BufferedWriter out = new BufferedWriter(new OutputStreamWriter(broker.getOutputStream(), StandardCharsets.UTF_8))) {
             out.write(new JSONObject().put("op", "get").toString() + "\n");
@@ -66,11 +86,7 @@ final class RootClipboard {
 
     void setText(String text) throws Exception {
         if (!isPrivilegedUid()) throw new SecurityException("只允许特权会话写入剪贴板");
-        ProcessBuilder pb = new ProcessBuilder("/system/bin/app_process", "/system/bin", "dev.bubuki.proactive.RootClipboardBroker").redirectError(new File("/dev/null"));
-        String cp = System.getenv("CLASSPATH");
-        if (cp == null || cp.isEmpty()) cp = System.getProperty("java.class.path", "");
-        if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
-        java.lang.Process broker = pb.start();
+        java.lang.Process broker = createBrokerProcessBuilder().start();
         try (BufferedReader in = new BufferedReader(new InputStreamReader(broker.getInputStream(), StandardCharsets.UTF_8));
              BufferedWriter out = new BufferedWriter(new OutputStreamWriter(broker.getOutputStream(), StandardCharsets.UTF_8))) {
             out.write(new JSONObject().put("op", "set").put("text", text != null ? text : "").toString() + "\n");

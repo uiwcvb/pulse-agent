@@ -9,6 +9,7 @@ Follows Letta / A-MEM Zettelkasten & Immutable Prefix Caching principles:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -22,8 +23,15 @@ from vault_manager import TEMPLATES, now_iso
 class MemoryEngine:
     AUTO_COMPACT_TOKENS = 100_000
     KEEP_RECENT_TOKENS = 35_000
-    SLEEP_CONSOLIDATE_IDLE_SECONDS = 180
+    SLEEP_CONSOLIDATE_IDLE_SECONDS = 480
     PINNED_FILE = 'profile/pinned_memories.md'
+
+    def get_sleep_consolidate_idle_seconds(self) -> int:
+        raw = getattr(getattr(self.store, 'config', None), 'sleep_consolidate_idle_seconds', self.SLEEP_CONSOLIDATE_IDLE_SECONDS)
+        try:
+            return max(60, min(3600, int(raw or self.SLEEP_CONSOLIDATE_IDLE_SECONDS)))
+        except Exception:
+            return self.SLEEP_CONSOLIDATE_IDLE_SECONDS
 
     def __init__(
         self,
@@ -43,7 +51,10 @@ class MemoryEngine:
         vault_root = Path(getattr(self.vault, 'root', '.'))
         ltm_base = vault_root.parent if vault_root.name == 'memory_vault' else vault_root
         unified_db_path = Path(self.context_search.db_path) if (self.context_search and getattr(self.context_search, 'db_path', None)) else (ltm_base / 'long_term_memory.db')
+        self.unified_db_path = unified_db_path
         self.long_term_memory = LongTermMemoryEngine(unified_db_path, vault=self.vault, legacy_db_path=ltm_base / 'long_term_memory.db')
+        self._embedding_engine = None
+        self._memory_tables = None
         self._consolidating = False
         self._suppress_vault_listener = False
         self.on_pins_changed = None
@@ -369,7 +380,7 @@ class MemoryEngine:
                 src, formatted_text = self._parse_pin_source_and_text(m.group(2).strip())
                 pins.append({'id': m.group(1), 'text': formatted_text, 'source': src})
             elif s.startswith('- '):
-                pid = 'pin-' + secrets.token_hex(3)
+                pid = 'pin-' + hashlib.sha1(s.encode('utf-8')).hexdigest()[:6]
                 src, formatted_text = self._parse_pin_source_and_text(s[2:].strip())
                 pins.append({'id': pid, 'text': formatted_text, 'source': src})
         return pins
@@ -467,8 +478,21 @@ class MemoryEngine:
                 missing.append(f'{current_sec} -> {item_label}' if current_sec else item_label)
         return raw_imp, missing
 
+    def get_embedding_engine(self):
+        if self._embedding_engine is None:
+            from core.embedding_engine import EmbeddingEngine
+            models_dir = Path(getattr(self.store, 'root', '.')) / 'models' / 'embeddings'
+            self._embedding_engine = EmbeddingEngine(models_dir, config_getter=lambda: getattr(self.store, 'config', None))
+        return self._embedding_engine
+
+    def get_memory_tables(self):
+        if self._memory_tables is None:
+            from core.memory_tables import MemoryTablesStore
+            self._memory_tables = MemoryTablesStore(self.unified_db_path, embedding_engine=self.get_embedding_engine())
+        return self._memory_tables
+
     def build_prompt_context(self) -> str:
-        """Dynamic vault index + user traits + structured personal impression digest (budgeted to fit cleanly in ~3.8K chars without truncating disk files)."""
+        """Dynamic vault index + core_blocks + user traits + structured personal impression digest."""
         raw_idx = self.vault.read('INDEX.md')
         idx = raw_idx[:1200] if len(raw_idx) <= 1200 else (raw_idx[:750] + '\n...\n' + raw_idx[-400:])
         raw_traits = self.vault.read('profile/user_traits.md')
@@ -481,13 +505,21 @@ class MemoryEngine:
                 + raw_traits[-1400:]
             )
         raw_imp, missing_imp = self.get_personal_impression()
+        core_blocks_txt = ''
+        try:
+            core_blocks_txt = self.get_memory_tables().build_static_core_blocks_text(max_total_chars=2400)
+        except Exception:
+            core_blocks_txt = ''
         parts = [
-            f'【记忆库目录 INDEX.md（可用 read_file("memory_vault/...")、memory_search 或 conversation_search 翻阅详情；按需技能存放在 memory_vault/skills/）】\n{idx}',
-            f'【个人印象档案 (memory_vault/profile/personal_impression.md)】\n{raw_imp[:1100]}',
+            f'【记忆库目录 INDEX.md（可用 read_file("memory_vault/...") 或 memory(op="search"|"query_facts") 翻阅详情；按需技能存放在 memory_vault/skills/）】\n{idx}',
         ]
+        if core_blocks_txt:
+            parts.append(f'【结构化核心记忆块 (core_blocks)】\n{core_blocks_txt}')
+        parts.append(f'【个人印象档案 (memory_vault/profile/personal_impression.md)】\n{raw_imp[:1100]}')
         if missing_imp:
+            idle_min = max(1, round(self.get_sleep_consolidate_idle_seconds() / 60))
             parts.append(
-                '【个人印象待补全维度（记忆运转规则：1. 日常闲聊中用户透露的新信息，系统会在停歇 45 秒后由后台记忆引擎自动归档进 personal_impression.md 与 user_traits.md，无需每句话都调工具；2. 若你本轮未实际调用 edit_file/write_file/memory_pin 工具，严禁在回复中谎称“已经写进档案文件了/已经填好表了”，只说明已暂记上下文；3. 若用户要求现在写入或你决定当场落盘，必须真实调用一次 edit_file("memory_vault/profile/personal_impression.md", ...) 或 memory_pin 后再说已写入档案）】\n- '
+                f'【个人印象待补全维度（记忆运转规则：1. 日常闲聊中用户透露的新信息，系统会在停歇 {idle_min} 分钟后由后台记忆引擎增量归档进 entity_facts、personal_impression.md 与 user_traits.md 并增量建向量，无需每句话都调工具；2. 若你本轮未实际调用 edit_file/write_file/memory_pin 工具，严禁在回复中谎称“已经写进档案文件了/已经填好表了”，只说明已暂记上下文；3. 若用户要求现在写入或你决定当场落盘，必须真实调用一次 edit_file("memory_vault/profile/personal_impression.md", ...) 或 memory_pin 后再说已写入档案）】\n- '
                 + '\n- '.join(missing_imp[:6])
             )
         parts.append(f'【用户核心画像日志】\n{traits}')
@@ -627,7 +659,7 @@ class MemoryEngine:
         on_stream=None,
     ) -> dict | None:
         from core.compaction_service import execute_streaming_compaction
-        return await execute_streaming_compaction(
+        res = await execute_streaming_compaction(
             memory_engine=self,
             bot_id=bot_id,
             source=normalize_node_source(source),
@@ -638,6 +670,20 @@ class MemoryEngine:
             silent_complete_fn=silent_complete_fn,
             on_stream=on_stream,
         )
+        if isinstance(res, dict) and res.get('compacted') and not res.get('already_compacted'):
+            try:
+                from core.memory_migrator import ingest_compaction_to_tables
+                marker = res.get('marker') if isinstance(res.get('marker'), dict) else {}
+                ingest_compaction_to_tables(
+                    self,
+                    bot_id=bot_id,
+                    source=normalize_node_source(source),
+                    summary_text=str(marker.get('text') or res.get('summary') or ''),
+                    ctx_id=str(res.get('ctx_id') or ''),
+                )
+            except Exception:
+                pass
+        return res
 
     def apply_impression_patches(
         self, patches: list[dict] | None = None, topic_updates: list[dict] | None = None, followups: list[dict] | None = None,
@@ -729,7 +775,7 @@ class MemoryEngine:
         s = self.store.state
         last_consolidated = float(s.get('last_sleep_consolidate', 0.0))
         last_user = float(s.get('last_user', 0.0))
-        if last_user <= last_consolidated or (time.time() - last_user) < self.SLEEP_CONSOLIDATE_IDLE_SECONDS:
+        if last_user <= last_consolidated or (time.time() - last_user) < self.get_sleep_consolidate_idle_seconds():
             return
         candidates = [
             m for m in s.get('messages', [])
@@ -802,22 +848,21 @@ class MemoryEngine:
             delta_parts: list[str] = []
             prev_suppress = self._suppress_vault_listener
             self._suppress_vault_listener = True
+            tables = self.get_memory_tables()
             try:
                 for tr in (data.get('new_traits') or [])[:4]:
                     if isinstance(tr, str) and tr.strip() and tr.strip() not in existing_traits:
                         clean_tr = tr.strip()
                         if hasattr(self, 'long_term_memory') and self.long_term_memory is not None:
                             self.long_term_memory.retain(
-                                l0_summary=clean_tr[:180],
-                                l1_overview=clean_tr,
-                                kind='fact',
-                                bot_id='companion',
-                                source='phone',
-                                outcome='success',
-                                supersede_topic=False,
+                                l0_summary=clean_tr[:180], l1_overview=clean_tr, kind='fact',
+                                bot_id='all', source='phone', outcome='success', supersede_topic=False,
                             )
-                        else:
-                            self.vault.append('profile/user_traits.md', f'- {now_iso()}（静默整理）{clean_tr}')
+                        tables.upsert_fact_reconciled(
+                            entity='主人', attr=f'特征_{hashlib.sha1(clean_tr.encode()).hexdigest()[:6]}',
+                            value=clean_tr, ttl_type='stateful', source_ref='sleep_consolidate', bot_id='all',
+                        )
+                        self.vault.append('profile/user_traits.md', f'- {now_iso()}（静默整理）{clean_tr}')
                         delta_parts.append(clean_tr)
                         changed = True
                 pin_updates = data.get('completed_or_updated_pins') or []
@@ -859,7 +904,10 @@ class MemoryEngine:
                 if self.apply_impression_patches(patches=patches, topic_updates=topic_upds, followups=followups):
                     for pt in (patches if isinstance(patches, list) else [])[:4]:
                         if isinstance(pt, dict) and pt.get('fact'):
-                            delta_parts.append(f"印象更新({pt.get('item_key', '')})：{str(pt.get('fact'))[:80]}")
+                            ik = str(pt.get('item_key') or pt.get('key') or '个人印象').strip()
+                            fv = str(pt.get('fact') or '').strip()
+                            tables.upsert_fact_reconciled(entity='主人', attr=ik[:80], value=fv, ttl_type='permanent', source_ref='sleep_consolidate', bot_id='all')
+                            delta_parts.append(f"印象更新({ik})：{fv[:80]}")
                     changed = True
                 slug = re.sub(r'[^a-zA-Z0-9_-]', '', str(data.get('note_slug') or ''))[:40].lower()
                 md_body = str(data.get('note_markdown') or '').strip()
@@ -877,15 +925,15 @@ class MemoryEngine:
                             continue
                         urls = ex.get('urls') if isinstance(ex.get('urls'), list) else []
                         res_ret = self.long_term_memory.retain(
-                            l0_summary=l0,
-                            l1_overview=l1,
-                            topic=str(ex.get('topic') or ''),
-                            kind=str(ex.get('kind') or 'experience'),
-                            bot_id='companion',
-                            source='phone',
-                            source_urls=[str(u) for u in urls if u],
-                            outcome=str(ex.get('outcome') or 'success'),
-                            importance=1.2,
+                            l0_summary=l0, l1_overview=l1, topic=str(ex.get('topic') or ''),
+                            kind=str(ex.get('kind') or 'experience'), bot_id='companion', source='phone',
+                            source_urls=[str(u) for u in urls if u], outcome=str(ex.get('outcome') or 'success'), importance=1.2,
+                        )
+                        tables.upsert_fact_reconciled(
+                            entity=str(ex.get('topic') or '经验方案').strip()[:80], attr=str(ex.get('kind') or 'experience')[:40],
+                            value=(f'{l0} — {l1}' if l0 and l1 and l0 not in l1 else (l1 or l0)),
+                            ttl_type='project', search_cues=' '.join([str(u) for u in urls if u][:2]),
+                            source_ref='sleep_consolidate', bot_id='companion',
                         )
                         if res_ret.get('ok'):
                             delta_parts.append(f"长久经验沉淀：{l0[:60]}")

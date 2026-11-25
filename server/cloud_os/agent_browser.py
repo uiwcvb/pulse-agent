@@ -33,12 +33,36 @@ from typing import Dict, List, Optional, Tuple
 
 from cloud_os.browser_dom_scripts import LIVE_DOM_EXTRACT_JS, build_ref_action_js
 from cloud_os.window_manager import list_x11_windows
+from core.tool_schemas import public_url_sync, scrub_subprocess_env
 
 CDP_PORT = 9222
 _WARP_HOST = '127.0.0.1'
 _WARP_PORT = 40001
 _WARP_PROBE_CACHE: Optional[Tuple[float, Optional[str]]] = None
 _RECENT_CDP_DIALOGS: List[Dict[str, object]] = []
+_TRACKED_BROWSER_PROCS: List[subprocess.Popen] = []
+
+
+def close_tracked_browsers(timeout_s: float = 2.0) -> None:
+    """Terminate and wait for any Chromium processes spawned by `launch_modern_browser`."""
+    alive: List[subprocess.Popen] = []
+    for proc in list(_TRACKED_BROWSER_PROCS):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                alive.append(proc)
+        except Exception:
+            pass
+    _TRACKED_BROWSER_PROCS.clear()
+    for proc in alive:
+        try:
+            proc.wait(timeout=timeout_s)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
 
 PROXY_BYPASS_LIST = (
     '<-loopback>;localhost;127.0.0.1;'
@@ -448,6 +472,49 @@ def cdp_click_or_type_ref(
     return None
 
 
+def cdp_eval_js(expression: str, *, timeout: float = 5.0) -> Dict[str, object]:
+    """Execute arbitrary JS in the active Chromium page via CDP Runtime.evaluate."""
+    expr = str(expression or '').strip()
+    if not expr:
+        return {'ok': False, 'error': 'eval_js 需要提供 script/command JS 表达式'}
+    target = _select_cdp_target(_cdp_get_targets(timeout=0.8))
+    if not target:
+        return {'ok': False, 'error': '云电脑 Chromium CDP 9222 当前未连接或无可用标签页，请先 navigate 打开页面'}
+    ws_url = str(target.get('webSocketDebuggerUrl') or '')
+    if not ws_url:
+        return {'ok': False, 'error': 'CDP target 缺少 webSocketDebuggerUrl'}
+    page_url = str(target.get('url') or '')
+    page_title = str(target.get('title') or '')
+    try:
+        res_list = _ws_cdp_call(
+            ws_url,
+            [
+                ('Page.enable', {}),
+                ('Runtime.evaluate', {'expression': expr, 'returnByValue': True, 'awaitPromise': True}),
+            ],
+            timeout=max(1.0, min(20.0, float(timeout))),
+        )
+        if not res_list:
+            return {'ok': False, 'error': 'CDP 未返回执行结果'}
+        last = res_list[-1]
+        if last.get('_cdp_error'):
+            return {'ok': False, 'error': f"CDP 通信失败: {last['_cdp_error']}"}
+        if last.get('exceptionDetails'):
+            ex = last['exceptionDetails']
+            desc = (ex.get('exception') or {}).get('description') or ex.get('text') or 'JS exception'
+            return {'ok': False, 'url': page_url, 'title': page_title, 'error': f'JS 异常: {str(desc)[:320]}'}
+        res_obj = last.get('result') or {}
+        if 'value' in res_obj:
+            val = res_obj['value']
+        elif res_obj.get('type') == 'undefined':
+            val = None
+        else:
+            val = res_obj.get('description') or str(res_obj)
+        return {'ok': True, 'url': page_url, 'title': page_title, 'value': val}
+    except Exception as exc:
+        return {'ok': False, 'url': page_url, 'error': f'CDP eval_js 异常: {str(exc)[:240]}'}
+
+
 class _SemanticDOMParser(HTMLParser):
     """Lightweight static HTML fallback parser extracting clean readable text and link elements."""
 
@@ -616,8 +683,7 @@ def launch_modern_browser(
     """Open or navigate `url` in persistent CDP-enabled Chromium."""
     target_url = _validate_http_url(url)
 
-    run_env = dict(os.environ)
-    run_env.update(env)
+    run_env = scrub_subprocess_env(base_env=dict(getattr(os, 'environ', None) or {}), extra=env)
     home_dir = Path(run_env.get('HOME') or str(cwd.parent))
     run_env['HOME'] = str(home_dir)
     run_env.setdefault('LANG', 'C.UTF-8')
@@ -683,7 +749,9 @@ def launch_modern_browser(
             if warp_url and not domestic_direct:
                 cmd.insert(-1, f'--proxy-server={warp_url}')
                 cmd.insert(-1, f'--proxy-bypass-list={PROXY_BYPASS_LIST}')
-            subprocess.Popen(cmd, env=run_env, cwd=str(cwd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            proc_b = subprocess.Popen(cmd, env=run_env, cwd=str(cwd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            _TRACKED_BROWSER_PROCS[:] = [p for p in _TRACKED_BROWSER_PROCS if getattr(p, 'poll', lambda: None)() is None]
+            _TRACKED_BROWSER_PROCS.append(proc_b)
             browser_used = 'chromium-cdp'
             _wait_for_browser_window(run_env, timeout_s=10.0)
             new_target = None
@@ -708,7 +776,7 @@ def launch_modern_browser(
 
 def fetch_semantic_dom_snapshot(url: str, width: int = 1280, height: int = 720, cwd: Optional[Path] = None) -> Dict[str, object]:
     """Fetch live CDP DOM snapshot or static HTTP(S) fallback without fabricating missing interactive refs."""
-    target_url = _validate_http_url(url)
+    target_url = public_url_sync(_validate_http_url(url))
     live = extract_live_cdp_dom_snapshot(wait_ms=100)
     if live and str(live.get('url') or '').rstrip('/') == target_url.rstrip('/'):
         if live.get('elements') or live.get('page_text') or live.get('title') or live.get('auth_gate'):

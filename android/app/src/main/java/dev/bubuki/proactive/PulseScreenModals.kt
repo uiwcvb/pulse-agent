@@ -58,17 +58,25 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
         subPage = null
     }
     var modelFilter by remember { mutableStateOf("") }
-    val filteredModels = remember(s.availableModels, modelFilter) {
-        if (modelFilter.isBlank()) s.availableModels else s.availableModels.filter { it.contains(modelFilter, ignoreCase = true) }
-    }
+    var workerModelFilter by remember { mutableStateOf("") }
     val pageTitle = when (subPage) {
-        "api" -> "模型接口与节点"
-        "phone" -> "手机虚拟屏与权限"
-        "rhythm" -> "主动节奏与后台通知"
-        "appearance" -> "外观、动效与省电"
-        "update" -> "版本与软件更新"
+        "api" -> "模型与接口"
+        "phone" -> "手机虚拟屏"
+        "memory" -> "记忆与缓存"
+        "rhythm" -> "主动任务与通知"
+        "appearance" -> "外观与省电"
+        "update" -> "软件更新"
         else -> "设置"
     }
+    val settingsReduce = rememberReducedMotion()
+    val settingsScroll = rememberScrollState()
+    LaunchedEffect(subPage) { settingsScroll.scrollTo(0) }
+    val showSaveBtn = subPage in setOf("api", "memory", "rhythm", "appearance") || s.savingSettings
+    val settingsDivAlpha by animateFloatAsState(
+        targetValue = if (settingsScroll.value > 6) 0.65f else 0f,
+        animationSpec = if (settingsReduce) snap() else tween(160),
+        label = "settings_hdr_div"
+    )
     Column(modifier.background(c.bg)) {
         Surface(color = c.surface.copy(alpha = 0.96f), tonalElevation = 0.dp) {
             Column {
@@ -77,12 +85,12 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(
-                        Modifier.clip(RoundedCornerShape(10.dp))
+                        Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(10.dp))
                             .iosPressScale(0.95f) {
                                 focus.clearFocus()
                                 if (subPage != null) subPage = null else model.closePanel()
                             }
-                            .padding(horizontal = 6.dp, vertical = 6.dp),
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         PulseIcon("back", c.accent, Modifier.size(21.dp))
@@ -92,7 +100,7 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                         targetState = pageTitle,
                         modifier = Modifier.weight(1f),
                         transitionSpec = {
-                            if (!s.motion) EnterTransition.None togetherWith ExitTransition.None
+                            if (settingsReduce) fadeIn(tween(110)) togetherWith fadeOut(tween(90))
                             else fadeIn(tween(150)) togetherWith fadeOut(tween(100))
                         },
                         label = "settings_title"
@@ -106,27 +114,39 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                             textAlign = TextAlign.Center
                         )
                     }
-                    Text(
-                        if (s.savingSettings) "同步中…" else "保存",
-                        Modifier.clip(RoundedCornerShape(14.dp))
-                            .background(c.accent)
-                            .iosPressScale(0.95f, enabled = !s.savingSettings) { focus.clearFocus(); model.saveSettings() }
-                            .padding(horizontal = 14.dp, vertical = 7.dp),
-                        color = Color.White,
-                        fontSize = 13.5.sp,
-                        fontWeight = FontWeight.SemiBold)
+                    Box(Modifier.widthIn(min = 58.dp), contentAlignment = Alignment.CenterEnd) {
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = showSaveBtn,
+                            enter = fadeIn(tween(150)),
+                            exit = fadeOut(tween(110))
+                        ) {
+                            Box(
+                                Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(14.dp))
+                                    .background(c.accent)
+                                    .iosPressScale(0.95f, enabled = !s.savingSettings) { focus.clearFocus(); model.saveSettings() }
+                                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    if (s.savingSettings) "同步中…" else "保存",
+                                    color = Color.White,
+                                    fontSize = 13.5.sp,
+                                    fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
                 }
-                HorizontalDivider(color = c.line.copy(alpha = 0.65f), thickness = 0.5.dp)
+                HorizontalDivider(color = c.line.copy(alpha = settingsDivAlpha), thickness = 0.5.dp)
             }
         }
         AnimatedContent(
             targetState = subPage,
             modifier = Modifier.fillMaxSize(),
-            transitionSpec = { appSubPageTransitionSpec(goingDeeper = targetState != null, reduceMotion = !s.motion) },
+            transitionSpec = { appSubPageTransitionSpec(goingDeeper = targetState != null, reduceMotion = settingsReduce) },
             label = "settings_subpage"
         ) { page ->
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 14.dp),
+            Modifier.fillMaxSize().verticalScroll(settingsScroll).padding(horizontal = 16.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             when (page) {
@@ -137,51 +157,54 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface)) {
                             SettingsCategoryRow(
                                 icon = "cloud",
-                                title = "模型接口与节点",
-                                subtitle = "API 地址、密钥、默认模型与云端节点",
+                                title = "模型与接口",
+                                subtitle = "服务器、主模型、辅助模型与备用切换",
                                 value = s.defaultModel.ifBlank { if (s.hasApiKey) "已配置" else "待配置" }
                             ) { subPage = "api" }
                         }
                     }
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("工作区与运行", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 6.dp))
+                        Text("运行与记忆", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 6.dp))
                         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface)) {
                             SettingsCategoryRow(
+                                icon = "vault",
+                                title = "记忆与缓存",
+                                subtitle = "上下文上限、缓存保活、向量模型与记忆整理",
+                                value = if (s.cacheKeepaliveEnabled) "${s.idleCompactMinutes}m" else "标准"
+                            ) { subPage = "memory" }
+                            HorizontalDivider(Modifier.padding(start = 54.dp), color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
+                            SettingsCategoryRow(
                                 icon = "screen",
-                                title = "手机虚拟屏与权限",
-                                subtitle = "Root / 无线 ADB 独立虚拟屏与悬浮窗控制",
+                                title = "手机虚拟屏",
+                                subtitle = "Root / Shizuku / 无线 ADB 权限",
                                 value = if (phoneState.privileged || phoneState.root) "已就绪" else "待授权"
                             ) { subPage = "phone" }
                             HorizontalDivider(Modifier.padding(start = 54.dp), color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
                             SettingsCategoryRow(
-                                icon = "clock",
-                                title = "主动节奏与后台通知",
-                                subtitle = "好奇心间隔、自动压缩阈值与常驻连接",
+                                icon = "bell",
+                                title = "主动任务与通知",
+                                subtitle = "巡检间隔、后台保活与分级通知",
                                 value = if (s.curiosityEnabledGlobal) "${s.curiosityMinutes}m" else "已关闭"
                             ) { subPage = "rhythm" }
                         }
                     }
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("偏好与系统", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 6.dp))
+                        Text("系统", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 6.dp))
                         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface)) {
                             SettingsCategoryRow(
                                 icon = "moon",
-                                title = "外观、动效与省电",
-                                subtitle = "深浅色主题、弹簧动效与超级省电模式",
-                                value = if (s.powerSave) "省电中" else if (s.appearance == "light") "浅色" else "深色"
+                                title = "外观与省电",
+                                subtitle = "主题、动效与省电",
+                                value = if (s.powerSave) "省电" else if (s.appearance == "light") "浅色" else "深色"
                             ) { subPage = "appearance" }
                             HorizontalDivider(Modifier.padding(start = 54.dp), color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
                             SettingsCategoryRow(
                                 icon = "spark",
-                                title = "版本与软件更新",
-                                subtitle = "当前 v${BuildConfig.VERSION_NAME} (Build ${BuildConfig.VERSION_CODE})",
-                                value = when { s.checkingUpdate -> "检查中"; !s.updateChecked -> "点此检查版本"; s.updateAvailable -> "有更新"; else -> "最新" }
+                                title = "软件更新",
+                                subtitle = "v${BuildConfig.VERSION_NAME} (Build ${BuildConfig.VERSION_CODE})",
+                                value = when { s.checkingUpdate -> "检查中"; !s.updateChecked -> "检查更新"; s.updateAvailable -> "有更新"; else -> "最新" }
                             ) { subPage = "update" }
                         }
-                    }
-                    PulseAction(if (s.savingSettings) "正在同步到服务器…" else "保存并同步到云端") {
-                        focus.clearFocus()
-                        model.saveSettings()
                     }
                 }
                 "api" -> {
@@ -189,8 +212,7 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface).padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Text("1. 中枢服务器节点与配对", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
-                        Text("先填好服务器地址和设备配对码并连接；若服务器已配好 AI，连上即可直接使用。", color = c.muted, fontSize = 12.sp)
+                        Text("1. 服务器连接", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
                         PulseInputField(
                             label = "Server URL",
                             value = s.serverUrl,
@@ -234,8 +256,7 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface).padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text("2. 统一大模型接口 (OpenAI 兼容)", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
-                        Text("保存后自动同步至云端，各助手可单独指定专属模型。", color = c.muted, fontSize = 12.sp)
+                        Text("2. 主模型接口 (OpenAI 兼容)", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
                         PulseInputField(
                             label = "API Base URL（不含 /chat/completions）",
                             value = s.apiBaseUrl,
@@ -265,26 +286,84 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                             value = s.defaultModel,
                             placeholder = "填入或从下方选择模型名称",
                             onChange = { model.updateSettingsField(defaultModel = it) })
-                        if (s.availableModels.isNotEmpty()) {
-                            PulseInputField(
-                                label = "筛选已拉取的 ${s.availableModels.size} 个模型",
-                                value = modelFilter,
-                                placeholder = "输入关键词过滤模型…",
-                                onChange = { modelFilter = it })
-                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(top = 2.dp)) {
-                                items(filteredModels.take(60)) { m ->
-                                    val selected = m == s.defaultModel
-                                    Text(
-                                        m,
-                                        Modifier.clip(RoundedCornerShape(9.dp))
-                                            .background(if (selected) c.accent else c.fill)
-                                            .iosPressScale(0.95f) { model.updateSettingsField(defaultModel = m) }
-                                            .padding(horizontal = 11.dp, vertical = 7.dp),
-                                        color = if (selected) Color.White else c.ink,
-                                        fontSize = 12.sp,
-                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+                        val resolvedEntries = remember(s.modelEntries, s.availableModels, s.channels) {
+                            s.modelEntries.ifEmpty { PulseModelEntry.synthesize(s.availableModels, s.channels) }
+                        }
+                        if (resolvedEntries.isNotEmpty()) {
+                            ChannelAwareModelPicker(
+                                entries = resolvedEntries,
+                                channels = s.channels,
+                                selectedValue = s.defaultModel,
+                                accentColor = c.accent,
+                                searchQuery = modelFilter,
+                                showSearchBox = true,
+                                onSearchChange = { modelFilter = it },
+                                onSelect = { model.updateSettingsField(defaultModel = it) }
+                            )
+                        }
+                    }
+                    ApiChannelsSection(model)
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface).padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("3. 辅助模型（子任务与整理）", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "用于子任务与记忆整理，留空则使用主模型",
+                                    color = c.muted,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Box(
+                                Modifier.weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(c.accent)
+                                    .iosPressScale(0.96f, enabled = !s.fetchingModels) { focus.clearFocus(); model.fetchModels(false) }
+                                    .padding(vertical = 9.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    if (s.fetchingModels) "获取中…" else "获取模型列表",
+                                    color = Color.White,
+                                    fontSize = 12.5.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            if (s.workerModel.isNotBlank()) {
+                                Box(
+                                    Modifier.clip(RoundedCornerShape(10.dp))
+                                        .background(c.fill)
+                                        .iosPressScale(0.96f) { model.updateSettingsField(workerModel = "") }
+                                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("跟随主模型", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                                 }
                             }
+                        }
+                        PulseInputField(
+                            label = "辅助模型",
+                            value = s.workerModel,
+                            placeholder = "留空则跟随主模型",
+                            onChange = { model.updateSettingsField(workerModel = it) })
+                        val workerEntries = remember(s.modelEntries, s.availableModels, s.channels) {
+                            s.modelEntries.ifEmpty { PulseModelEntry.synthesize(s.availableModels, s.channels) }
+                        }
+                        if (workerEntries.isNotEmpty()) {
+                            ChannelAwareModelPicker(
+                                entries = workerEntries,
+                                channels = s.channels,
+                                selectedValue = s.workerModel,
+                                accentColor = c.accent,
+                                searchQuery = workerModelFilter,
+                                showSearchBox = true,
+                                onSearchChange = { workerModelFilter = it },
+                                onSelect = { model.updateSettingsField(workerModel = it) }
+                            )
                         }
                     }
                     Column(
@@ -306,28 +385,32 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                                 onCheckedChange = { model.updateSettingsField(fallbackEnabled = it) }
                             )
                         }
-                        if (s.fallbackEnabled) {
+                        val fbReduce = rememberReducedMotion()
+                        AnimatedVisibility(
+                            visible = s.fallbackEnabled,
+                            enter = if (fbReduce) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                            exit = if (fbReduce) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             PulseInputField(
                                 label = "统一备用模型名称",
                                 value = s.fallbackModel,
                                 placeholder = "填入备用模型名称",
                                 onChange = { model.updateSettingsField(fallbackModel = it) })
-                            if (s.availableModels.isNotEmpty()) {
+                            val fbEntries = remember(s.modelEntries, s.availableModels, s.channels) {
+                                s.modelEntries.ifEmpty { PulseModelEntry.synthesize(s.availableModels, s.channels) }
+                            }
+                            if (fbEntries.isNotEmpty()) {
                                 Text("点选设为统一备用模型：", color = c.muted, fontSize = 11.5.sp)
-                                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                                    items(filteredModels.take(60)) { m ->
-                                        val selected = m == s.fallbackModel
-                                        Text(
-                                            m,
-                                            Modifier.clip(RoundedCornerShape(9.dp))
-                                                .background(if (selected) c.green else c.fill)
-                                                .iosPressScale(0.95f) { model.updateSettingsField(fallbackModel = m) }
-                                                .padding(horizontal = 11.dp, vertical = 7.dp),
-                                            color = if (selected) Color.White else c.ink,
-                                            fontSize = 12.sp,
-                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
-                                    }
-                                }
+                                ChannelAwareModelPicker(
+                                    entries = fbEntries,
+                                    channels = s.channels,
+                                    selectedValue = s.fallbackModel,
+                                    accentColor = c.green,
+                                    searchQuery = modelFilter,
+                                    showSearchBox = false,
+                                    onSelect = { model.updateSettingsField(fallbackModel = it) }
+                                )
                             }
                             PulseInputField(
                                 label = "备用 API Base URL（留空则共用上方主接口）",
@@ -339,6 +422,7 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                                 value = s.fallbackApiKeyInput,
                                 placeholder = "sk-...（留空则共用主 API Key）",
                                 onChange = { model.updateSettingsField(fallbackApiKeyInput = it) })
+                            }
                         }
                     }
                 }
@@ -353,9 +437,12 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                                 val ready = phoneState.privileged || phoneState.root
                                 Text(
                                     if (ready) {
-                                        if (phoneState.privilegeMode == "wireless_adb") "无线 ADB 独立虚拟屏已就绪 (uid ${phoneState.uid})"
-                                        else "Root 后台独立虚拟屏已就绪 (uid 0)"
-                                    } else "支持免 Root 无线 ADB (uid 2000) 或 Root 启用后台独立虚拟屏",
+                                        when (phoneState.privilegeMode) {
+                                            "shizuku" -> "Shizuku 独立虚拟屏已就绪 (uid ${phoneState.uid})"
+                                            "wireless_adb" -> "无线 ADB 独立虚拟屏已就绪 (uid ${phoneState.uid})"
+                                            else -> "Root 后台独立虚拟屏已就绪 (uid 0)"
+                                        }
+                                    } else "支持免 Root Shizuku / 无线 ADB (uid 2000) 或 Root 启用后台独立虚拟屏",
                                     color = if (ready) c.green else c.muted,
                                     fontSize = 12.5.sp,
                                     fontWeight = FontWeight.Medium)
@@ -378,7 +465,12 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
-                                    if (btnReady) (if (phoneState.privilegeMode == "wireless_adb") "无线 ADB 已就绪" else "Root 已授权") else "连接 Root / 无线 ADB",
+                                    when {
+                                        !btnReady -> "连接 Root / Shizuku / ADB"
+                                        phoneState.privilegeMode == "shizuku" -> "Shizuku 已就绪"
+                                        phoneState.privilegeMode == "wireless_adb" -> "无线 ADB 已就绪"
+                                        else -> "Root 已授权"
+                                    },
                                     color = if (btnReady) c.green else Color.White,
                                     fontSize = 12.5.sp,
                                     fontWeight = FontWeight.SemiBold)
@@ -399,26 +491,15 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                             }
                         }
                     }
+                    ShizukuSettingsCard(model)
                     WirelessAdbSettingsCard(model)
                 }
-                "rhythm" -> {
+                "memory" -> {
                     Column(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface).padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text("主动好奇心与常驻通知", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text("启用云端主动好奇心心跳", color = c.ink, fontSize = 14.5.sp)
-                                Text("闲置时由开启了好奇心的助手主动关心或派发调研", color = c.muted, fontSize = 11.5.sp)
-                            }
-                            Switch(checked = s.curiosityEnabledGlobal, onCheckedChange = { model.updateSettingsField(curiosityEnabled = it) })
-                        }
-                        PulseInputField(
-                            label = "好奇心间隔（分钟，5-1440）",
-                            value = s.curiosityMinutes,
-                            placeholder = "30",
-                            onChange = { model.updateSettingsField(curiosityMinutes = it.filter { ch -> ch.isDigit() }) })
+                        Text("上下文与缓存", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
                         val curSettingCompact = (s.autoCompactTokens.toIntOrNull() ?: 200000).coerceIn(8000, 1000000)
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Text("上下文窗口上限 / 自动压缩阈值", color = c.ink, fontSize = 14.sp, fontWeight = FontWeight.Medium)
@@ -470,6 +551,120 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                             value = s.autoCompactTokens,
                             placeholder = "200000",
                             onChange = { model.updateSettingsField(autoCompactTokens = it.filter { ch -> ch.isDigit() }) })
+                        HorizontalDivider(color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("缓存保活与空闲压缩", color = c.ink, fontSize = 14.sp)
+                                Text("上下文 ≥ 40K 时短暂保活，空闲到点压缩后停止", color = c.muted, fontSize = 11.5.sp)
+                            }
+                            Switch(checked = s.cacheKeepaliveEnabled, onCheckedChange = { model.updateSettingsField(cacheKeepaliveEnabled = it) })
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Box(Modifier.weight(1f)) {
+                                PulseInputField(
+                                    label = "保活次数 (0-5)",
+                                    value = s.cacheKeepaliveMaxPings,
+                                    placeholder = "1",
+                                    onChange = { model.updateSettingsField(cacheKeepaliveMaxPings = it.filter { ch -> ch.isDigit() }) })
+                            }
+                            Box(Modifier.weight(1f)) {
+                                PulseInputField(
+                                    label = "保活间隔 (秒)",
+                                    value = s.cacheKeepaliveIntervalSec,
+                                    placeholder = "260",
+                                    onChange = { model.updateSettingsField(cacheKeepaliveIntervalSec = it.filter { ch -> ch.isDigit() }) })
+                            }
+                            Box(Modifier.weight(1f)) {
+                                PulseInputField(
+                                    label = "空闲压缩 (分,0=关)",
+                                    value = s.idleCompactMinutes,
+                                    placeholder = "9",
+                                    onChange = { model.updateSettingsField(idleCompactMinutes = it.filter { ch -> ch.isDigit() }) })
+                            }
+                        }
+                    }
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface).padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text("记忆与向量检索", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
+                        Text("本地向量模型（闲置 5 分钟自动卸载）", color = c.muted, fontSize = 12.sp)
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            listOf(
+                                "off" to "关闭",
+                                "local_gte_small_zh" to "GTE-S",
+                                "local_dmeta_zh_small" to "Dmeta",
+                                "local_gte_base_zh" to "BGE-B"
+                            ).forEach { (tierId, lbl) ->
+                                val sel = s.embeddingTier == tierId
+                                Text(
+                                    lbl,
+                                    Modifier.weight(1f)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(if (sel) c.accent else c.fill)
+                                        .iosPressScale(0.95f) { model.updateSettingsField(embeddingTier = tierId) }
+                                        .padding(vertical = 8.dp),
+                                    color = if (sel) Color.White else c.ink,
+                                    fontSize = 11.5.sp,
+                                    fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                        Text(
+                            when (s.embeddingTier) {
+                                "off" -> "仅使用查表与全文检索（0 MB）"
+                                "local_dmeta_zh_small" -> "Dmeta-zh-small INT8 · ~170 MB · 1024 上下文"
+                                "local_gte_base_zh" -> "bge-base-zh-v1.5 INT8 · ~240 MB · 适合 2G+ 内存"
+                                else -> "gte-small-zh INT8 · ~100 MB · 推荐"
+                            },
+                            color = c.muted,
+                            fontSize = 11.5.sp
+                        )
+                        PulseInputField(
+                            label = "闲置记忆提炼等待 (分钟，默认 8 分，错开 9 分热压缩)",
+                            value = s.sleepConsolidateIdleMinutes,
+                            placeholder = "8",
+                            onChange = { model.updateSettingsField(sleepConsolidateIdleMinutes = it.filter { ch -> ch.isDigit() }) }
+                        )
+                        Box(
+                            Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(c.fill)
+                                .iosPressScale(0.97f) { if (!s.reorganizingMemory) model.triggerMemoryReorganize() }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                if (s.reorganizingMemory) "正在整理记忆…" else "重新整理记忆（备份并迁移旧数据）",
+                                color = if (s.reorganizingMemory) c.muted else c.accent,
+                                fontSize = 13.5.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        if (s.memoryReorgNotice.isNotBlank()) {
+                            Text(s.memoryReorgNotice, color = c.muted, fontSize = 11.5.sp)
+                        }
+                    }
+                }
+                "rhythm" -> {
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.surface).padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text("主动巡检与后台通知", color = c.ink, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("启用后台主动巡检", color = c.ink, fontSize = 14.5.sp)
+                                Text("闲置时按间隔执行已启用的助手巡检", color = c.muted, fontSize = 11.5.sp)
+                            }
+                            Switch(checked = s.curiosityEnabledGlobal, onCheckedChange = { model.updateSettingsField(curiosityEnabled = it) })
+                        }
+                        PulseInputField(
+                            label = "巡检间隔（分钟，5-1440）",
+                            value = s.curiosityMinutes,
+                            placeholder = "30",
+                            onChange = { model.updateSettingsField(curiosityMinutes = it.filter { ch -> ch.isDigit() }) })
                         HorizontalDivider(color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
@@ -557,7 +752,8 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                                 },
                                 color = Color.White,
                                 fontSize = 13.5.sp,
-                                fontWeight = FontWeight.SemiBold)
+                                fontWeight = FontWeight.SemiBold,
+                                style = TextStyle(fontFeatureSettings = "tnum"))
                         }
                     }
                 }
@@ -574,13 +770,17 @@ internal fun ConnectionHealthDialog(model: NativePulseModel, onDismiss: () -> Un
     val ctx = LocalContext.current
     val phoneSt by RootPhoneHarness.changes.collectAsState()
     val overlayMode by FloatingVirtualDisplay.overlayModeFlow.collectAsState()
+    val lifecycleStarted = rememberLifecycleStarted()
+    val powerSave = LocalPowerSaveMode.current
     var health by remember { mutableStateOf(AgentForegroundService.currentHealth()) }
     var probing by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(lifecycleStarted, powerSave) {
+        if (!lifecycleStarted) return@LaunchedEffect
+        val intervalMs = if (powerSave) 3000L else 1000L
         while (true) {
             health = AgentForegroundService.currentHealth()
-            kotlinx.coroutines.delay(1000L)
+            kotlinx.coroutines.delay(intervalMs)
         }
     }
 
@@ -603,15 +803,16 @@ internal fun ConnectionHealthDialog(model: NativePulseModel, onDismiss: () -> Un
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("WS 长连状态：${health.phase} (代次 #${health.wsGeneration})", fontSize = 13.5.sp, color = c.ink)
-                Text("最近收包：$inboundAgo · 实测 RTT：$rttLabel", fontSize = 13.sp, color = c.muted)
-                Text("挂起 RPC 队列：${health.pendingRpcCount} · PC 节点：${if (health.pcOnline) "在线" else "离线"}", fontSize = 13.sp, color = c.muted)
+                Text("WS 长连状态：${health.phase} (代次 #${health.wsGeneration})", fontSize = 13.5.sp, color = c.ink, style = TextStyle(fontFeatureSettings = "tnum"))
+                Text("最近收包：$inboundAgo · 实测 RTT：$rttLabel", fontSize = 13.sp, color = c.muted, style = TextStyle(fontFeatureSettings = "tnum"))
+                Text("挂起 RPC 队列：${health.pendingRpcCount} · PC 节点：${if (health.pcOnline) "在线" else "离线"}", fontSize = 13.sp, color = c.muted, style = TextStyle(fontFeatureSettings = "tnum"))
                 Text("最近链路说明：${health.lastReason}", fontSize = 12.5.sp, color = c.muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 HorizontalDivider(color = c.line.copy(alpha = 0.6f), thickness = 0.5.dp)
                 Text(
                     "虚拟屏状态：${overlayMode.label}" + if (phoneSt.displayCreated) " · #${phoneSt.displayId}" else " · 未创建",
                     fontSize = 13.5.sp,
-                    color = c.ink
+                    color = c.ink,
+                    style = TextStyle(fontFeatureSettings = "tnum")
                 )
                 Text("工作区阶段：${phoneSt.phase.ifBlank { "idle" }} · 权限：${phoneSt.privilegeMode.ifBlank { "none" }}", fontSize = 12.5.sp, color = c.muted)
             }

@@ -165,7 +165,8 @@ class StreamPublisherMixin:
                 raw_thought = thought_prefix
             else:
                 raw_thought = clean_th
-        effective_text, tag_choices, tag_thought, tag_sticker = self._extract_all_tags(effective_text)
+        effective_text, tag_choices, tag_thought, tag_sticker = self._extract_all_tags(effective_text, queue_media=False)
+        effective_text = self.strip_trailing_partial_control_tag(effective_text)
         if tag_choices:
             self.choices_var.set(tag_choices)
         if tag_thought:
@@ -189,7 +190,7 @@ class StreamPublisherMixin:
             'step_text': str((cur_exec or {}).get('last_step_text') or (prev.get('step_text') if same_stream else '') or ''),
             'tool': effective_tool, 'trace': trace_tail,
             'turn_steps': list((cur_exec or {}).get('turn_steps') or [])[-32:],
-            'timeline': list((cur_exec or {}).get('timeline') or [])[-48:],
+            'timeline': self._sanitize_timeline_entries(list((cur_exec or {}).get('timeline') or [])[-48:], queue_media=False, strip_partial=True),
             'sub_agents': sub_agents, 'todos': todos,
             'choices': live_choices,
             'context_stats': self._get_light_stream_context_stats(bot_id, cur_src),
@@ -199,9 +200,25 @@ class StreamPublisherMixin:
         self.streams_by_bot[bot_id] = self.live_stream
         await self.publish({'type': 'stream', 'source': cur_src, 'stream': self.live_stream})
 
+    @property
+    def _next_tool_choice(self):
+        var = getattr(self, '_next_tool_choice_var', None)
+        if var is not None:
+            return var.get()
+        return self.__dict__.get('_next_tool_choice_fallback')
+
+    @_next_tool_choice.setter
+    def _next_tool_choice(self, val):
+        var = getattr(self, '_next_tool_choice_var', None)
+        if var is not None:
+            var.set(val)
+        else:
+            self.__dict__['_next_tool_choice_fallback'] = val
+
     async def complete(self, messages, tools=None, big=False, tool_choice=None):
-        eff_tc = tool_choice or getattr(self, '_next_tool_choice', None)
+        ntc_val = self._next_tool_choice
         self._next_tool_choice = None
+        eff_tc = tool_choice or ntc_val
         bot_id = self.bot_context.get()
         cur_src = normalize_node_source(self.source_context.get())
         try:
@@ -216,26 +233,15 @@ class StreamPublisherMixin:
         )
 
     async def _fetch_available_models(self) -> list[str]:
-        base_url = self.store.config.effective_base_url()
-        api_key = self.store.config.effective_api_key(big=True) or self.store.config.effective_api_key(big=False)
-        if not base_url or not api_key:
-            return []
-        cache_key = base_url.rstrip('/') + '|' + api_key[-8:]
-        now = time.time()
-        if self._models_cache and self._models_cache[1] == cache_key and (now - self._models_cache[0]) < 300:
-            return list(self._models_cache[2])
+        if hasattr(self, 'llm') and self.llm is not None:
+            try:
+                return await self.llm.fetch_available_models()
+            except Exception:
+                pass
+        from core.channel_router import fetch_aggregated_models
         try:
-            async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-                r = await client.get(base_url.rstrip('/') + '/models', headers={'Authorization': 'Bearer ' + api_key})
-            if r.status_code >= 400:
-                return []
-            body = r.json()
-            raw_list = body.get('data') if isinstance(body, dict) else (body if isinstance(body, list) else [])
-            models = [str(item['id']) if isinstance(item, dict) and item.get('id') else str(item) for item in (raw_list or []) if item]
-            sorted_models = sorted(list(dict.fromkeys(models)))
-            if sorted_models:
-                self._models_cache = (now, cache_key, sorted_models)
-            return sorted_models
+            agg = await fetch_aggregated_models(self.store, persist_channel_models=False)
+            return list(agg.get('models') or [])
         except Exception:
             return []
 

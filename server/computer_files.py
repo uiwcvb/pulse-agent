@@ -1,6 +1,6 @@
 """Task file library and resumable transfers, confined to this application's files."""
 from __future__ import annotations
-import asyncio,base64,inspect,os,re,secrets,threading,time
+import asyncio,base64,inspect,logging,os,re,secrets,threading,time
 from pathlib import Path
 from fastapi import APIRouter,Depends,HTTPException
 from pydantic import BaseModel,Field
@@ -143,9 +143,18 @@ async def mirror_upload_across_nodes(result:dict,*,workspace_root:Path,computer=
         except Exception:pass
     if publish is not None:
         try:
-            res=publish('file.uploaded',{'path':rel,'workspace_path':'uploads/'+clean_name,'name':clean_name,'bytes':file_bytes,'sha256':sha})
+            payload_ev={'type':'file.uploaded','path':rel,'workspace_path':'uploads/'+clean_name,'name':clean_name,'bytes':file_bytes,'sha256':sha}
+            pos_params=[
+                p for p in inspect.signature(publish).parameters.values()
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            if len(pos_params)>=2 and pos_params[1].default is inspect.Parameter.empty:
+                res=publish('file.uploaded',payload_ev)
+            else:
+                res=publish(payload_ev)
             if inspect.isawaitable(res):await res
-        except Exception:pass
+        except Exception as exc:
+            logging.getLogger(__name__).warning('mirror_upload publish failed: %s', exc)
 
 def install_file_routes(app,auth,files:WorkspaceFiles,prefix='/api/files',on_uploaded=None):
     router=APIRouter(prefix=prefix,dependencies=[Depends(auth)])

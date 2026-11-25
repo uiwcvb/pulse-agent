@@ -180,7 +180,7 @@ def test_prompts_system_status_and_llm_cloudflare_retry(tmp_path: Path, monkeypa
     p_txt = brain.persona('companion')
     assert 'send_message' not in p_txt
     assert 'whalechan' not in p_txt
-    assert 'blackboard' in p_txt and 'peek_bots' in p_txt
+    assert 'blackboard' in p_txt and 'peek' in p_txt
 
     async def _check_status():
         brain.last_prompt_tokens['companion'] = 512

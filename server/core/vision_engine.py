@@ -454,10 +454,25 @@ def enrich_cloud_desktop_vision(
             {k: v for k, v in el.items() if k not in ('x', 'y')} if isinstance(el, dict) else el
             for el in clean_res['dom_elements']
         ]
-    wins = list(res.get('x11_windows') or res.get('windows') or [])
-    clean_res['x11_windows'] = wins
-    if 'windows' not in clean_res:
-        clean_res['windows'] = wins
+    raw_wins = list(res.get('x11_windows') or res.get('windows') or [])
+    dedup_wins: list[dict] = []
+    seen_win_keys: dict[tuple[str, str], int] = {}
+    for w_it in raw_wins:
+        if not isinstance(w_it, dict):
+            continue
+        w_copy = dict(w_it)
+        w_key = (str(w_copy.get('title') or '').strip().lower(), str(w_copy.get('wm_class') or '').strip().lower())
+        if not w_copy.get('focused') and w_key[0] and w_key in seen_win_keys:
+            idx = seen_win_keys[w_key]
+            dedup_wins[idx]['duplicate_count'] = int(dedup_wins[idx].get('duplicate_count') or 1) + 1
+            continue
+        if not w_copy.get('focused') and w_key[0]:
+            seen_win_keys[w_key] = len(dedup_wins)
+        dedup_wins.append(w_copy)
+        if len(dedup_wins) >= 16:
+            break
+    clean_res['x11_windows'] = dedup_wins
+    clean_res.pop('windows', None)
     if not b64_raw:
         return clean_res
     try:

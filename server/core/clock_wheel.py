@@ -341,8 +341,9 @@ class UnifiedClockWheel:
         await _do_llm_timer()
 
     async def check_watchpoint(self, watch: dict) -> tuple[bool, str]:
-        import httpx, os
+        import httpx
         from pathlib import Path
+        from core.tool_schemas import public_url, scrub_subprocess_env
         kind = str(watch.get('kind') or 'file_exists').strip().lower()
         target = str(watch.get('target') or '').strip()
         expect = str(watch.get('expect') or '').strip()
@@ -351,10 +352,12 @@ class UnifiedClockWheel:
         try:
             if kind in ('file_exists', 'file_contains'):
                 try:
-                    p = self.brain.harness.path(target)
+                    ws_root = Path(self.brain.harness.root).resolve()
+                    raw_path = Path(target)
+                    p = raw_path.resolve() if raw_path.is_absolute() else self.brain.harness.path(target).resolve()
                 except Exception:
-                    p = Path(target)
-                if not p.exists():
+                    return False, ''
+                if not p.is_relative_to(ws_root) or not p.exists():
                     return False, ''
                 if kind == 'file_exists':
                     return True, f'文件已就绪: {target} ({p.stat().st_size} bytes)'
@@ -364,19 +367,27 @@ class UnifiedClockWheel:
                 proc = await asyncio.create_subprocess_shell(
                     target, cwd=str(self.brain.harness.root),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                    env={**os.environ, 'LANG': 'C.UTF-8'},
+                    env=scrub_subprocess_env(extra={'LANG': 'C.UTF-8'}),
                 )
-                out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
+                try:
+                    out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
+                    return False, ''
                 out_s = (out_b or b'').decode('utf-8', errors='replace').strip()
                 if kind == 'cmd_exit':
                     exp_code = int(expect) if expect.lstrip('-').isdigit() else 0
                     return (True, f'命令退出码 {proc.returncode}: {out_s[:240]}') if proc.returncode == exp_code else (False, '')
                 return (True, f'命令输出命中 "{expect}": {out_s[:240]}') if (expect and expect in out_s) else (False, '')
             if kind == 'http_status':
+                safe_target = await public_url(target)
                 async with httpx.AsyncClient(timeout=6.0, trust_env=False) as client:
-                    r = await client.get(target)
+                    r = await client.get(safe_target)
                 exp_st = int(expect) if expect.isdigit() else 200
-                return (True, f'HTTP {target} 返回状态码 {r.status_code}') if r.status_code == exp_st else (False, '')
+                return (True, f'HTTP {safe_target} 返回状态码 {r.status_code}') if r.status_code == exp_st else (False, '')
         except Exception:
             return False, ''
         return False, ''

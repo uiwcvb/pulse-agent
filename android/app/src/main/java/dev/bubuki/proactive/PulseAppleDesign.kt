@@ -3,9 +3,11 @@ package dev.bubuki.proactive
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.*
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -19,6 +21,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -26,6 +29,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 
 /**
  * [Module] PulseAppleDesign
@@ -59,15 +64,15 @@ internal fun AppleNavIconButton(
 ) {
     val c = LocalPulsePalette.current
     val haptics = LocalHapticFeedback.current
-    val reduceMotion = LocalReduceMotion.current
+    val reduceMotion = rememberReducedMotion()
     val bgCol by animateColorAsState(
         targetValue = if (active) c.accent.copy(alpha = 0.16f) else c.fill.copy(alpha = 0.76f),
-        animationSpec = tween(150),
+        animationSpec = if (reduceMotion) snap() else tween(150),
         label = "apple_nav_bg"
     )
     val iconTint by animateColorAsState(
         targetValue = if (active) c.accent else c.ink,
-        animationSpec = tween(150),
+        animationSpec = if (reduceMotion) snap() else tween(150),
         label = "apple_nav_tint"
     )
 
@@ -92,10 +97,10 @@ internal fun AppleNavIconButton(
                 targetState = icon,
                 transitionSpec = {
                     if (reduceMotion) {
-                        fadeIn(tween(100)) togetherWith fadeOut(tween(80))
+                        fadeIn(tween(110)) togetherWith fadeOut(tween(90))
                     } else {
-                        (scaleIn(initialScale = 0.84f, animationSpec = spring(0.75f, 520f)) + fadeIn(tween(120))) togetherWith
-                            (scaleOut(targetScale = 0.84f) + fadeOut(tween(90)))
+                        (scaleIn(initialScale = 0.90f, animationSpec = iosInteractiveSpring()) + fadeIn(tween(130))) togetherWith
+                            (scaleOut(targetScale = 0.90f) + fadeOut(tween(100)))
                     }
                 },
                 label = "apple_nav_icon"
@@ -242,37 +247,50 @@ internal fun AppleSearchField(
             if (query.isNotEmpty()) {
                 Box(
                     Modifier
-                        .size(18.dp)
-                        .clip(CircleShape)
-                        .background(c.faint.copy(alpha = 0.36f))
-                        .clickable { onQueryChange(null) },
+                        .size(40.dp)
+                        .iosPressScale(0.90f) { onQueryChange(null) }
+                        .semantics { contentDescription = "清空搜索" },
                     contentAlignment = Alignment.Center
                 ) {
-                    PulseIcon("close", c.surface, Modifier.size(10.dp))
+                    Box(
+                        Modifier
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(c.faint.copy(alpha = 0.36f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        PulseIcon("close", c.surface, Modifier.size(10.dp))
+                    }
                 }
             }
         }
 
+        val searchReduce = rememberReducedMotion()
         AnimatedVisibility(
             visible = isFocused || query.isNotEmpty(),
-            enter = if (reduceMotion) fadeIn(tween(100)) else expandHorizontally(iosInteractiveSpring()) + fadeIn(tween(140)),
-            exit = if (reduceMotion) fadeOut(tween(80)) else shrinkHorizontally(iosFluidSpring()) + fadeOut(tween(100))
+            enter = if (searchReduce) fadeIn(tween(110)) else expandHorizontally(iosInteractiveSpring()) + fadeIn(tween(140)),
+            exit = if (searchReduce) fadeOut(tween(90)) else shrinkHorizontally(iosFluidSpring()) + fadeOut(tween(110))
         ) {
-            Text(
-                "取消",
-                color = c.accent,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                modifier = Modifier
-                    .padding(start = 8.dp)
+            Box(
+                Modifier
+                    .padding(start = 6.dp)
+                    .heightIn(min = 40.dp)
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable {
+                    .iosPressScale(0.95f) {
                         focus.clearFocus()
                         onQueryChange(null)
                     }
-                    .padding(horizontal = 4.dp, vertical = 6.dp)
-            )
+                    .padding(horizontal = 6.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "取消",
+                    color = c.accent,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1
+                )
+            }
         }
     }
 }
@@ -291,17 +309,17 @@ internal fun AppleWorkspaceHub(
 
     AnimatedVisibility(
         visible = visible,
-        enter = if (reduceMotion) {
-            fadeIn(tween(120))
+        enter = if (rememberReducedMotion()) {
+            fadeIn(tween(110))
         } else {
-            expandVertically(spring(dampingRatio = 0.82f, stiffness = 400f)) +
+            expandVertically(iosFluidSpring()) +
                 fadeIn(tween(160)) +
-                scaleIn(initialScale = 0.96f, animationSpec = spring(dampingRatio = 0.82f, stiffness = 420f))
+                scaleIn(initialScale = 0.96f, animationSpec = iosInteractiveSpring())
         },
-        exit = if (reduceMotion) {
-            fadeOut(tween(100))
+        exit = if (rememberReducedMotion()) {
+            fadeOut(tween(90))
         } else {
-            shrinkVertically(spring(dampingRatio = 0.86f, stiffness = 440f)) + fadeOut(tween(120))
+            shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
         }
     ) {
         Column(
@@ -334,8 +352,8 @@ internal fun AppleWorkspaceHub(
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 WorkspaceQuickTile(
                     icon = "vault",
-                    title = "透明记忆库",
-                    subtitle = "知识与笔记",
+                    title = "向量记忆空间",
+                    subtitle = "语义关联与关键词",
                     tint = c.accent,
                     modifier = Modifier.weight(1f)
                 ) { onDismiss(); model.openVault("INDEX.md") }
@@ -353,9 +371,9 @@ internal fun AppleWorkspaceHub(
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
+                    .clip(RoundedCornerShape(10.dp))
                     .background(c.surface.copy(alpha = 0.88f))
-                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
@@ -378,10 +396,6 @@ internal fun AppleWorkspaceHub(
                         .clip(RoundedCornerShape(9.dp))
                         .background(c.fill.copy(alpha = 0.85f))
                         .padding(2.dp)
-                        .iosPressScale(0.95f) {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            model.toggleAppearanceQuick()
-                        }
                         .semantics { contentDescription = if (s.dark) "切换日间模式" else "切换夜间模式" },
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -389,9 +403,15 @@ internal fun AppleWorkspaceHub(
                         val selected = s.dark == isDarkOpt
                         Box(
                             Modifier
+                                .heightIn(min = 36.dp)
                                 .clip(RoundedCornerShape(7.dp))
                                 .background(if (selected) c.surface else Color.Transparent)
-                                .padding(horizontal = 9.dp, vertical = 3.5.dp),
+                                .iosPressScale(0.95f) {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    model.updateSettingsField(appearance = if (isDarkOpt) "dark" else "light")
+                                }
+                                .semantics { this.selected = selected }
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
@@ -419,12 +439,12 @@ internal fun AppleLiveActivityPill(
 ) {
     val c = LocalPulsePalette.current
     val haptics = LocalHapticFeedback.current
-    val reduceMotion = LocalReduceMotion.current
+    val reduceMotion = rememberReducedMotion()
 
     AnimatedVisibility(
         visible = visible,
-        enter = if (reduceMotion) fadeIn(tween(120)) else expandVertically(iosFluidSpring()) + fadeIn(tween(160)),
-        exit = if (reduceMotion) fadeOut(tween(100)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(120)),
+        enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+        exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110)),
         modifier = modifier
     ) {
         Row(
@@ -434,18 +454,19 @@ internal fun AppleLiveActivityPill(
                 .clip(RoundedCornerShape(14.dp))
                 .background(c.elevated)
                 .border(0.5.dp, c.green.copy(alpha = 0.28f), RoundedCornerShape(14.dp))
-                .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                .padding(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(
                 Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(10.dp))
+                    .heightIn(min = 40.dp)
+                    .clip(RoundedCornerShape(8.dp))
                     .iosPressScale(0.97f) {
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onExpand()
                     }
-                    .padding(vertical = 3.dp),
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
@@ -467,13 +488,14 @@ internal fun AppleLiveActivityPill(
             }
             Box(
                 Modifier
-                    .clip(RoundedCornerShape(10.dp))
+                    .heightIn(min = 40.dp)
+                    .clip(RoundedCornerShape(8.dp))
                     .background(c.warn.copy(alpha = 0.14f))
                     .iosPressScale(0.93f) {
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                         onDestroy()
                     }
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
@@ -483,6 +505,149 @@ internal fun AppleLiveActivityPill(
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1
                 )
+            }
+        }
+    }
+}
+
+internal data class MessageContextAction(
+    val icon: String,
+    val label: String,
+    val tint: Color,
+    val onClick: () -> Unit
+)
+
+@Composable
+internal fun AppleMessageContextOverlay(
+    visible: Boolean,
+    previewText: String,
+    telemetry: String,
+    actions: List<MessageContextAction>,
+    onDismiss: () -> Unit
+) {
+    if (!visible) return
+    val c = LocalPulsePalette.current
+    val haptics = LocalHapticFeedback.current
+    val reduceMotion = rememberReducedMotion()
+    var entered by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { entered = true }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = if (c.isDark) 0.56f else 0.36f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onDismiss
+                )
+                .padding(horizontal = 24.dp, vertical = 32.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            AnimatedVisibility(
+                visible = entered || reduceMotion,
+                enter = if (reduceMotion) fadeIn(tween(110))
+                else scaleIn(iosInteractiveSpring(), initialScale = 0.94f) + fadeIn(tween(150))
+            ) {
+                Column(
+                    Modifier
+                        .widthIn(max = 360.dp)
+                        .fillMaxWidth()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = {}
+                        ),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (previewText.isNotBlank()) {
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(c.surface.copy(alpha = 0.96f))
+                                .border(0.5.dp, c.line.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
+                                .padding(horizontal = 14.dp, vertical = 11.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                previewText,
+                                color = c.ink,
+                                fontSize = 13.5.sp,
+                                lineHeight = 19.sp,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (telemetry.isNotBlank()) {
+                                Text(
+                                    telemetry,
+                                    color = c.muted,
+                                    fontSize = 11.sp,
+                                    style = TextStyle(fontFeatureSettings = "tnum")
+                                )
+                            }
+                        }
+                    } else if (telemetry.isNotBlank()) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(c.surface.copy(alpha = 0.96f))
+                                .padding(horizontal = 14.dp, vertical = 8.dp)
+                        ) {
+                            Text(
+                                telemetry,
+                                color = c.muted,
+                                fontSize = 11.5.sp,
+                                style = TextStyle(fontFeatureSettings = "tnum")
+                            )
+                        }
+                    }
+
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(c.surface.copy(alpha = 0.98f))
+                            .border(0.5.dp, c.line.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
+                            .padding(5.dp)
+                    ) {
+                        actions.forEachIndexed { idx, act ->
+                            if (idx > 0) {
+                                HorizontalDivider(
+                                    Modifier.padding(horizontal = 10.dp),
+                                    color = c.line.copy(alpha = 0.55f),
+                                    thickness = 0.5.dp
+                                )
+                            }
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 46.dp)
+                                    .clip(RoundedCornerShape(11.dp))
+                                    .iosPressScale(0.97f) {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        act.onClick()
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    act.label,
+                                    Modifier.weight(1f),
+                                    color = act.tint,
+                                    fontSize = 15.5.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                PulseIcon(act.icon, act.tint, Modifier.size(18.dp))
+                            }
+                        }
+                    }
+                }
             }
         }
     }

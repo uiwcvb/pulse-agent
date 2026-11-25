@@ -28,7 +28,9 @@ import io
 import json
 import os
 import platform
+import random
 import secrets
+import shlex
 import socket
 import subprocess
 import sys
@@ -36,6 +38,7 @@ import time
 import webbrowser
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import contextlib
 
@@ -522,6 +525,9 @@ class DesktopWorkspaceHarness:
             url = str(args.get('url') or args.get('text') or '').strip()
             if not url:
                 return {'ok': False, 'error': 'url 不能为空'}
+            parsed_url = urlsplit(url)
+            if parsed_url.scheme.lower() not in ('http', 'https') or not parsed_url.netloc:
+                return {'ok': False, 'error': f'仅允许打开 http:// 或 https:// 链接: {url}'}
             if not webbrowser.open(url, new=2, autoraise=False):
                 return {'ok': False, 'error': f'无法打开浏览器 URL: {url}'}
             return {'ok': True, 'opened_url': url}
@@ -530,13 +536,21 @@ class DesktopWorkspaceHarness:
             if not app_cmd:
                 return {'ok': False, 'error': 'app 不能为空'}
             try:
+                raw_tokens = shlex.split(app_cmd, posix=(not IS_WIN))
+                argv = [
+                    tok[1:-1] if (IS_WIN and len(tok) >= 2 and ((tok[0] == '"' and tok[-1] == '"') or (tok[0] == "'" and tok[-1] == "'"))) else tok
+                    for tok in raw_tokens
+                ]
+                argv = [tok for tok in argv if tok]
+                if not argv:
+                    return {'ok': False, 'error': 'app 不能为空'}
                 if IS_WIN:
                     si = subprocess.STARTUPINFO()
                     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                     si.wShowWindow = SW_SHOWNOACTIVATE
-                    subprocess.Popen(app_cmd, shell=True, startupinfo=si)
+                    subprocess.Popen(argv, shell=False, startupinfo=si)
                 else:
-                    subprocess.Popen(app_cmd, shell=True)
+                    subprocess.Popen(argv, shell=False)
             except Exception as exc:
                 return {'ok': False, 'error': f'启动应用失败: {exc}'}
             await asyncio.sleep(0.6)
@@ -727,14 +741,65 @@ class DesktopWorkspaceHarness:
         return {'ok': False, 'error': f'未知桌面端指令: {op}'}
 
 
-async def run_agent_loop(server_url: str, token: str, device_id: str) -> None:
+_PC_CONFIG_PATH = Path.home() / '.pulse-agent' / 'pc_config.json'
+
+
+def parse_pair_code(raw: str) -> tuple[str, str] | None:
+    clean = str(raw or '').strip()
+    if not clean:
+        return None
+    if clean.upper().startswith('DSCLAW1:'):
+        clean = clean[len('DSCLAW1:'):].strip()
+    if '|' not in clean:
+        return None
+    url_part, tok_part = clean.rsplit('|', 1)
+    url_clean = url_part.strip().rstrip('/')
+    tok_clean = tok_part.strip()
+    if not url_clean or not tok_clean:
+        return None
+    return url_clean, tok_clean
+
+
+def load_saved_pc_config() -> dict[str, str]:
+    try:
+        if _PC_CONFIG_PATH.is_file():
+            data = json.loads(_PC_CONFIG_PATH.read_text('utf-8'))
+            if isinstance(data, dict):
+                return {
+                    'server_url': str(data.get('server_url') or '').strip().rstrip('/'),
+                    'token': str(data.get('token') or '').strip(),
+                    'device_id': str(data.get('device_id') or '').strip(),
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def save_pc_config(server_url: str, token: str, device_id: str) -> Path:
+    _PC_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'server_url': server_url.strip().rstrip('/'),
+        'token': token.strip(),
+        'device_id': device_id.strip(),
+        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+    _PC_CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    if os.name == 'posix':
+        with contextlib.suppress(OSError):
+            os.chmod(_PC_CONFIG_PATH, 0o600)
+    return _PC_CONFIG_PATH
+
+
+async def run_agent_loop(server_url: str, token: str, device_id: str, check_only: bool = False) -> None:
     import websockets  # type: ignore
 
     ws_base = server_url.rstrip('/').replace('https://', 'wss://').replace('http://', 'ws://')
     ws_url = ws_base + '/ws/device'
     harness = DesktopWorkspaceHarness()
 
+    backoff = 1.5
     while True:
+        pending_tasks: set[asyncio.Task[Any]] = set()
         try:
             sw, sh = get_screen_size()
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, max_size=8_000_000) as ws:
@@ -753,6 +818,34 @@ async def run_agent_loop(server_url: str, token: str, device_id: str) -> None:
                     'screen': {'width': sw, 'height': sh, 'scale': 1.0},
                 }
                 await ws.send(json.dumps(hello))
+                if check_only:
+                    try:
+                        await asyncio.wait_for(ws.recv(), timeout=1.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    if getattr(ws, 'close_code', None) not in (None, 1000):
+                        raise RuntimeError(f'Server closed WebSocket during handshake (code={ws.close_code})')
+                    print(f'DESKTOP_AGENT_CONNECTED server={server_url} device_id={device_id}')
+                    return
+                backoff = 1.5
+                ws_send_lock = asyncio.Lock()
+
+                async def _dispatch_cmd(ev_req_id: str, ev_op: str, ev_args: dict[str, Any]) -> None:
+                    try:
+                        res = await harness.execute(ev_op, ev_args)
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as exc:
+                        res = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+                    reply = {
+                        'type': 'desktop_workspace_result',
+                        'request_id': ev_req_id,
+                        'result': res,
+                    }
+                    with contextlib.suppress(Exception):
+                        async with ws_send_lock:
+                            await ws.send(json.dumps(reply))
+
                 async for raw_msg in ws:
                     event = json.loads(raw_msg)
                     ev_type = event.get('type')
@@ -760,35 +853,51 @@ async def run_agent_loop(server_url: str, token: str, device_id: str) -> None:
                         req_id = event.get('request_id', '')
                         op = event.get('op', 'status')
                         cmd_args = event.get('args') or {}
-                        try:
-                            res = await harness.execute(op, cmd_args)
-                        except Exception as exc:
-                            res = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
-                        reply = {
-                            'type': 'desktop_workspace_result',
-                            'request_id': req_id,
-                            'result': res,
-                        }
-                        await ws.send(json.dumps(reply))
+                        task = asyncio.create_task(_dispatch_cmd(req_id, op, cmd_args))
+                        pending_tasks.add(task)
+                        task.add_done_callback(pending_tasks.discard)
         except Exception as exc:
-            print(f'[desktop-agent] Disconnected ({exc}), reconnecting in 3s...', file=sys.stderr)
-            await asyncio.sleep(3.0)
+            if check_only:
+                raise SystemExit(f'DESKTOP_AGENT_CHECK_FAILED: {exc}')
+            wait_s = min(30.0, backoff) + random.uniform(0.0, 0.75)
+            print(f'[desktop-agent] Disconnected ({exc}), reconnecting in {wait_s:.1f}s...', file=sys.stderr)
+            backoff = min(30.0, backoff * 2.0)
+            await asyncio.sleep(wait_s)
+        finally:
+            for t in list(pending_tasks):
+                t.cancel()
+            if pending_tasks:
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
 def main() -> None:
+    saved = load_saved_pc_config()
     parser = argparse.ArgumentParser(description='Pulse Lightweight Non-Intrusive Desktop Agent')
-    parser.add_argument('--server', default=os.getenv('PULSE_SERVER_URL', 'http://127.0.0.1:18190'))
-    parser.add_argument('--token', default=os.getenv('PULSE_DEVICE_TOKEN', ''))
-    parser.add_argument('--device-id', default=os.getenv('PULSE_DEVICE_ID', f'desktop-{socket.gethostname().lower()}'))
+    parser.add_argument('--pair-code', default=os.getenv('PULSE_PAIR_CODE', os.getenv('DS_CLAW_PAIR_CODE', '')), help='DSCLAW1:<server_url>|<token> pair code')
+    parser.add_argument('--server', default=os.getenv('PULSE_SERVER_URL', saved.get('server_url') or 'http://127.0.0.1:18190'))
+    parser.add_argument('--token', default=os.getenv('PULSE_DEVICE_TOKEN', saved.get('token') or ''))
+    parser.add_argument('--device-id', default=os.getenv('PULSE_DEVICE_ID', saved.get('device_id') or f'desktop-{socket.gethostname().lower()}'))
+    parser.add_argument('--save', action='store_true', help='Save server/token/device_id to ~/.pulse-agent/pc_config.json')
+    parser.add_argument('--check', action='store_true', help='Perform live WebSocket handshake test and exit')
     args = parser.parse_args()
+    server_url = args.server.strip().rstrip('/')
     token = args.token.strip()
+    if args.pair_code.strip():
+        parsed = parse_pair_code(args.pair_code)
+        if not parsed:
+            raise SystemExit('无效配对码格式，期望 DSCLAW1:<server_url>|<token>')
+        server_url, token = parsed
     if not token:
         tok_file = Path(__file__).parent.parent / 'private' / 'device-token'
         if tok_file.exists():
             token = tok_file.read_text('utf-8').strip()
     if not token:
-        raise SystemExit('请提供 --token 或设置 PULSE_DEVICE_TOKEN')
-    asyncio.run(run_agent_loop(args.server, token, args.device_id))
+        raise SystemExit('请提供 --pair-code、--token，或设置 PULSE_DEVICE_TOKEN')
+    if args.save:
+        cfg_path = save_pc_config(server_url, token, args.device_id)
+        print(f'[desktop-agent] Saved config -> {cfg_path}')
+    asyncio.run(run_agent_loop(server_url, token, args.device_id, check_only=args.check))
 
 
 if __name__ == '__main__':

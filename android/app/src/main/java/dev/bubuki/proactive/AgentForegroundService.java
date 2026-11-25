@@ -43,20 +43,23 @@ public class AgentForegroundService extends Service {
             },"vd-force-stop").start();
         }
     }
+    public static final String ACTION_RECONNECT = "dev.bubuki.proactive.action.RECONNECT";
     private static volatile Ringtone activeAlarmRingtone=null;
     private static volatile Vibrator activeVibrator=null;
     private final Handler handler=new Handler(Looper.getMainLooper());
     private final ExecutorService io=Executors.newSingleThreadExecutor();
     private final ExecutorService cmdPool=Executors.newCachedThreadPool();
-    private WebSocket socket;
-    private byte[] sessionKey;
-    private boolean stopped=false;
-    private int retrySeconds=2;
+    private volatile WebSocket socket;
+    private volatile byte[] sessionKey;
+    private volatile boolean stopped=false;
+    private volatile int retrySeconds=2;
+    private volatile long connectStartedMs=0L;
     private OverlayController overlay;
-    private JSONObject pendingOverlay;
+    private volatile JSONObject pendingOverlay;
     private BroadcastReceiver screen;
-    private final Set<String> notified=new HashSet<>();
-    private final Set<String> nonces=new HashSet<>();
+    private final LinkedHashSet<String> notified=new LinkedHashSet<>();
+    private final LinkedHashMap<String,Integer> notifIdByMsgId=new LinkedHashMap<>();
+    private final LinkedHashSet<String> nonces=new LinkedHashSet<>();
     private long snoozeUntil=0;
     private volatile long lastIdlePingSentMs=0L;
     private volatile long lastInboundWsMs=0L;
@@ -120,10 +123,51 @@ public class AgentForegroundService extends Service {
         ));
     }
 
+    private void safeExecute(ExecutorService pool, Runnable task) {
+        if (stopped) return;
+        try {
+            pool.execute(task);
+        } catch (RejectedExecutionException ignored) {}
+    }
+
+    private static boolean hasValidConfigForService(Context ctx) {
+        if (ctx == null) return false;
+        SecurePrefs.FastConfig cfg = SecurePrefs.readFastConfig(ctx);
+        return cfg.background
+            && cfg.serverUrl != null && !cfg.serverUrl.trim().isEmpty()
+            && cfg.deviceToken != null && !cfg.deviceToken.trim().isEmpty();
+    }
+
+    public static void clearPendingOverlay(String id) {
+        AgentForegroundService svc = activeService;
+        if (svc == null) return;
+        JSONObject cur = svc.pendingOverlay;
+        if (cur != null && (id == null || id.isEmpty() || id.equals(cur.optString("id")))) {
+            svc.pendingOverlay = null;
+        }
+    }
+
+    public static void reconnectOrStart(Context ctx) {
+        if (ctx == null) return;
+        Context appCtx = ctx.getApplicationContext();
+        AgentForegroundService svc = activeService;
+        if (svc != null && !svc.stopped) {
+            if (!hasValidConfigForService(appCtx)) {
+                svc.handler.post(() -> svc.stopSelf());
+                return;
+            }
+            svc.handler.post(() -> svc.forceReconnectSocket("config_changed"));
+            return;
+        }
+        if (hasValidConfigForService(appCtx)) {
+            try { appCtx.startForegroundService(new Intent(appCtx, AgentForegroundService.class)); } catch (Exception ignored) {}
+        }
+    }
+
     public static void forceReconnectFromUi(Context ctx){
         AgentForegroundService svc=activeService;
         if(svc==null||svc.stopped){
-            if(ctx!=null){
+            if(ctx!=null && hasValidConfigForService(ctx)){
                 try{
                     Intent si=new Intent(ctx.getApplicationContext(),AgentForegroundService.class);
                     ctx.getApplicationContext().startForegroundService(si);
@@ -142,15 +186,16 @@ public class AgentForegroundService extends Service {
             return;
         }
         final WebSocket probedWs=svc.socket;
+        final byte[] probedKey=svc.sessionKey;
         final long sentAt=System.currentTimeMillis();
         final CompletableFuture<Long> fut=new CompletableFuture<>();
         svc.pendingProbeFuture=fut;
         svc.lastManualProbeSentMs=sentAt;
-        svc.io.execute(()->{
+        svc.safeExecute(svc.io, ()->{
             try{
-                if(svc.socket==probedWs&&svc.sessionKey!=null){
+                if(svc.socket==probedWs&&probedKey!=null){
                     int vdId=RootPhoneHarness.INSTANCE.currentDisplayId();
-                    boolean ok=probedWs.send(SecureTransport.encrypt(svc.sessionKey,
+                    boolean ok=probedWs.send(SecureTransport.encrypt(probedKey,
                         new JSONObject().put("type","ping").put("virtual_display_id",vdId)).toString());
                     if(!ok) fut.completeExceptionally(new RuntimeException("ws_send_rejected"));
                 }else{
@@ -160,7 +205,7 @@ public class AgentForegroundService extends Service {
                 fut.completeExceptionally(e);
             }
         });
-        svc.cmdPool.execute(()->{
+        svc.safeExecute(svc.cmdPool, ()->{
             try{
                 long rtt=fut.get(3500L,TimeUnit.MILLISECONDS);
                 svc.lastPongRttMs=rtt;
@@ -186,50 +231,61 @@ public class AgentForegroundService extends Service {
     public static void ensureHealthyConnection(Context ctx){
         AgentForegroundService svc=activeService;
         if(svc==null||svc.stopped){
-            if(ctx!=null){
+            if(ctx!=null && hasValidConfigForService(ctx)){
                 try{
-                    JSONObject settings=SecurePrefs.readFast(ctx);
-                    if(settings.optBoolean("background",true)){
-                        Intent si=new Intent(ctx.getApplicationContext(),AgentForegroundService.class);
-                        ctx.getApplicationContext().startForegroundService(si);
-                    }
+                    Intent si=new Intent(ctx.getApplicationContext(),AgentForegroundService.class);
+                    ctx.getApplicationContext().startForegroundService(si);
                 }catch(Exception ignored){}
             }
             return;
         }
-        long now=System.currentTimeMillis();
-        if(!isWsReady()){
-            svc.retrySeconds=2;
-            svc.handler.removeCallbacks(svc.reconnect);
-            svc.connect();
+        svc.handler.post(()->svc.checkHealthOnHandler(false));
+    }
+
+    private void checkHealthOnHandler(boolean forceImmediateProbe) {
+        if (stopped) return;
+        if (!hasValidConfigForService(this)) {
+            refreshHealth("UNPAIRED");
             return;
         }
-        long lastIn=svc.lastInboundWsMs;
-        long idleMs=lastIn>0?(now-lastIn):0L;
-        if(lastIn>0&&idleMs>40_000L){
-            svc.forceReconnectSocket("ws_idle_zombie");
+        long now = System.currentTimeMillis();
+        if (!isWsReady()) {
+            // Respect an active in-flight handshake up to 10s so fast poll ticks never thrash it.
+            if (socket != null && !connected && (now - connectStartedMs) < 10_000L) {
+                return;
+            }
+            retrySeconds = 2;
+            handler.removeCallbacks(reconnect);
+            connect();
             return;
         }
-        if(idleMs>12_000L&&(now-svc.lastProbeSentMs)>4_000L){
-            svc.lastProbeSentMs=now;
-            final WebSocket probedWs=svc.socket;
-            final long sentAt=now;
-            svc.io.execute(()->{
-                try{
-                    if(probedWs!=null&&svc.sessionKey!=null){
-                        int vdId=RootPhoneHarness.INSTANCE.currentDisplayId();
-                        probedWs.send(SecureTransport.encrypt(svc.sessionKey,
-                            new JSONObject().put("type","ping").put("virtual_display_id",vdId)).toString());
+        long lastIn = lastInboundWsMs;
+        long idleMs = lastIn > 0 ? (now - lastIn) : 0L;
+        if (lastIn > 0 && idleMs > 40_000L) {
+            forceReconnectSocket("ws_idle_zombie");
+            return;
+        }
+        if ((forceImmediateProbe && idleMs > 2_000L) || (idleMs > 12_000L && (now - lastProbeSentMs) > 4_000L)) {
+            lastProbeSentMs = now;
+            final WebSocket probedWs = socket;
+            final byte[] probedKey = sessionKey;
+            final long sentAt = now;
+            safeExecute(io, () -> {
+                try {
+                    if (probedWs != null && probedKey != null) {
+                        int vdId = RootPhoneHarness.INSTANCE.currentDisplayId();
+                        probedWs.send(SecureTransport.encrypt(probedKey,
+                            new JSONObject().put("type", "ping").put("virtual_display_id", vdId)).toString());
                     }
-                }catch(Exception e){
-                    svc.handler.post(()->svc.forceReconnectIfSame(probedWs,"ws_probe_send_failed"));
+                } catch (Exception e) {
+                    handler.post(() -> forceReconnectIfSame(probedWs, "ws_probe_send_failed"));
                 }
             });
-            svc.handler.postDelayed(()->{
-                if(svc.socket==probedWs&&svc.lastInboundWsMs<sentAt){
-                    svc.forceReconnectIfSame(probedWs,"ws_probe_timeout");
+            handler.postDelayed(() -> {
+                if (this.socket == probedWs && this.lastInboundWsMs < sentAt) {
+                    forceReconnectIfSame(probedWs, "ws_probe_timeout");
                 }
-            },3500L);
+            }, 3500L);
         }
     }
 
@@ -363,16 +419,15 @@ public class AgentForegroundService extends Service {
                         handler.post(()->{
                             if(!stopped){
                                 retrySeconds=2;
-                                ensureHealthyConnection(AgentForegroundService.this);
+                                checkHealthOnHandler(true);
                             }
                         });
                     }
                     @Override public void onLost(android.net.Network network){
                         handler.post(()->{
                             if(!stopped){
-                                retrySeconds=2;
-                                handler.removeCallbacks(reconnect);
-                                handler.postDelayed(reconnect,1500L);
+                                lastDisconnectReason="network_lost";
+                                refreshHealth("sync");
                             }
                         });
                     }
@@ -383,22 +438,39 @@ public class AgentForegroundService extends Service {
         }catch(Throwable ignored){}
         connect();
     }
-    @Override public int onStartCommand(Intent intent,int flags,int startId){return START_STICKY;}
+    @Override public int onStartCommand(Intent intent,int flags,int startId){
+        if(intent!=null && ACTION_RECONNECT.equals(intent.getAction())){
+            handler.post(()->forceReconnectSocket("config_changed"));
+        }
+        return START_STICKY;
+    }
     private void connect(){
         if(stopped)return;
+        if(!hasValidConfigForService(this)){
+            refreshHealth("UNPAIRED");
+            return;
+        }
+        connectStartedMs=System.currentTimeMillis();
         final long myGen=wsGeneration.incrementAndGet();
-        io.execute(()->{try{
+        safeExecute(io, ()->{try{
             if(stopped||wsGeneration.get()!=myGen)return;
-            JSONObject settings=SecurePrefs.read(this);
-            if(!settings.optBoolean("background",true)){handler.post(this::stopSelf);return;}
+            SecurePrefs.FastConfig cfg=SecurePrefs.readFastConfig(this);
+            if(!cfg.background){handler.post(this::stopSelf);return;}
+            if(!hasValidConfigForService(this)){refreshHealth("UNPAIRED");return;}
             WebSocket prev=socket;
             socket=null;
             if(prev!=null){try{prev.cancel();}catch(Throwable ignored){}}
             SecureTransport.Session s=new SecureTransport(this).session(new JSONObject(), true);
-            sessionKey=s.key;nonces.clear();
-            OkHttpClient client=SecureTransport.HTTP.newBuilder().pingInterval(25,TimeUnit.SECONDS).readTimeout(0,TimeUnit.SECONDS).build();
+            sessionKey=s.key;
+            synchronized(nonces){nonces.clear();}
+            int pingSec=(PowerSaveController.isPowerSaveActive(this)||!screenInteractive)?45:30;
+            OkHttpClient client=SecureTransport.HTTP.newBuilder()
+                .pingInterval(pingSec,TimeUnit.SECONDS)
+                .readTimeout(0,TimeUnit.SECONDS)
+                .callTimeout(0,TimeUnit.SECONDS)
+                .build();
             String url=s.base.replaceFirst("^http","ws")+"/ws/client";
-            client.newWebSocket(new Request.Builder().url(url).build(),new WebSocketListener(){
+            WebSocket createdWs=client.newWebSocket(new Request.Builder().url(url).build(),new WebSocketListener(){
                 @Override public void onOpen(WebSocket ws,Response response){
                     if(wsGeneration.get()!=myGen){try{ws.cancel();}catch(Throwable ignored){} return;}
                     socket=ws;
@@ -410,7 +482,15 @@ public class AgentForegroundService extends Service {
                     lastInboundWsMs=System.currentTimeMillis();
                     try{
                         JSONObject packet=new JSONObject(text);String nonce=packet.getString("nonce");
-                        synchronized(nonces){if(nonces.contains(nonce))return;if(nonces.size()>1000)nonces.clear();nonces.add(nonce);}
+                        synchronized(nonces){
+                            if(nonces.contains(nonce))return;
+                            while(nonces.size()>=1000){
+                                Iterator<String> it=nonces.iterator();
+                                if(!it.hasNext())break;
+                                it.next();it.remove();
+                            }
+                            nonces.add(nonce);
+                        }
                         JSONObject event=SecureTransport.decrypt(s.key,packet);
                         if("rpc_res".equals(event.optString("type"))){
                             String reqId=event.optString("id","");
@@ -427,24 +507,33 @@ public class AgentForegroundService extends Service {
                     }
                 }
                 @Override public void onFailure(WebSocket ws,Throwable t,Response r){
-                    if(wsGeneration.get()!=myGen||socket!=ws)return;
+                    if(wsGeneration.get()!=myGen||(socket!=null&&socket!=ws))return;
                     connected=false;socket=null;
                     lastDisconnectReason=(t!=null&&t.getMessage()!=null)?t.getMessage():"ws_failure";
                     failPendingRpcs("ws_failure");refreshHealth("RETRYING");handler.post(()->retry());
                 }
                 @Override public void onClosed(WebSocket ws,int code,String reason){
-                    if(wsGeneration.get()!=myGen||socket!=ws)return;
+                    if(wsGeneration.get()!=myGen||(socket!=null&&socket!=ws))return;
                     connected=false;socket=null;
                     lastDisconnectReason=(reason!=null&&!reason.isEmpty())?reason:("ws_closed_"+code);
                     failPendingRpcs("ws_closed");refreshHealth("RETRYING");handler.post(()->retry());
                 }
                 @Override public void onClosing(WebSocket ws,int code,String reason){ws.close(code,reason);}
             });
+            if(wsGeneration.get()==myGen){
+                socket=createdWs;
+            }else{
+                try{createdWs.cancel();}catch(Throwable ignored){}
+            }
         }catch(Exception e){if(wsGeneration.get()==myGen)handler.post(()->retry());}});
     }
     private void retry(){
         connected=false;broadcast();if(stopped)return;
-        handler.removeCallbacks(reconnect);handler.postDelayed(reconnect,retrySeconds*1000L);retrySeconds=Math.min(screenInteractive?60:120,retrySeconds*2);
+        handler.removeCallbacks(reconnect);
+        long baseMs=retrySeconds*1000L;
+        long jitteredMs=Math.max(1000L,(long)(baseMs*(0.8+ThreadLocalRandom.current().nextDouble()*0.4)));
+        handler.postDelayed(reconnect,jitteredMs);
+        retrySeconds=Math.min(screenInteractive?60:120,retrySeconds*2);
     }
     private final Runnable reconnect=this::connect;
     private void handle(JSONObject event){
@@ -483,10 +572,12 @@ public class AgentForegroundService extends Service {
                 return;
             }
             lastIdlePingSentMs=now;
-            io.execute(()->{
+            safeExecute(io, ()->{
                 try{
-                    if(socket!=null&&sessionKey!=null){
-                        socket.send(SecureTransport.encrypt(sessionKey,new JSONObject().put("type","ping").put("virtual_display_id",vdId)).toString());
+                    final WebSocket ws=socket;
+                    final byte[] key=sessionKey;
+                    if(ws!=null&&key!=null){
+                        ws.send(SecureTransport.encrypt(key,new JSONObject().put("type","ping").put("virtual_display_id",vdId)).toString());
                     }
                 }catch(Exception ignored){}
             });
@@ -495,12 +586,19 @@ public class AgentForegroundService extends Service {
         if(type.equals("snooze")){
             snoozeUntil=event.optLong("until")*1000;pendingOverlay=null;overlay.hide();
             stopEmergencyAlarm(this);
-            for(String id:notified)getSystemService(NotificationManager.class).cancel(id.hashCode());
+            NotificationManager nm=getSystemService(NotificationManager.class);
+            for(String id:new ArrayList<>(notified)){
+                Integer nid=notifIdByMsgId.remove(id);
+                nm.cancel(nid!=null?nid:id.hashCode());
+            }
         }
         if(type.equals("ack")){
             JSONArray ids=event.optJSONArray("ids");
+            NotificationManager nm=getSystemService(NotificationManager.class);
             if(ids!=null)for(int i=0;i<ids.length();i++){
-                String id=ids.optString(i);getSystemService(NotificationManager.class).cancel(id.hashCode());
+                String id=ids.optString(i);
+                Integer nid=notifIdByMsgId.remove(id);
+                nm.cancel(nid!=null?nid:id.hashCode());
                 if(pendingOverlay!=null&&id.equals(pendingOverlay.optString("id"))){pendingOverlay=null;overlay.hide();}
             }
         }
@@ -528,7 +626,7 @@ public class AgentForegroundService extends Service {
                 phoneAbortUntilMs=System.currentTimeMillis()+5000L;
             }
             final JSONObject cmdArgs=args;
-            cmdPool.execute(()->{
+            safeExecute(cmdPool, ()->{
                 JSONObject res=new JSONObject();
                 try{
                     if(!("release".equals(op)||"auto_release".equals(op))&&System.currentTimeMillis()<phoneAbortUntilMs){
@@ -633,7 +731,7 @@ public class AgentForegroundService extends Service {
                         }
                     }
                 }catch(Exception e){
-                    try{res.put("error",MainActivity.safeError(e));}catch(Exception ignored){}
+                    try{res.put("error",PulseErrors.safeError(e));}catch(Exception ignored){}
                 }
                 boolean sentViaWs=false;
                 JSONObject reply=new JSONObject();
@@ -641,8 +739,10 @@ public class AgentForegroundService extends Service {
                     int vdId=RootPhoneHarness.INSTANCE.currentDisplayId();
                     if(!res.has("virtual_display_id") && vdId>0) res.put("virtual_display_id",vdId);
                     reply.put("type","phone_workspace_result").put("request_id",reqId).put("virtual_display_id",vdId).put("result",res);
-                    if(socket!=null&&sessionKey!=null){
-                        sentViaWs=socket.send(SecureTransport.encrypt(sessionKey,reply).toString());
+                    final WebSocket ws=socket;
+                    final byte[] key=sessionKey;
+                    if(ws!=null&&key!=null){
+                        sentViaWs=ws.send(SecureTransport.encrypt(key,reply).toString());
                     }
                 }catch(Exception ignored){}
                 boolean wsPotentiallyStale = lastInboundWsMs > 0 && (System.currentTimeMillis() - lastInboundWsMs > 30_000L);
@@ -669,8 +769,7 @@ public class AgentForegroundService extends Service {
                     boolean urgent="deadline".equals(kind)||"escalation_demo".equals(kind);
                     String collapseKey="msg:"+botId+":"+("curiosity".equals(kind)?"curiosity":"chat");
                     notifyCustom(id,title,text.length()>260?text.substring(0,260)+"…":text,botId,collapseKey,urgent);
-                    notified.add(id);
-                    if(notified.size()>600)notified.clear();
+                    rememberNotifiedId(id);
                 }
             }
         }
@@ -686,8 +785,7 @@ public class AgentForegroundService extends Service {
                 boolean urgent=event.optBoolean("urgent",false);
                 boolean overlayFlag=event.optBoolean("overlay",false)||"strong".equalsIgnoreCase(event.optString("level",""))||urgent;
                 notifyCustom(id,title,body,botId,collapseKey,urgent||overlayFlag);
-                notified.add(id);
-                if(notified.size()>600)notified.clear();
+                rememberNotifiedId(id);
                 if(overlayFlag){
                     try{
                         pendingOverlay=new JSONObject()
@@ -708,7 +806,7 @@ public class AgentForegroundService extends Service {
                 String botId=m==null?event.optString("bot_id","companion"):m.optString("bot_id","companion");
                 String botName=m!=null?m.optString("from_bot_name",event.optString("bot_name","默认助手")):event.optString("bot_name","默认助手");
                 notifyCustom(id,botName,text,botId,"esc:"+botId,true);
-                notified.add(id);if(notified.size()>600)notified.clear();
+                rememberNotifiedId(id);
             }
             if(stage==3){pendingOverlay=event;tryShowOverlay();}
         }
@@ -730,7 +828,7 @@ public class AgentForegroundService extends Service {
                         .setUsage(AudioAttributes.USAGE_ALARM)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build());
-                    if(Build.VERSION.SDK_INT>=28) r.setLooping(true);
+                    r.setLooping(true);
                     r.play();
                     activeAlarmRingtone=r;
                 }
@@ -776,9 +874,25 @@ public class AgentForegroundService extends Service {
             overlay.show(id,botId,botName,title,text);
         }
     }
+    private void rememberNotifiedId(String id) {
+        if (id == null || id.isEmpty()) return;
+        notified.remove(id);
+        notified.add(id);
+        while (notified.size() > 600) {
+            Iterator<String> it = notified.iterator();
+            if (!it.hasNext()) break;
+            String oldest = it.next();
+            it.remove();
+            notifIdByMsgId.remove(oldest);
+        }
+    }
+
     private void notifyCustom(String id,String title,String text,String botId,String collapseKey,boolean urgent){
         String stableKey=(collapseKey!=null&&!collapseKey.isEmpty())?collapseKey:id;
         int notifId=20000+Math.abs(stableKey.hashCode()%10000);
+        if (id != null && !id.isEmpty()) {
+            notifIdByMsgId.put(id, notifId);
+        }
         String channel=urgent?"pulse_nudges":"pulse_updates";
         Intent open=new Intent(this,NativePulseActivity.class).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("openBot",botId);
         PendingIntent tap=PendingIntent.getActivity(this,notifId,open,PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
@@ -792,6 +906,6 @@ public class AgentForegroundService extends Service {
         try{getSystemService(NotificationManager.class).notify(notifId,n);}catch(SecurityException ignored){}
     }
     private void broadcast(){sendBroadcast(new Intent(getPackageName()+".UPDATE").setPackage(getPackageName()));}
-    @Override public void onDestroy(){stopped=true;running=false;connected=false;if(activeService==this)activeService=null;failPendingRpcs("service_destroyed");stopEmergencyAlarm(this);handler.removeCallbacksAndMessages(null);if(networkCallback!=null){try{android.net.ConnectivityManager cm=getSystemService(android.net.ConnectivityManager.class);if(cm!=null)cm.unregisterNetworkCallback(networkCallback);}catch(Throwable ignored){}networkCallback=null;}if(socket!=null)socket.close(1000,"stopped by user");overlay.hide();if(screen!=null)unregisterReceiver(screen);io.shutdownNow();cmdPool.shutdownNow();super.onDestroy();}
+    @Override public void onDestroy(){stopped=true;running=false;connected=false;if(activeService==this)activeService=null;failPendingRpcs("service_destroyed");stopEmergencyAlarm(this);handler.removeCallbacksAndMessages(null);if(networkCallback!=null){try{android.net.ConnectivityManager cm=getSystemService(android.net.ConnectivityManager.class);if(cm!=null)cm.unregisterNetworkCallback(networkCallback);}catch(Throwable ignored){}networkCallback=null;}WebSocket curWs=socket;socket=null;if(curWs!=null)curWs.close(1000,"stopped by user");overlay.hide();if(screen!=null)unregisterReceiver(screen);io.shutdownNow();cmdPool.shutdownNow();refreshHealth("STOPPED");super.onDestroy();}
     @Override public IBinder onBind(Intent i){return null;}
 }

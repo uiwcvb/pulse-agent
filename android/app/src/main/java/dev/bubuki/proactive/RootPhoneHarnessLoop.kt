@@ -13,8 +13,54 @@ import java.util.UUID
 /**
  * [Module] RootPhoneHarnessLoop
  * [Responsibility] Live VirtualDisplay preview polling, local RootPhoneAgent task loop,
- *                  `submit`, `submitFromBridge`, `stop`, and `resume`.
+ *                  active-control keep-screen-on policy, `submit`, `submitFromBridge`, `stop`, and `resume`.
  */
+
+internal const val ACTIVE_CONTROL_KEEP_SCREEN_WINDOW_MS = 90_000L
+
+internal fun RootPhoneHarness.isScreenInteractiveNow(base: Context): Boolean {
+    val live = runCatching {
+        val pm = base.getSystemService(android.os.PowerManager::class.java)
+        val km = base.getSystemService(android.app.KeyguardManager::class.java)
+        (pm?.isInteractive != false) && (km?.isKeyguardLocked != true)
+    }.getOrElse { screenInteractive }
+    screenInteractive = live
+    return live
+}
+
+internal fun shouldKeepScreenOnDuringControl(
+    screenInteractive: Boolean,
+    displayCreated: Boolean,
+    taskActive: Boolean,
+    sinceLastControlMs: Long,
+    overlayExpanded: Boolean
+): Boolean {
+    if (!screenInteractive || !displayCreated) return false
+    if (taskActive) return true
+    if (sinceLastControlMs in 0L..ACTIVE_CONTROL_KEEP_SCREEN_WINDOW_MS) return true
+    return overlayExpanded && sinceLastControlMs in 0L..(ACTIVE_CONTROL_KEEP_SCREEN_WINDOW_MS * 2)
+}
+
+internal fun RootPhoneHarness.syncControlScreenKeepOn(appContext: Context, pokeDaemon: Boolean = false) {
+    FloatingVirtualDisplay.syncKeepScreenOn(appContext)
+    val keepOn = shouldKeepScreenOn(overlayExpanded = FloatingVirtualDisplay.expanded)
+    if (!keepOn) {
+        releaseKeepAwake()
+        return
+    }
+    acquireKeepAwake(appContext)
+    if (!pokeDaemon) return
+    val now = SystemClock.elapsedRealtime()
+    if (lastDaemonPokeElapsed != 0L && now - lastDaemonPokeElapsed < 12_000L) return
+    lastDaemonPokeElapsed = now
+    scope.launch(Dispatchers.IO) {
+        runCatching {
+            if (screenInteractive && privilege?.isPrivilegedReady() == true) {
+                privilege?.execute(JSONObject().put("op", "keep_awake"))
+            }
+        }
+    }
+}
 
 internal fun RootPhoneHarness.startLivePreviewLoop(appContext: Context) {
     if (previewJob?.isActive == true) return
@@ -89,7 +135,7 @@ internal suspend fun RootPhoneHarness.submitTaskImpl(
         }
         persist()
         try { withContext(Dispatchers.Main) { base.startForegroundService(Intent(base, RootPhoneService::class.java)) } }
-        catch (error: Exception) { state.update { it.copy(phase = "failed", error = MainActivity.safeError(error)) }; persist(); throw error }
+        catch (error: Exception) { state.update { it.copy(phase = "failed", error = PulseErrors.safeError(error)) }; persist(); throw error }
         if (state.value.phase != "running") throw CancellationException("手机任务已取消")
         startAgentLoop(base.applicationContext, bot, goal, config, workspace, history)
         id
@@ -147,14 +193,16 @@ internal fun RootPhoneHarness.startAgentLoop(
                 append(message(bot, "assistant", "手机执行已停止。", "phone_stopped", state.value.trace))
             }
         } catch (error: Exception) {
-            state.update { it.copy(phase = "failed", error = MainActivity.safeError(error), result = "手机执行中断：${MainActivity.safeError(error)}") }
+            state.update { it.copy(phase = "failed", error = PulseErrors.safeError(error), result = "手机执行中断：${PulseErrors.safeError(error)}") }
             append(message(bot, "assistant", state.value.result, "phone_stopped", state.value.trace))
         } finally {
             withContext(NonCancellable) {
                 persist(); broadcast()
                 if (!waiting) {
                     scheduleAutoRelease(base, 2500L)
-                    withContext(Dispatchers.Main) { base.stopService(Intent(base, RootPhoneService::class.java)) }
+                    if (!state.value.displayCreated && !FloatingVirtualDisplay.overlayVisible.value) {
+                        withContext(Dispatchers.Main) { base.stopService(Intent(base, RootPhoneService::class.java)) }
+                    }
                 }
             }
         }
@@ -205,7 +253,7 @@ internal fun RootPhoneHarness.resumeTaskImpl(base: Context) {
                 recordUserMessage = true
             )
         }.onFailure { error ->
-            state.update { it.copy(phase = "waiting_user", error = MainActivity.safeError(error as? Exception ?: Exception(error))) }
+            state.update { it.copy(phase = "waiting_user", error = PulseErrors.safeError(error)) }
         }
     }
 }

@@ -349,7 +349,7 @@ describe('DSH Sidecar HTTP & AgentLoop Kernel', () => {
     }
   });
 
-  it('prunes historical tool screenshots beyond the latest 4 images to prevent V8 OOM on long visual loops', async () => {
+  it('prunes historical tool screenshots beyond the latest 3 images to prevent V8 OOM on long visual loops', async () => {
     const dataDir = mkdtempSync(path.join(tmpdir(), 'dsh-sidecar-imgprune-'));
     const llmRequests = [];
     const pySrv = await startMockPythonToolServer(async (reqBody) => ({
@@ -410,10 +410,166 @@ describe('DSH Sidecar HTTP & AgentLoop Kernel', () => {
           imgCount += m.content.filter((p) => p.type === 'image_url').length;
         }
       }
-      assert.equal(imgCount, 4, `Expected at most 4 image_url blocks in final LLM request, got ${imgCount}`);
+      assert.equal(imgCount, 3, `Expected at most 3 image_url blocks in final LLM request, got ${imgCount}`);
     } finally {
       await sidecar.close();
       await pySrv.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps systemPrompt 100% byte-identical across turns while appending ephemeral_recall to user_text tail', async () => {
+    const dataDir = mkdtempSync(path.join(tmpdir(), 'dsh-sidecar-mem-'));
+    const llmRequests = [];
+    const pySrv = await startMockPythonToolServer(async () => ({ ok: true, result: { ok: true } }));
+
+    const mockFetch = async (url, init) => {
+      if (String(url).includes('/internal/dsh/tool')) return globalThis.fetch(url, init);
+      llmRequests.push(JSON.parse(String(init.body || '{}')));
+      const n = llmRequests.length;
+      return makeSseResponse([
+        `data: {"choices":[{"delta":{"content":"第${n}轮收到，余记得 5335 续费规则和土区笔记。"}}]}`,
+        'data: {"usage":{"prompt_tokens":180,"completion_tokens":14,"total_tokens":194},"choices":[]}',
+        'data: [DONE]',
+      ]);
+    };
+
+    const sidecar = await startDshSidecarServer({
+      port: 0,
+      dataDir,
+      pyPort: pySrv.port,
+      pySecret: 'sec-mem',
+      fetchImpl: mockFetch,
+    });
+
+    try {
+      const sendTurn = async (turnId, userText, recall) => {
+        const resp = await globalThis.fetch(`http://127.0.0.1:${sidecar.port}/turn/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_key: 'phone__companion',
+            bot_id: 'companion',
+            source: 'phone',
+            turn_id: turnId,
+            system_prompt: '你是智能主助理。',
+            compaction_checkpoint: '### 📋 核心进展与上下文摘要\n- 土区 Mastercard 5335 续费纪律',
+            ephemeral_recall: recall,
+            user_text: userText,
+            allowed_tools: ['read_file', 'memory'],
+            llm: { base_url: 'https://mock.llm/v1', api_key: 'sk-test', model: 'deepseek-v4.1-flash' },
+          }),
+        });
+        return (await resp.text()).trim().split('\n').map((l) => JSON.parse(l));
+      };
+
+      const events1 = await sendTurn('turn-mem-1', '之前那个卡怎么说的？', '<recalled_memory>1. [笔记:notes/tr.md] 5335 绑在苹果小号</recalled_memory>');
+      assert.equal(events1.find((e) => e.type === 'agent_error' || e.type === 'error'), undefined);
+      assert.ok(events1.find((e) => e.type === 'done')?.text.includes('5335'));
+
+      const events2 = await sendTurn('turn-mem-2', '那另外一件事呢？', '<recalled_memory>2. [经验] 主人偏好晚间静音</recalled_memory>');
+      assert.equal(events2.find((e) => e.type === 'agent_error' || e.type === 'error'), undefined);
+
+      assert.equal(llmRequests.length, 2);
+      const msgs1 = llmRequests[0].messages;
+      const msgs2 = llmRequests[1].messages;
+      const sys1 = msgs1.find((m) => m.role === 'system');
+      const sys2 = msgs2.find((m) => m.role === 'system');
+      assert.ok(sys1 && sys2);
+      // Byte-identical system prompt across turns => 0 prefix cache invalidation!
+      assert.strictEqual(sys1.content, sys2.content);
+      assert.ok(sys1.content.includes('你是智能主助理。'));
+      assert.ok(sys1.content.includes('土区 Mastercard 5335 续费纪律'));
+      assert.ok(!sys1.content.includes('5335 绑在苹果小号'), 'ephemeral_recall must NOT pollute static systemPrompt');
+      assert.ok(!sys2.content.includes('主人偏好晚间静音'), 'ephemeral_recall must NOT pollute static systemPrompt');
+
+      // Append-only guarantee: Turn 1 messages must be exact prefix of Turn 2 messages
+      assert.deepStrictEqual(msgs2.slice(0, msgs1.length), msgs1);
+      // Each turn's ephemeral_recall is appended cleanly to that turn's user message tail
+      const user1 = msgs1[msgs1.length - 1];
+      const user2 = msgs2[msgs2.length - 1];
+      assert.equal(user1.role, 'user');
+      assert.equal(user2.role, 'user');
+      assert.ok(String(user1.content).includes('5335 绑在苹果小号'));
+      assert.ok(String(user2.content).includes('主人偏好晚间静音'));
+    } finally {
+      await sidecar.close();
+      await pySrv.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('pings /session/keepalive with max_tokens=1 reusing exact prefix without polluting session history', async () => {
+    const dataDir = mkdtempSync(path.join(tmpdir(), 'dsh-sidecar-keepalive-'));
+    const llmRequests = [];
+    const mockFetch = async (_url, init) => {
+      const parsed = JSON.parse(String(init.body || '{}'));
+      llmRequests.push(parsed);
+      if (parsed.stream === false) {
+        return new Response(JSON.stringify({
+          id: 'ka-1',
+          choices: [{ message: { role: 'assistant', content: '.' }, finish_reason: 'length' }],
+          usage: { prompt_tokens: 180, prompt_tokens_details: { cached_tokens: 180 }, completion_tokens: 1 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return makeSseResponse([
+        `data: {"choices":[{"delta":{"content":"回复${llmRequests.length}"}}]}`,
+        'data: {"usage":{"prompt_tokens":180,"completion_tokens":8,"total_tokens":188},"choices":[]}',
+        'data: [DONE]',
+      ]);
+    };
+
+    const sidecar = await startDshSidecarServer({ port: 0, dataDir, fetchImpl: mockFetch });
+    try {
+      await globalThis.fetch(`http://127.0.0.1:${sidecar.port}/turn/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_key: 'phone__companion',
+          bot_id: 'companion',
+          source: 'phone',
+          turn_id: 'ka-t1',
+          system_prompt: '静态系统提示词。',
+          user_text: '第一句对话',
+          llm: { base_url: 'https://mock.llm/v1', api_key: 'sk-test', model: 'deepseek-v4.1-flash' },
+        }),
+      }).then((r) => r.text());
+
+      const kaRes = await (await globalThis.fetch(`http://127.0.0.1:${sidecar.port}/session/keepalive`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_key: 'phone__companion' }),
+      })).json();
+      assert.equal(kaRes.ok, true);
+      assert.equal(kaRes.kept_alive, true);
+      assert.equal(kaRes.cached_tokens, 180);
+
+      // Next real turn must NOT contain any keepalive artifact
+      await globalThis.fetch(`http://127.0.0.1:${sidecar.port}/turn/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_key: 'phone__companion',
+          bot_id: 'companion',
+          source: 'phone',
+          turn_id: 'ka-t2',
+          system_prompt: '静态系统提示词。',
+          user_text: '第二句对话',
+          llm: { base_url: 'https://mock.llm/v1', api_key: 'sk-test', model: 'deepseek-v4.1-flash' },
+        }),
+      }).then((r) => r.text());
+
+      assert.equal(llmRequests.length, 3);
+      // Keepalive request (index 1) has max_tokens=1 and identical messages to turn 1
+      assert.equal(llmRequests[1].max_tokens, 1);
+      assert.deepStrictEqual(llmRequests[1].messages, llmRequests[0].messages);
+      // Turn 2 (index 2) has only Turn 1 user + Turn 1 assistant + Turn 2 user (zero keepalive noise)
+      const turn2Users = llmRequests[2].messages.filter((m) => m.role === 'user');
+      assert.equal(turn2Users.length, 2);
+      assert.equal(turn2Users[0].content, '第一句对话');
+      assert.equal(turn2Users[1].content, '第二句对话');
+    } finally {
+      await sidecar.close();
       rmSync(dataDir, { recursive: true, force: true });
     }
   });

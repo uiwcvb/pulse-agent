@@ -259,28 +259,44 @@ function rawHttpRequestViaHttpProxy(targetUrlObj, proxyUrlObj, method, headers, 
       headers: { Host: `${targetUrlObj.hostname}:${targetPort}`, "Proxy-Connection": "close" },
       agent: false,
     });
-    const timer = setTimeout(() => connectReq.destroy(new Error(`CONNECT timeout after ${timeoutMs}ms`)), timeoutMs);
+    let activeTlsSock = null;
+    const destroyTunnel = (err) => {
+      try { connectReq.destroy(err); } catch {}
+      if (activeTlsSock) { try { activeTlsSock.destroy(err); } catch {} }
+    };
+    const timer = setTimeout(() => destroyTunnel(new Error(`CONNECT timeout after ${timeoutMs}ms`)), timeoutMs);
     const onAbort = () => {
       clearTimeout(timer);
-      connectReq.destroy(externalSignal?.reason || new Error("Aborted"));
+      destroyTunnel(externalSignal?.reason || new Error("Aborted"));
     };
     if (externalSignal) externalSignal.addEventListener("abort", onAbort, { once: true });
+
+    const stripHeaderToken = (s) => String(s ?? "").replace(/[\r\n]+/g, " ").trim();
+    const stripHeaderName = (s) => String(s ?? "").replace(/[^A-Za-z0-9!#$%&'*+.^_`|~-]/g, "");
 
     connectReq.on("connect", (res, socket) => {
       if (res.statusCode !== 200) {
         clearTimeout(timer);
+        if (externalSignal) externalSignal.removeEventListener("abort", onAbort);
         socket.destroy();
         return reject(new Error(`Proxy CONNECT HTTP ${res.statusCode}`));
       }
       const tlsSock = tls.connect({ socket, servername: targetUrlObj.hostname }, () => {
         const reqHeaders = { "Accept-Encoding": "gzip", ...headers, Host: targetUrlObj.host, Connection: "close" };
         if (bodyBuf) reqHeaders["Content-Length"] = bodyBuf.length;
-        let head = `${method} ${targetUrlObj.pathname}${targetUrlObj.search} HTTP/1.1\r\n`;
-        for (const [k, v] of Object.entries(reqHeaders)) head += `${k}: ${v}\r\n`;
+        const safeMethod = stripHeaderToken(method).toUpperCase() || "GET";
+        const safePath = `${targetUrlObj.pathname}${targetUrlObj.search}`.replace(/[\r\n]+/g, "");
+        let head = `${safeMethod} ${safePath} HTTP/1.1\r\n`;
+        for (const [k, v] of Object.entries(reqHeaders)) {
+          const hk = stripHeaderName(k);
+          if (!hk) continue;
+          head += `${hk}: ${stripHeaderToken(v)}\r\n`;
+        }
         head += "\r\n";
         tlsSock.write(head);
         if (bodyBuf) tlsSock.write(bodyBuf);
       });
+      activeTlsSock = tlsSock;
       const rawChunks = [];
       let totalLen = 0;
       let headerEndIdx = -1;
@@ -289,6 +305,7 @@ function rawHttpRequestViaHttpProxy(targetUrlObj, proxyUrlObj, method, headers, 
       let contentLength = null;
       let isChunked = false;
       let settled = false;
+      let tailProbe = "";
 
       const parseHeadersMap = (hdrStr) => {
         const lines = hdrStr.split("\r\n");
@@ -358,12 +375,13 @@ function rawHttpRequestViaHttpProxy(targetUrlObj, proxyUrlObj, method, headers, 
         if (settled) return;
         rawChunks.push(c);
         totalLen += c.length;
-        const full = Buffer.concat(rawChunks, totalLen);
+        let fullCache = null;
         if (headerEndIdx < 0) {
-          const sep = full.indexOf("\r\n\r\n");
+          fullCache = Buffer.concat(rawChunks, totalLen);
+          const sep = fullCache.indexOf("\r\n\r\n");
           if (sep < 0) return;
           headerEndIdx = sep;
-          const parsed = parseHeadersMap(full.subarray(0, sep).toString("utf8"));
+          const parsed = parseHeadersMap(fullCache.subarray(0, sep).toString("utf8"));
           parsedStatus = parsed.st;
           parsedHeaders = parsed.map;
           isChunked = /chunked/i.test(parsedHeaders["transfer-encoding"] || "");
@@ -372,15 +390,19 @@ function rawHttpRequestViaHttpProxy(targetUrlObj, proxyUrlObj, method, headers, 
         }
         const bodyLen = totalLen - (headerEndIdx + 4);
         if (parsedStatus === 204 || parsedStatus === 304 || method === "HEAD") {
-          return finishWithBuffer(full);
+          return finishWithBuffer(fullCache || Buffer.concat(rawChunks, totalLen));
         }
         if (contentLength !== null && bodyLen >= contentLength) {
-          return finishWithBuffer(full);
+          return finishWithBuffer(fullCache || Buffer.concat(rawChunks, totalLen));
         }
         if (isChunked) {
-          const bodySlice = full.subarray(headerEndIdx + 4);
-          if (decodeChunked(bodySlice).complete) {
-            return finishWithBuffer(full);
+          tailProbe = (tailProbe + c.subarray(Math.max(0, c.length - 16)).toString("latin1")).slice(-32);
+          if (tailProbe.endsWith("\r\n\r\n") || fullCache) {
+            const full = fullCache || Buffer.concat(rawChunks, totalLen);
+            const bodySlice = full.subarray(headerEndIdx + 4);
+            if (decodeChunked(bodySlice).complete) {
+              return finishWithBuffer(full);
+            }
           }
         }
       });

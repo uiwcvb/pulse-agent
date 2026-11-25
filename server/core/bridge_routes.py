@@ -518,6 +518,7 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
         bridge_id='dsh-'+secrets.token_hex(6)
         sender=None
         key=None
+        ws_send_lock=asyncio.Lock()
         try:
             envelope=await asyncio.wait_for(ws.receive_json(),12)
             if isinstance(envelope,dict) and 'key' in envelope and 'data' in envelope:
@@ -533,10 +534,11 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
             brain.dsh_bridge_info['last_seen']=time.time()
             brain.update_dsh_peer(hello if isinstance(hello,dict) else None)
             async def send(event):
-                if key is not None:
-                    await ws.send_json(crypto.seal(key,event))
-                else:
-                    await ws.send_json(event)
+                async with ws_send_lock:
+                    if key is not None:
+                        await asyncio.wait_for(ws.send_json(crypto.seal(key,event)),12)
+                    else:
+                        await asyncio.wait_for(ws.send_json(event),12)
             await send({'type':'connected','bridge_id':bridge_id,'phone_online':len(clients)>0,'dsh_online':True,'dsh_peers':_get_dsh_peers(),'product_abbr':'DSB','time':time.time()})
             await publish({'type':'dsh_bridge_state','online':True,'dsh_online':True,'dsh_peers':_get_dsh_peers(),'last_seen':brain.dsh_bridge_info['last_seen']})
             async def pump():
@@ -556,6 +558,8 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
                 etype=event.get('type')
                 if etype=='ping':
                     brain.update_dsh_peer(event)
+                    if queue.full():
+                        with contextlib.suppress(asyncio.QueueEmpty): queue.get_nowait()
                     queue.put_nowait({'type':'pong','phone_online':len(clients)>0,'dsh_online':True,'dsh_peers':_get_dsh_peers(),'time':time.time()})
                 elif etype in ('dsh_workspace_result','result'):
                     brain.resolve_dsh_command(event)
@@ -615,8 +619,8 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
             p=harness.path(clean_rel)
         except Exception:
             raise HTTPException(400,'非法路径')
-        img_exts=('.png','.jpg','.jpeg','.webp','.gif','.bmp','.svg')
-        authed_doc_exts=('.pdf','.txt','.md','.csv','.json','.html','.docx','.xlsx','.pptx','.zip')
+        img_exts=('.png','.jpg','.jpeg','.webp','.gif','.bmp')
+        authed_doc_exts=('.pdf','.txt','.md','.csv','.json','.html','.htm','.xhtml','.xml','.svg','.docx','.xlsx','.pptx','.zip')
         sfx=p.suffix.lower()
         if not p.is_file() or (sfx not in img_exts and (not is_authed or sfx not in authed_doc_exts)):
             raise HTTPException(404,'文件或图片不存在')
@@ -624,16 +628,18 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
             '.png':'image/png','.webp':'image/webp','.gif':'image/gif','.bmp':'image/bmp','.svg':'image/svg+xml',
             '.pdf':'application/pdf','.txt':'text/plain; charset=utf-8','.md':'text/markdown; charset=utf-8',
             '.csv':'text/csv; charset=utf-8','.json':'application/json; charset=utf-8','.html':'text/html; charset=utf-8',
+            '.htm':'text/html; charset=utf-8','.xhtml':'application/xhtml+xml; charset=utf-8','.xml':'application/xml; charset=utf-8',
             '.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             '.xlsx':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             '.pptx':'application/vnd.openxmlformats-officedocument.presentationml.presentation',
             '.zip':'application/zip',
         }
         media=mime_map.get(sfx,'image/jpeg' if sfx in ('.jpg','.jpeg') else 'application/octet-stream')
-        dl=str(request.query_params.get('download') or '').strip() in ('1','true','yes')
-        if dl:
-            return FileResponse(p,media_type=media,filename=p.name)
-        return FileResponse(p,media_type=media)
+        force_dl=sfx in ('.svg','.html','.htm','.xhtml','.xml') or str(request.query_params.get('download') or '').strip() in ('1','true','yes')
+        sec_headers={'X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; sandbox"}
+        if force_dl:
+            return FileResponse(p,media_type=media,filename=p.name,headers=sec_headers)
+        return FileResponse(p,media_type=media,headers=sec_headers)
 
     @app.get('/api/plugins/stickers',dependencies=[Depends(auth)])
     async def list_sticker_packs():
@@ -694,7 +700,7 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
 
         state = store.state
         src = normalize_node_source(source)
-        bot = get_assistant(store, bot_id or state.get('active_assistant') or state.get('primary_assistant') or 'companion', source=src)
+        bot = get_assistant(store, bot_id or state.get('primary_bot_id') or 'companion', source=src)
         raw_persona = str(bot.get('instructions') or '').strip()
         persona_block = strip_response_calibration_blocks(raw_persona)
         if not persona_block:
@@ -730,8 +736,9 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
         vault_section = '[记忆快照]\n' + vault_ctx
         assembled = system_base + '\n\n' + vault_section + '\n\n' + persona_and_node + calibration_tail
         est_tokens = MemoryEngine.estimate_tokens(assembled)
-        prompt_tokens_map = state.get('context_tokens') if isinstance(state.get('context_tokens'), dict) else {}
-        cached_tokens_map = state.get('context_cached_tokens') if isinstance(state.get('context_cached_tokens'), dict) else {}
+        prompt_tokens_map = state.get('last_prompt_tokens') if isinstance(state.get('last_prompt_tokens'), dict) else {}
+        cached_tokens_map = state.get('last_cached_tokens') if isinstance(state.get('last_cached_tokens'), dict) else {}
+        nb_key = f'{src}:{bot["id"]}'
         return {
             'ok': True,
             'bot_id': bot['id'],
@@ -747,9 +754,119 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
             },
             'total_chars': len(assembled),
             'estimated_tokens': est_tokens,
-            'last_prompt_tokens': int(prompt_tokens_map.get(bot['id']) or 0),
-            'last_cached_tokens': int(cached_tokens_map.get(bot['id']) or 0),
+            'last_prompt_tokens': int(prompt_tokens_map.get(nb_key) or prompt_tokens_map.get(bot['id']) or 0),
+            'last_cached_tokens': int(cached_tokens_map.get(nb_key) or cached_tokens_map.get(bot['id']) or 0),
         }
+
+    @app.get('/api/memory/status', dependencies=[Depends(auth)])
+    async def memory_system_status():
+        tables = brain.memory_engine.get_memory_tables()
+        return {
+            'ok': True,
+            **tables.stats(),
+            'sleep_consolidate_idle_seconds': brain.memory_engine.get_sleep_consolidate_idle_seconds(),
+        }
+
+    @app.get('/api/memory/vector-space', dependencies=[Depends(auth)])
+    async def memory_vector_space(q: str = '', limit: int = 160):
+        from core.memory_vector_space import build_vector_space_payload
+        return await asyncio.to_thread(build_vector_space_payload, brain.memory_engine, query=q, limit=limit)
+
+    @app.post('/api/memory/facts', dependencies=[Depends(auth)])
+    async def memory_upsert_fact(body: dict | None = None):
+        b = body if isinstance(body, dict) else {}
+        tables = brain.memory_engine.get_memory_tables()
+        res = await asyncio.to_thread(
+            tables.upsert_fact_reconciled,
+            entity=str(b.get('entity') or '').strip(),
+            attr=str(b.get('attr') or '备忘').strip(),
+            value=str(b.get('value') or '').strip(),
+            ttl_type=str(b.get('ttl_type') or 'permanent').strip(),
+            search_cues=str(b.get('search_cues') or '').strip(),
+            source_ref='user_manual',
+            bot_id='all',
+        )
+        return res
+
+    @app.delete('/api/memory/facts/{fact_id}', dependencies=[Depends(auth)])
+    async def memory_delete_fact(fact_id: str, hard: bool = True):
+        tables = brain.memory_engine.get_memory_tables()
+        return await asyncio.to_thread(tables.delete_fact, fact_id, hard=hard)
+
+    @app.delete('/api/memory/episodes/{episode_id}', dependencies=[Depends(auth)])
+    async def memory_delete_episode(episode_id: str, hard: bool = True):
+        tables = brain.memory_engine.get_memory_tables()
+        return await asyncio.to_thread(tables.delete_episode, episode_id, hard=hard)
+
+    @app.get('/api/subtasks', dependencies=[Depends(auth)])
+    async def api_list_subtasks(bot_id: str = '', limit: int = 30):
+        from core.subtask_runner import get_subtask_store
+        store = get_subtask_store(brain)
+        return {'ok': True, 'subtasks': store.list_runs(parent_bot_id=bot_id or None, limit=limit)}
+
+    @app.get('/api/subtasks/{task_id}', dependencies=[Depends(auth)])
+    async def api_get_subtask(task_id: str):
+        from core.subtask_runner import get_subtask_store
+        run = get_subtask_store(brain).get_run(task_id, recent_steps_limit=30)
+        if not run:
+            raise HTTPException(404, '未找到该子任务')
+        return {'ok': True, 'subtask': run}
+
+    @app.post('/api/subtasks/{task_id}/cancel', dependencies=[Depends(auth)])
+    async def api_cancel_subtask(task_id: str):
+        from core.subtask_runner import cancel_subtask
+        return await cancel_subtask(brain, task_id)
+
+    @app.post('/api/subtasks/{task_id}/resume', dependencies=[Depends(auth)])
+    async def api_resume_subtask(task_id: str):
+        from core.subtask_runner import resume_subtask
+        return await resume_subtask(brain, task_id)
+
+    @app.post('/api/subtasks/{task_id}/steer', dependencies=[Depends(auth)])
+    async def api_steer_subtask(task_id: str, body: dict | None = None):
+        from core.subtask_runner import steer_subtask
+        b = body if isinstance(body, dict) else {}
+        return await steer_subtask(brain, task_id, str(b.get('message') or b.get('text') or ''))
+
+    @app.post('/api/memory/reorganize', dependencies=[Depends(auth)])
+    async def memory_system_reorganize(body: dict | None = None):
+        b = body if isinstance(body, dict) else {}
+        if bool(b.get('dry_run', False)):
+            from core.memory_migrator import reorganize_legacy_memory
+            return await reorganize_legacy_memory(brain, dry_run=True, use_llm=bool(b.get('use_llm', True)))
+        from core.subtask_runner import spawn_memory_reorganize_subtask
+        return await spawn_memory_reorganize_subtask(
+            brain,
+            parent_bot_id=str(b.get('bot_id') or 'companion'),
+            parent_source=str(b.get('source') or 'phone'),
+            use_llm=bool(b.get('use_llm', True)),
+        )
+
+    @app.get('/api/memory/backups', dependencies=[Depends(auth)])
+    async def memory_system_backups():
+        from core.memory_migrator import list_memory_backups
+        vroot = Path(brain.vault.root) if getattr(brain, 'vault', None) is not None else (brain.store.root / 'memory_vault')
+        return {'ok': True, 'backups': list_memory_backups(vroot)}
+
+    @app.post('/api/memory/rollback', dependencies=[Depends(auth)])
+    async def memory_system_rollback(body: dict | None = None):
+        from core.memory_migrator import rollback_memory_backup
+        b = body if isinstance(body, dict) else {}
+        return rollback_memory_backup(brain, backup_id=str(b.get('backup_id') or ''))
+
+    @app.post('/api/memory/gardener', dependencies=[Depends(auth)])
+    async def memory_system_gardener():
+        from core.memory_migrator import run_memory_gardener
+        return run_memory_gardener(brain)
+
+    @app.post('/api/memory/embedding/download', dependencies=[Depends(auth)])
+    async def memory_embedding_download(body: dict | None = None):
+        b = body if isinstance(body, dict) else {}
+        eng = brain.memory_engine.get_embedding_engine()
+        dl = await asyncio.to_thread(eng.download_tier_model, b.get('tier'))
+        if dl.get('ok'):
+            dl['reindex'] = await asyncio.to_thread(brain.memory_engine.get_memory_tables().reindex_vectors)
+        return dl
 
     @app.api_route('/download/mika-corresponding-source.tar.gz',methods=['GET','HEAD'])
     async def mika_corresponding_source():

@@ -8,13 +8,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import json
+import logging
 import os
+import re
 import time
 from typing import Any
 
 import httpx
 from core.canonical_tool_handlers import build_pc_fs_rpc_payload, stage_and_execute_send_file, stage_and_execute_send_image
+from core.cloud_stuck_detector import CloudStuckDetector
+from core.observation_masker import GUI_UI_TOOLS, extract_ephemeral_ui_from_result
 from core.vision_engine import detect_image_mime
 from core.task_continuity import TaskContinuityManager
 from core.tool_schemas import is_tool_allowed, normalize_tool_name
@@ -22,6 +27,8 @@ from core.turn_history import append_turn_step, build_compact_turn_step
 from core.turn_ledger import TurnLedgerManager
 from storage import compact_trace_list, normalize_node_source
 from vault_manager import now_iso
+
+logger = logging.getLogger(__name__)
 
 
 class DshBrainAdapter:
@@ -103,19 +110,31 @@ class DshBrainAdapter:
     def _session_key(self, bot_id: str, source: str) -> str:
         return f'{normalize_node_source(source)}__{bot_id or "companion"}'
 
-    def _get_or_init_turn_acc(self, turn_id: str, allowed: set[str] | None = None) -> dict[str, Any]:
+    def _get_or_init_turn_acc(
+        self,
+        turn_id: str,
+        allowed: set[str] | None = None,
+        *,
+        turn_origin: str | None = None,
+        hop_depth: int = 0,
+    ) -> dict[str, Any]:
         rec = self._turn_acc.get(turn_id)
         if rec is None:
             rec = {
                 'allowed': set(allowed) if allowed else None,
+                'turn_origin': turn_origin,
+                'hop_depth': hop_depth,
                 'stickers': [],
                 'files': [],
+                'emitted_stickers': [],
+                'emitted_files': [],
                 'choices': None,
                 'choices_prompt': '',
                 'goal_completed': False,
                 'goal_summary': '',
                 'silent_requested': False,
                 'silent_reason': '',
+                'stuck_detector': CloudStuckDetector(),
             }
             self._turn_acc[turn_id] = rec
         return rec
@@ -137,11 +156,15 @@ class DshBrainAdapter:
 
         acc = self._turn_acc.get(turn_id)
         allowed = acc.get('allowed') if isinstance(acc, dict) else None
+        rec_origin = acc.get('turn_origin') if isinstance(acc, dict) else None
+        rec_hop = int(acc.get('hop_depth') or 0) if isinstance(acc, dict) else 0
 
         m_bot = b.bot_context.set(eff_bot)
         m_room = b.room_context.set(eff_bot)
         m_src = b.source_context.set(src)
         m_turn = b.turn_id_var.set(turn_id or '')
+        m_hop = b.hop_depth.set(rec_hop) if hasattr(b, 'hop_depth') and rec_hop else None
+        m_origin = b.turn_origin_context.set(rec_origin) if (rec_origin and hasattr(b, 'turn_origin_context')) else None
         m_choices = b.choices_var.set(None)
         m_cprompt = b.choices_prompt_var.set('')
         m_sticker = b.pending_sticker_var.set('')
@@ -149,11 +172,28 @@ class DshBrainAdapter:
         m_files = b.pending_files_var.set(()) if hasattr(b, 'pending_files_var') else None
         try:
             c_op_low = str(eff_args.get('op') or eff_args.get('action') or '').strip().lower()
+            req_node_val = str(eff_args.get('node') or eff_args.get('target') or '').strip().lower()
+            is_pc_plain_bash = (
+                req_node_val in ('pc', 'pc2', 'pc_windows', 'windows')
+                or (src in ('pc', 'pc2') and req_node_val not in ('server', 'hub', 'cloud_sandbox'))
+            ) and (
+                name in ('run_bash', 'run_command') or (name == 'bash' and c_op_low in ('', 'run', 'exec'))
+            )
             if allowed is not None and not is_tool_allowed(name, allowed):
                 result: Any = {'ok': False, 'error': '此助手未启用该工具'}
-            elif src in ('pc', 'pc2') and (name in ('run_bash', 'run_command') or (name == 'bash' and c_op_low in ('', 'run', 'exec'))) and b.is_dsh_online():
-                result = await b._raw_dsh_rpc('pc_shell', eff_args, timeout=float(eff_args.get('timeout') or 25.0))
-            elif src in ('pc', 'pc2') and name in ('read_file', 'write_file', 'edit_file', 'delete_file', 'move_file', 'search_files', 'list_dir', 'glob_files', 'grep_search') and b._should_use_pc_fs(name, eff_args):
+            elif is_pc_plain_bash:
+                if b.is_dsh_online():
+                    result = await b._raw_dsh_rpc('pc_shell', eff_args, timeout=float(eff_args.get('timeout') or 25.0))
+                    if isinstance(result, dict):
+                        result.setdefault('node', 'pc_windows')
+                else:
+                    result = {
+                        'ok': False,
+                        'pc_online': False,
+                        'node': 'pc_offline',
+                        'error': 'Windows 电脑端代理当前未在线，已阻止将本机 bash 静默回退到云端 Linux 沙箱。请等待电脑端重连，或改用 cloud(op="shell") 操作云电脑，或显式传 target="cloud_sandbox" 在中枢沙箱执行。',
+                    }
+            elif src in ('pc', 'pc2') and name in ('read_file', 'write_file', 'edit_file', 'delete_file', 'move_file', 'search_files', 'list_dir', 'glob_files', 'grep_search') and b._should_use_pc_fs(name, eff_args) and c_op_low not in ('locate', 'find_anywhere', 'cross_locate'):
                 pc_fs_op, pc_fs_args = build_pc_fs_rpc_payload(name, eff_args)
                 result = await b._raw_dsh_rpc('pc_fs', {'fs_op': pc_fs_op, **pc_fs_args}, timeout=25.0)
             elif name == 'send_image' or (name == 'reply' and c_op_low in ('send_image', 'image')):
@@ -163,25 +203,81 @@ class DshBrainAdapter:
             else:
                 result = await b.harness.execute(name, eff_args)
 
-            # Capture ContextVar side effects (images, files, choices, silent, goal_completed) into turn_acc
+            # Attach CloudStuckDetector loop pivot nudge on DSH primary turns
+            stuck_nudge_msg = ''
+            if isinstance(acc, dict) and normalize_tool_name(name) in ('cloud', 'phone', 'pc'):
+                sd = acc.get('stuck_detector')
+                if isinstance(sd, CloudStuckDetector):
+                    verdict = sd.observe(name, eff_args, result)
+                    if verdict.stage == 'nudge' and verdict.message:
+                        stuck_nudge_msg = verdict.message
+
+            # Capture ContextVar side effects & IMMEDIATELY push media/screenshots/files to chat
+            emitted_now_note = ''
             if isinstance(acc, dict):
+                new_imgs: list[str] = []
                 q_stickers = list(b.pending_stickers_var.get() or ())
                 if b.pending_sticker_var.get():
                     q_stickers.append(b.pending_sticker_var.get())
                 for s_url in q_stickers:
-                    if s_url and s_url not in acc['stickers']:
-                        acc['stickers'].append(s_url)
-                if isinstance(result, dict) and result.get('chat_image_url'):
-                    u = str(result['chat_image_url'])
-                    if u not in acc['stickers']:
-                        acc['stickers'].append(u)
+                    if s_url and s_url not in acc['emitted_stickers'] and s_url not in acc['stickers']:
+                        new_imgs.append(s_url)
+                if isinstance(result, dict):
+                    for key_img in ('chat_image_url', 'sticker'):
+                        val_img = str(result.get(key_img) or '').strip()
+                        if val_img and val_img not in acc['emitted_stickers'] and val_img not in new_imgs:
+                            new_imgs.append(val_img)
+                new_files: list[dict[str, Any]] = []
                 q_files = list(b.pending_files_var.get() or ()) if hasattr(b, 'pending_files_var') else []
                 if isinstance(result, dict) and isinstance(result.get('chat_file'), dict):
                     q_files.append(result['chat_file'])
                 for f_item in q_files:
                     if isinstance(f_item, dict) and f_item.get('path'):
-                        if not any(isinstance(x, dict) and x.get('path') == f_item['path'] for x in acc['files']):
-                            acc['files'].append(f_item)
+                        if not any(isinstance(x, dict) and x.get('path') == f_item['path'] for x in (acc['emitted_files'] + new_files)):
+                            new_files.append(f_item)
+
+                # Keep stickers (/stickers/* or reply(op="sticker")) attached to the final reply bubble so they never split thinking into two cards
+                is_sticker_op = normalize_tool_name(name) == 'reply' and str(eff_args.get('op') or eff_args.get('action') or '').strip().lower() in ('sticker', 'send_sticker', 'emoji')
+                real_media_imgs = [u for u in new_imgs if not is_sticker_op and not u.startswith('/stickers/') and (u.startswith('/') or u.startswith(('http://', 'https://')))]
+                plain_stickers = [u for u in new_imgs if u not in real_media_imgs]
+                for ps in plain_stickers:
+                    if ps not in acc['stickers']:
+                        acc['stickers'].append(ps)
+                if (real_media_imgs or new_files) and hasattr(b, 'emit'):
+                    try:
+                        # Clear context vars so emit() doesn't double-attach unrelated state
+                        b.pending_sticker_var.set('')
+                        b.pending_stickers_var.set(())
+                        if hasattr(b, 'pending_files_var'):
+                            b.pending_files_var.set(())
+                        push_extra: dict[str, Any] = {
+                            'non_terminal': True,
+                            'from_bot_id': eff_bot,
+                            'from_node': src,
+                            'turn_id': turn_id or '',
+                        }
+                        if real_media_imgs:
+                            push_extra['stickers'] = list(real_media_imgs)
+                            push_extra['sticker'] = real_media_imgs[-1]
+                        if new_files:
+                            push_extra['attachments'] = list(new_files)
+                        await b.emit('', 'chat', track=False, **push_extra)
+                        acc['emitted_stickers'].extend(real_media_imgs)
+                        acc['emitted_files'].extend(new_files)
+                        emitted_now_note = (
+                            '【已实时送达用户】图片/文件已立刻推送到用户聊天界面（无需等待本轮结束）。'
+                            '如果正在等用户扫码、付款、输入或人工确认，请立刻用简短文字说明并结束本轮对话，严禁调用 shell sleep 原地干等！'
+                        )
+                    except Exception:
+                        for u in real_media_imgs:
+                            if u not in acc['stickers']:
+                                acc['stickers'].append(u)
+                        acc['files'].extend(new_files)
+                else:
+                    for u in real_media_imgs:
+                        if u not in acc['stickers']:
+                            acc['stickers'].append(u)
+                    acc['files'].extend(new_files)
                 if b.choices_var.get():
                     acc['choices'] = list(b.choices_var.get())
                 if b.choices_prompt_var.get():
@@ -191,13 +287,14 @@ class DshBrainAdapter:
                         acc['goal_completed'] = True
                         acc['goal_summary'] = str(result.get('summary') or '').strip()
                     if normalize_tool_name(name) in ('stay_silent', 'do_not_disturb') or result.get('_stay_silent'):
-                        acc['silent_requested'] = True
-                        acc['silent_reason'] = str(result.get('reason') or 'quiet').strip()
+                        if not acc.get('emitted_stickers') and not acc.get('emitted_files'):
+                            acc['silent_requested'] = True
+                            acc['silent_reason'] = str(result.get('reason') or 'quiet').strip()
 
             mm_b64 = ''
             mm_mime = 'image/jpeg'
             if isinstance(result, dict):
-                clean_res = dict(result)
+                clean_res: Any = dict(result)
                 b1 = str(clean_res.pop('_multimodal_b64', '') or '')
                 b2 = str(clean_res.pop('_image_b64', '') or '')
                 b3_raw = clean_res.get('image')
@@ -210,18 +307,61 @@ class DshBrainAdapter:
                 clean_res.pop('_final_emitted_msg', None)
                 if mm_b64:
                     clean_res['_image_attached'] = True
+                if emitted_now_note:
+                    clean_res['delivered_immediately'] = True
+                    clean_res['note'] = emitted_now_note
             else:
                 clean_res = result
 
+            # Context protection: apply GUI ephemeral UI compression and FTS5 offloading identically to native loop
+            cs = getattr(b, 'context_search', None)
+            if name in GUI_UI_TOOLS:
+                raw_res_str = clean_res if isinstance(clean_res, str) else json.dumps(clean_res, ensure_ascii=False)
+                compact_str, eph_ui = extract_ephemeral_ui_from_result(name, clean_res, raw_res_str)
+                if cs is not None and eph_ui is None and len(compact_str) > 8000:
+                    compact_str = cs.maybe_offload_tool_output(name, eff_args, clean_res, bot_id=eff_bot, turn_id=turn_id)
+                if compact_str != raw_res_str or eph_ui:
+                    try:
+                        parsed_c = json.loads(compact_str)
+                        if isinstance(parsed_c, dict):
+                            if eph_ui:
+                                parsed_c['_ephemeral_ui'] = eph_ui
+                            clean_res = parsed_c
+                        elif eph_ui and isinstance(clean_res, dict):
+                            clean_res['_ephemeral_ui'] = eph_ui
+                    except Exception:
+                        if isinstance(clean_res, dict) and eph_ui:
+                            clean_res['_ephemeral_ui'] = eph_ui
+            elif cs is not None:
+                raw_res_str = clean_res if isinstance(clean_res, str) else json.dumps(clean_res, ensure_ascii=False)
+                offloaded_str = cs.maybe_offload_tool_output(name, eff_args, clean_res, bot_id=eff_bot, turn_id=turn_id)
+                if offloaded_str != raw_res_str:
+                    with contextlib.suppress(Exception):
+                        parsed_o = json.loads(offloaded_str)
+                        if isinstance(parsed_o, dict):
+                            if isinstance(clean_res, dict):
+                                for keep_k in ('ok', 'error', 'chat_image_url', 'sticker', 'chat_file', 'goal_completed', '_stay_silent'):
+                                    if keep_k in clean_res and keep_k not in parsed_o:
+                                        parsed_o[keep_k] = clean_res[keep_k]
+                            clean_res = parsed_o
+
             return {
                 'ok': True,
-                'result': clean_res,
+                'result': (
+                    {**clean_res, '_stuck_nudge': stuck_nudge_msg}
+                    if (stuck_nudge_msg and isinstance(clean_res, dict))
+                    else clean_res
+                ),
                 'image_b64': mm_b64,
                 'image_mime': mm_mime,
             }
         except Exception as exc:
             return {'ok': False, 'result': {'ok': False, 'error': str(exc)[:280]}, 'image_b64': '', 'image_mime': 'image/jpeg'}
         finally:
+            if m_origin is not None and hasattr(b, 'turn_origin_context'):
+                b.turn_origin_context.reset(m_origin)
+            if m_hop is not None and hasattr(b, 'hop_depth'):
+                b.hop_depth.reset(m_hop)
             if m_files is not None and hasattr(b, 'pending_files_var'):
                 b.pending_files_var.reset(m_files)
             b.pending_stickers_var.reset(m_stickers)
@@ -244,8 +384,8 @@ class DshBrainAdapter:
                     headers=headers,
                     json={'session_key': self._session_key(bot_id, source), 'bot_id': bot_id, 'source': normalize_node_source(source)},
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning('DSH cancel_turn failed (%s:%s): %s', source, bot_id, exc)
 
     async def reset_session(self, bot_id: str, source: str = 'phone') -> None:
         if self.mode == 'legacy':
@@ -267,6 +407,20 @@ class DshBrainAdapter:
         except Exception:
             pass
 
+    async def keepalive_session(self, bot_id: str, source: str = 'phone') -> dict[str, Any]:
+        if self.mode == 'legacy' or (self.mode != 'dsh' and not self._health_ok):
+            return {'ok': True, 'skipped': True, 'reason': 'dsh_disabled'}
+        skey = self._session_key(bot_id, source)
+        try:
+            headers = {'X-DSH-Secret': self.secret} if self.secret else {}
+            async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
+                r = await client.post(f'{self.base_url}/session/keepalive', headers=headers, json={'session_key': skey, 'bot_id': bot_id, 'source': normalize_node_source(source)})
+                if r.status_code == 200:
+                    return r.json()
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc)[:160]}
+        return {'ok': False, 'error': 'keepalive_failed'}
+
     async def _publish_live_state(
         self,
         *,
@@ -283,12 +437,13 @@ class DshBrainAdapter:
         b = self.brain
         nb_key = f'{src}:{bot_id}'
         b.stream_seq += 1
-        clean_stream_txt, _, _, _ = b._extract_all_tags(str(text or ''))
-        # Strip incomplete trailing `<choices` / `<thought` tag while streaming
-        for open_tag in ('<choices', '<thought', '<sticker'):
-            t_idx = clean_stream_txt.rfind(open_tag)
-            if t_idx != -1:
-                clean_stream_txt = clean_stream_txt[:t_idx].rstrip()
+        clean_stream_txt, _, _, _ = b._extract_all_tags(str(text or ''), queue_media=False)
+        clean_stream_txt = b.strip_trailing_partial_control_tag(clean_stream_txt)
+        clean_timeline = b._sanitize_timeline_entries(
+            list(my_exec.get('timeline') or [])[-48:],
+            queue_media=False,
+            strip_partial=True,
+        )
         stream_obj = {
             'seq': b.stream_seq,
             'turn_id': turn_id,
@@ -304,7 +459,7 @@ class DshBrainAdapter:
             'tool': tool,
             'trace': compact_trace_list(list(my_exec.get('trace') or [])[-24:]),
             'turn_steps': list(my_exec.get('turn_steps') or [])[-32:],
-            'timeline': list(my_exec.get('timeline') or [])[-48:],
+            'timeline': clean_timeline,
             'context_stats': b._get_light_stream_context_stats(bot_id, src),
             'updated_at': time.time(),
         }
@@ -335,9 +490,12 @@ class DshBrainAdapter:
         b = self.brain
         cfg = b.store.config
         use_big = bot.get('engine') == 'big'
-        api_key = cfg.effective_api_key(big=use_big) or cfg.effective_api_key(big=not use_big)
-        base_url = cfg.effective_base_url()
-        model_id = cfg.effective_model(bot_model=bot.get('model', ''), big=use_big) or cfg.effective_model(bot_model=bot.get('model', ''), big=not use_big)
+        if hasattr(cfg, 'resolve_route'):
+            base_url, api_key, model_id, _channel_id = cfg.resolve_route(bot_model=bot.get('model', ''), big=use_big)
+        else:
+            api_key = cfg.effective_api_key(big=use_big) or cfg.effective_api_key(big=not use_big)
+            base_url = cfg.effective_base_url()
+            model_id = cfg.effective_model(bot_model=bot.get('model', ''), big=use_big) or cfg.effective_model(bot_model=bot.get('model', ''), big=not use_big)
         nb_key = f'{src}:{bot_id}'
         turn_started_perf = time.perf_counter()
 
@@ -383,6 +541,10 @@ class DshBrainAdapter:
                     if txt_val:
                         raw_seed_items.append({'role': 'tool', 'text': f"[{tname} 返回]: {txt_val[:3200]}"})
                 elif h_role in ('user', 'assistant') and txt_val:
+                    # Skip compact_summary inside seed_history because it is now delivered
+                    # unconditionally via the dedicated `compaction_checkpoint` section!
+                    if h_role == 'assistant' and ('核心进展与上下文摘要' in txt_val or '交接检查点' in txt_val):
+                        continue
                     raw_seed_items.append({'role': h_role, 'text': txt_val[:6000]})
 
             kept_seed_rev: list[dict[str, str]] = []
@@ -416,7 +578,9 @@ class DshBrainAdapter:
         else:
             eff_user_text = str(u_content or raw_user_text or '')
 
-        self._get_or_init_turn_acc(eff_turn_id, allowed=allowed)
+        cur_origin = b.turn_origin_context.get() if (hasattr(b, 'turn_origin_context') and b.turn_origin_context in contextvars.copy_context()) else None
+        cur_hop = int(b.hop_depth.get() or 0) if hasattr(b, 'hop_depth') else 0
+        self._get_or_init_turn_acc(eff_turn_id, allowed=allowed, turn_origin=cur_origin, hop_depth=cur_hop)
         my_exec.setdefault('trace', [])
         my_exec.setdefault('turn_steps', [])
         live_timeline: list[dict[str, Any]] = my_exec.setdefault('timeline', [])
@@ -431,13 +595,18 @@ class DshBrainAdapter:
         first_token_perf: float | None = None
         last_in_tokens = 0
         last_cached_tokens_step = 0
+        enqueued_abort_epoch = int(getattr(b, '_abort_epoch_by_node_bot', {}).get(nb_key, 0) or 0)
+        enqueued_bot_abort_epoch = int(getattr(b, '_abort_epoch_by_bot', {}).get(bot_id, 0) or 0)
 
         def _is_aborted() -> bool:
             return (
                 (eff_turn_id in b._stopped_turn_ids)
                 or (enqueued_stop_epoch != getattr(b, '_user_stop_epoch_by_node_bot', {}).get(nb_key, 0))
+                or (enqueued_abort_epoch != getattr(b, '_abort_epoch_by_node_bot', {}).get(nb_key, 0))
+                or (enqueued_bot_abort_epoch != getattr(b, '_abort_epoch_by_bot', {}).get(bot_id, 0))
             )
 
+        mem_env = (getattr(b, '_last_turn_memory_envelope', None) or {}).get(nb_key) or {}
         payload = {
             'session_key': skey,
             'bot_id': bot_id,
@@ -445,6 +614,8 @@ class DshBrainAdapter:
             'turn_id': eff_turn_id,
             'reset_session': force_reset,
             'system_prompt': sys_prompt,
+            'compaction_checkpoint': str(mem_env.get('compaction_checkpoint') or ''),
+            'ephemeral_recall': str(mem_env.get('ephemeral_recall') or ''),
             'user_text': eff_user_text,
             'images': images,
             'seed_history': seed_history,
@@ -467,10 +638,17 @@ class DshBrainAdapter:
             headers['X-DSH-Secret'] = self.secret
 
         try:
+            stream_client = getattr(self, '_stream_client', None)
+            if stream_client is None or getattr(stream_client, 'is_closed', False):
+                stream_client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(600.0, connect=5.0),
+                    limits=httpx.Limits(max_keepalive_connections=8, max_connections=16, keepalive_expiry=120.0),
+                    trust_env=False,
+                )
+                self._stream_client = stream_client
             for stream_attempt in range(2):
                 try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=5.0), trust_env=False) as client:
-                        async with client.stream('POST', f'{self.base_url}/turn/stream', headers=headers, json=payload) as resp:
+                    async with stream_client.stream('POST', f'{self.base_url}/turn/stream', headers=headers, json=payload) as resp:
                             if resp.status_code >= 400:
                                 err_body = (await resp.aread()).decode('utf-8', 'replace')[:260]
                                 raise RuntimeError(f'DSH Sidecar HTTP {resp.status_code}: {err_body}')
@@ -488,6 +666,17 @@ class DshBrainAdapter:
                                 et = evt.get('type')
                                 if et == 'step_start':
                                     api_calls += 1
+                                    # Avoid duplicate stacked thinking blocks when step 1 was only a lightweight sticker/reply call
+                                    if api_calls > 1 and stream_thought.strip():
+                                        only_sticker_steps = bool(my_exec['trace']) and all(
+                                            str(tr.get('tool') or '') in ('reply', 'send_sticker', 'sticker')
+                                            and str((tr.get('arguments') or {}).get('op') or 'sticker').lower() in ('sticker', 'send_sticker', 'emoji', '')
+                                            for tr in my_exec['trace']
+                                        )
+                                        if only_sticker_steps:
+                                            stream_thought = ''
+                                        elif not stream_thought.endswith('\n'):
+                                            stream_thought += '\n'
                                 elif et == 'thought_delta':
                                     th_d = str(evt.get('delta') or '')
                                     first_th = first_token_perf is None and bool(th_d)
@@ -495,7 +684,7 @@ class DshBrainAdapter:
                                         first_token_perf = time.perf_counter()
                                     stream_thought += th_d
                                     now_m = time.monotonic()
-                                    if first_th or (now_m - last_pub >= 0.05):
+                                    if first_th or (now_m - last_pub >= 0.025):
                                         last_pub = now_m
                                         await self._publish_live_state(
                                             bot_id=bot_id, bot_name=bot['name'], src=src, turn_id=eff_turn_id,
@@ -516,7 +705,7 @@ class DshBrainAdapter:
                                             if clean_chunk:
                                                 live_timeline.append({'type': 'text', 'text': clean_chunk})
                                     now_m = time.monotonic()
-                                    if first_tx or (now_m - last_pub >= 0.04):
+                                    if first_tx or (now_m - last_pub >= 0.025):
                                         last_pub = now_m
                                         await self._publish_live_state(
                                             bot_id=bot_id, bot_name=bot['name'], src=src, turn_id=eff_turn_id,
@@ -540,9 +729,10 @@ class DshBrainAdapter:
                                     tname = str(evt.get('tool') or '')
                                     call_id = str(evt.get('call_id') or f'call_dsh_{len(my_exec["trace"])}')
                                     raw_args = evt.get('arguments') if isinstance(evt.get('arguments'), dict) else {}
-                                    step_note_here = pending_step_note
-                                    pending_step_note = ''
+                                    step_note_here, pending_step_note = pending_step_note, ''
                                     running_calls[call_id] = (tname, raw_args, step_note_here)
+                                    if tname == 'reply' and str(raw_args.get('op') or raw_args.get('action') or '').strip().lower() in ('sticker', 'send_sticker', 'emoji', 'choices', 'present_choices'):
+                                        continue
                                     my_exec['tool'] = tname
                                     r_ent = compact_trace_list([{
                                         'tool': tname,
@@ -577,6 +767,8 @@ class DshBrainAdapter:
                                     step_note_here = matched_info[2] if matched_info else ''
                                     res_payload = evt.get('result') or ({'ok': evt.get('ok')} if 'ok' in evt else {})
                                     st_flag = 'error' if evt.get('ok') is False else 'done'
+                                    if tname == 'reply' and st_flag != 'error' and str(saved_args.get('op') or saved_args.get('action') or '').strip().lower() in ('sticker', 'send_sticker', 'emoji', 'choices', 'present_choices'):
+                                        continue
                                     done_ent = compact_trace_list([{
                                         'tool': tname,
                                         'arguments': saved_args,
@@ -649,7 +841,7 @@ class DshBrainAdapter:
                         live_step_text = ''
                         pending_step_note = ''
                         await asyncio.sleep(0.5)
-                        await self.probe_health(timeout=1.5)
+                        await self.health_status(force=True)
                         continue
                     if stream_text.strip() or my_exec['trace']:
                         partial_body = stream_text.strip() or live_step_text.strip()
@@ -692,8 +884,15 @@ class DshBrainAdapter:
                 raise RuntimeError(str(terminal.get('error') or 'DSH execution failed'))
 
             if acc.get('silent_requested'):
-                b._finish_turn_metrics = None
-                return {'silent': True, 'reason': acc.get('silent_reason') or 'quiet'}
+                silent_reason = str(acc.get('silent_reason') or 'quiet')
+                if b.hop_depth.get() == 0:
+                    duration_ms = max(1, int(round((time.perf_counter() - turn_started_perf) * 1000)))
+                    TurnLedgerManager.finish_turn(
+                        b.store, src, bot_id, eff_turn_id,
+                        status='silent', reason=silent_reason,
+                        api_calls=max(1, api_calls), steps_count=len(my_exec['trace']), duration_ms=duration_ms,
+                    )
+                return {'silent': True, 'reason': silent_reason}
 
             # Apply stickers, files & choices accumulated during DSH tool calls
             if acc.get('stickers'):
@@ -773,7 +972,9 @@ class DshBrainAdapter:
             else:
                 final_timeline = list(live_timeline)
             if final_timeline:
-                extra['timeline'] = final_timeline
+                sanitized_tl = b._sanitize_timeline_entries(final_timeline, queue_media=False)
+                if sanitized_tl:
+                    extra['timeline'] = sanitized_tl
             if my_exec.get('turn_steps'):
                 steps_list = list(my_exec['turn_steps'])
                 extra['turn_steps'] = steps_list[-3:] if b.hop_depth.get() > 0 else steps_list
@@ -787,6 +988,8 @@ class DshBrainAdapter:
                     'direction': 'outbound',
                 })
 
+            if is_fg_user_turn and hasattr(b, '_touch_cache_keepalive'):
+                b._touch_cache_keepalive(src, bot_id)
             emitted_final_msg = await b.emit(final_txt, emit_kind, engine='dsh', track=False, **extra)
             return emitted_final_msg
         except asyncio.CancelledError:

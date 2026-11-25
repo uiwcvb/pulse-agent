@@ -118,9 +118,39 @@ class Harness:
     def path(self, p):
         if not p or p == '.':
             return self.root
-        if Path(p).is_absolute() or '\\' in p or ':' in p:
+        raw_p = str(p).strip()
+        if '\\' in raw_p:
             raise ValueError(f'只允许工作区相对路径 (收到: {p})')
-        vault_rel = self._is_vault_rel_path(p)
+        norm_p = raw_p.removeprefix('/workspace-media/').lstrip('/') if raw_p.startswith('/workspace-media/') else raw_p
+        if Path(norm_p).is_absolute():
+            cand_abs = os.path.normpath(norm_p)
+            root_str = os.path.normpath(str(self.root))
+            vault_str = os.path.normpath(str(self.vault.root)) if self.vault is not None else ''
+            matched_rel = None
+            if cand_abs == root_str:
+                return self.root
+            if cand_abs.startswith(root_str + os.sep):
+                matched_rel = cand_abs[len(root_str) + 1:].replace('\\', '/')
+            elif vault_str and cand_abs == vault_str:
+                return self.vault.root
+            elif vault_str and cand_abs.startswith(vault_str + os.sep):
+                matched_rel = 'memory_vault/' + cand_abs[len(vault_str) + 1:].replace('\\', '/')
+            else:
+                for known_pfx in ('/opt/proactive-agent/data/workspace/', '/opt/proactive-agent/data/memory_vault/'):
+                    if norm_p.startswith(known_pfx):
+                        tail_r = norm_p[len(known_pfx):].lstrip('/')
+                        matched_rel = ('memory_vault/' + tail_r) if 'memory_vault/' in known_pfx else tail_r
+                        break
+            if matched_rel is None:
+                raise ValueError(f'只允许工作区相对路径 (收到: {p})')
+            norm_p = matched_rel
+        if norm_p == 'workspace':
+            return self.root
+        if norm_p.startswith('workspace/'):
+            norm_p = norm_p[len('workspace/'):].lstrip('/')
+        if ':' in norm_p:
+            raise ValueError(f'只允许工作区相对路径 (收到: {p})')
+        vault_rel = self._is_vault_rel_path(norm_p)
         if vault_rel is not None and self.vault is not None:
             if not vault_rel:
                 return self.vault.root
@@ -130,23 +160,26 @@ class Harness:
             if cand.is_dir():
                 return cand
             return self.vault.path(vault_rel)
-        path = self.root / p
+        path = self.root / norm_p
         if '..' in path.parts or any(x.is_symlink() for x in [path, *list(path.parents)[:len(path.parts) - len(self.root.parts)]]):
             raise ValueError('禁止上级路径或符号链接')
         if not path.resolve().is_relative_to(self.root):
             raise ValueError('超出工作区')
         resolved = path.resolve()
         if not resolved.exists() and self.vault is not None:
-            vault_cand = (self.vault.root / p).resolve()
+            vault_cand = (self.vault.root / norm_p).resolve()
             if vault_cand.is_relative_to(self.vault.root.resolve()) and vault_cand.exists():
                 return vault_cand
         return resolved
 
-    async def fetch(self, url):
+    async def fetch(self, url, max_chars: int = 16000):
         now = time.time()
+        cap = max(500, min(160000, int(max_chars or 16000)))
         cached = self._web_cache.get(url)
         if cached and now - cached[0] < 600:
-            return dict(cached[1])
+            c_out = dict(cached[1])
+            c_out['text'] = str(c_out.get('text') or '')[:cap]
+            return c_out
         async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
             orig_url = url
             for _ in range(5):
@@ -168,19 +201,52 @@ class Harness:
                         node.decompose()
                     text = soup.get_text(' ', strip=True)
                     links = [{'title': a.get_text(' ', strip=True)[:180], 'url': a['href']} for a in soup.select('a[href]') if a['href'].startswith('http')][:16]
-                    res = {'source': url, 'text': text[:16000], 'links': links}
+                    res = {'source': url, 'text': text[:cap], 'links': links}
                     if len(self._web_cache) > 120:
                         self._web_cache.clear()
-                    self._web_cache[orig_url] = (now, res)
+                    self._web_cache[orig_url] = (now, {'source': url, 'text': text[:64000], 'links': links})
                     return res
             raise ValueError('重定向过多')
+
+    async def http_request(self, args: dict):
+        url = str(args.get('url') or '').strip()
+        if not url:
+            return {'ok': False, 'error': 'url 不能为空'}
+        method = str(args.get('method') or 'GET').strip().upper()
+        if method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'):
+            return {'ok': False, 'error': f'不支持的 HTTP method: {method}'}
+        await public_url(url)
+        headers = dict(args.get('headers') or {}) if isinstance(args.get('headers'), dict) else {}
+        headers.setdefault('User-Agent', 'ProactiveAgent/4.0')
+        cap = max(500, min(160000, int(args.get('max_chars') or 24000)))
+        req_kw: dict[str, Any] = {'headers': headers}
+        if args.get('json_body') is not None:
+            req_kw['json'] = args.get('json_body')
+        elif args.get('body') is not None:
+            req_kw['content'] = str(args.get('body')).encode('utf-8')
+        async with httpx.AsyncClient(timeout=25, trust_env=False, follow_redirects=False) as client:
+            r = await client.request(method, url, **req_kw)
+            raw_txt = r.text[:cap]
+            ct = r.headers.get('content-type', '')
+            out: dict[str, Any] = {'ok': 200 <= r.status_code < 400, 'status_code': r.status_code, 'url': str(r.url), 'content_type': ct}
+            if 'json' in ct.lower():
+                try:
+                    out['json'] = r.json()
+                except Exception:
+                    out['text'] = raw_txt
+            else:
+                out['text'] = raw_txt
+            return out
 
     async def execute(self, name, args):
         try:
             if name in self.custom_handlers:
                 return await self.custom_handlers[name](args)
             if name in self.extension_registry.tool_plugins:
-                return await self.extension_registry.execute_tool(name, args, {'root': str(self.root)})
+                ctx_dir = {'root': str(self.root)}
+                if self.store is not None and getattr(self.store, 'root', None):
+                    ctx_dir['data_dir'] = str(self.store.root)
+                return await self.extension_registry.execute_tool(name, args, ctx_dir)
             if name == 'edit_file':
                 op_edit = str(args.get('op') or args.get('action') or '').strip().lower()
                 if op_edit in ('delete', 'rm', 'remove') or args.get('delete') is True:
@@ -201,6 +267,8 @@ class Harness:
                         args = {**args, 'query': args.get('pattern')}
             elif name == 'web':
                 w_op = str(args.get('op') or args.get('action') or '').strip().lower()
+                if w_op == 'request':
+                    return await self.http_request(args)
                 if w_op == 'fetch' or (not w_op and str(args.get('url') or '').strip()):
                     name = 'web_fetch'
                 else:
@@ -224,10 +292,54 @@ class Harness:
                         return await self.vision_reader(p)
                     from core.vision_engine import VisionEngine
                     return await VisionEngine().read_image_file_with_vision(p, str(args.get('prompt') or ''))
-                if p.stat().st_size > 1_000_000:
-                    raise ValueError('文件过大')
-                raw_text = p.read_text('utf-8', errors='replace')
+                req_max_chars = max(1000, min(160000, int(args.get('max_chars') or 16000)))
+                if p.suffix.lower() in ('.pdf', '.docx', '.xlsx'):
+                    if p.stat().st_size > 20_000_000:
+                        raise ValueError('文档文件超过 20MB')
+                    from core.doc_extractor import extract_document_text
+                    raw_text, _fmt = extract_document_text(p, max_chars=max(req_max_chars, 120000))
+                else:
+                    if p.stat().st_size > 1_000_000:
+                        raise ValueError('文件过大')
+                    raw_text = p.read_text('utf-8', errors='replace')
                 lines = raw_text.splitlines()
+                grep_pat = str(args.get('grep') or '').strip()
+                if grep_pat:
+                    try:
+                        rx_f = re.compile(re.escape(grep_pat) if bool(args.get('literal', False)) else grep_pat, re.IGNORECASE)
+                    except re.error as re_err:
+                        return {'ok': False, 'error': f'grep 正则语法非法 ({re_err})，请修正或传 literal=true', 'total_lines': len(lines)}
+                    ctx_n = max(0, min(10, int(args.get('context') if args.get('context') is not None else 2)))
+                    match_indices = [idx0 for idx0, ln in enumerate(lines) if rx_f.search(ln)]
+                    out_blocks: list[str] = []
+                    shown_line_ids: set[int] = set()
+                    for idx0 in match_indices[:80]:
+                        seg_s = max(0, idx0 - ctx_n)
+                        seg_e = min(len(lines) - 1, idx0 + ctx_n)
+                        if out_blocks and seg_s > (max(shown_line_ids) + 1 if shown_line_ids else -1):
+                            out_blocks.append('---')
+                        for li in range(seg_s, seg_e + 1):
+                            if li not in shown_line_ids:
+                                shown_line_ids.add(li)
+                                mark = '>' if li == idx0 else ' '
+                                out_blocks.append(f'{li + 1}:{mark} {lines[li]}')
+                    header_msg = (
+                        f'[grep={grep_pat!r} 共命中 {len(match_indices)} 行'
+                        f'{"（仅显示前 80 处）" if len(match_indices) > 80 else ""} / 文件共 {len(lines)} 行]\n'
+                    )
+                    return {
+                        'ok': True,
+                        'content': (header_msg + '\n'.join(out_blocks))[:160000],
+                        'total_lines': len(lines),
+                        'match_count': len(match_indices),
+                        'resolved_path': self._display_rel_path(p),
+                    }
+                if args.get('tail') is not None and int(args.get('tail') or 0) > 0:
+                    tail_n = max(1, min(400, int(args.get('tail'))))
+                    s = max(1, len(lines) - tail_n + 1)
+                    e = len(lines)
+                    sliced = '\n'.join(f'{idx}: {lines[idx - 1]}' for idx in range(s, e + 1) if 1 <= idx <= len(lines))
+                    return {'content': sliced[:160000], 'total_lines': len(lines), 'range': f'{s}-{e}', 'resolved_path': self._display_rel_path(p)}
                 if 'start_line' in args or 'end_line' in args:
                     raw_s = int(args.get('start_line') if args.get('start_line') is not None else 1)
                     raw_e = int(args.get('end_line') if args.get('end_line') is not None else (max(1, raw_s) + 200))
@@ -251,15 +363,20 @@ class Harness:
                 if len(lines) > 160 or len(raw_text) > 9000:
                     default_end = min(len(lines), 120)
                     sliced = '\n'.join(f'{idx}: {lines[idx - 1]}' for idx in range(1, default_end + 1))
+                    next_e = min(len(lines), default_end + 120)
+                    banner = (
+                        f'[⚠️ 已截断：文件共 {len(lines)} 行，当前仅展示第 1-{default_end} 行；'
+                        f'续读请传 start_line={default_end + 1}, end_line={next_e}，读末尾请传 tail=80，或传 grep="关键词" 直接过滤]\n\n'
+                    )
                     return {
-                        'content': sliced[:12000],
+                        'content': banner + sliced[:req_max_chars],
                         'total_lines': len(lines),
                         'range': f'1-{default_end}',
                         'resolved_path': self._display_rel_path(p),
                         'truncated': True,
-                        'hint': f'文件共 {len(lines)} 行，已默认返回前 {default_end} 行以保护上下文容量；如需阅读后续部分请传 start_line={default_end + 1}, end_line={min(len(lines), default_end + 120)} 或用 grep_search 定位行号。',
+                        'hint': f'文件共 {len(lines)} 行，已默认返回前 {default_end} 行以保护上下文容量；如需阅读后续部分请传 start_line={default_end + 1}, end_line={next_e}、tail=80 或传 grep。',
                     }
-                return {'content': raw_text[:160000], 'total_lines': len(lines), 'resolved_path': self._display_rel_path(p)}
+                return {'content': raw_text[:req_max_chars], 'total_lines': len(lines), 'resolved_path': self._display_rel_path(p)}
             if name == 'delete_file':
                 raw_path_arg = str(args.get('path') or '').strip()
                 if not raw_path_arg:
@@ -349,7 +466,7 @@ class Harness:
                     im = _Image.open(_io.BytesIO(raw_bytes)).convert('RGB')
                     iw, ih = im.size
                     if crop_box and len(crop_box) == 4:
-                        ymin, xmin, ymax, xmax = [max(0, min(1000, int(v))) for v in crop_box]
+                        xmin, ymin, xmax, ymax = [max(0, min(1000, int(v))) for v in crop_box]
                         if xmax > xmin and ymax > ymin:
                             left = max(0, int(round(xmin * iw / 1000.0)))
                             top = max(0, int(round(ymin * ih / 1000.0)))
@@ -486,7 +603,8 @@ class Harness:
                             rel = 'memory_vault/' + f.relative_to(self.vault.root).as_posix()
                             if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(f.name, pattern):
                                 matches.append(rel)
-                return {'pattern': pattern, 'matches': matches[:200]}
+                glob_lim = max(1, min(500, int(args.get('limit') or args.get('max_results') or 200)))
+                return {'pattern': pattern, 'matches': matches[:glob_lim]}
             if name == 'grep_search':
                 query = str(args.get('query') or '').strip()
                 if not query:
@@ -531,6 +649,7 @@ class Harness:
 
                 hits = []
                 files_scanned = 0
+                grep_lim = max(1, min(300, int(args.get('limit') or args.get('max_results') or 80)))
                 for target_p, base_dir, prefix in search_targets:
                     file_iter = [target_p] if target_p.is_file() else sorted(target_p.rglob('*'))
                     for f in file_iter:
@@ -556,7 +675,7 @@ class Harness:
                             for idx, line in enumerate(f.read_text('utf-8', errors='ignore').splitlines(), 1):
                                 if rx.search(line):
                                     hits.append({'file': rel, 'line': idx, 'text': line[:220]})
-                                    if len(hits) >= 80:
+                                    if len(hits) >= grep_lim:
                                         return {
                                             'ok': True,
                                             'query': query,
@@ -596,18 +715,20 @@ class Harness:
             if name == 'run_bash':
                 if sys.platform != 'linux':
                     return {'ok': False, 'error': 'Bash 隔离执行仅在 Linux 部署节点可用'}
-                timeout_sec = max(1, min(90, int(args.get('timeout') or 30)))
-                env = os.environ.copy()
+                timeout_sec = max(1, min(300, int(args.get('timeout') or 30)))
+                from core.tool_schemas import scrub_subprocess_env
                 py_user_base = self.root / '.python_packages'
                 py_user_base.mkdir(parents=True, exist_ok=True)
-                env['TZ'] = 'Asia/Shanghai'
-                env['PYTHONUSERBASE'] = str(py_user_base)
-                env['PIP_USER'] = '1'
-                env['PATH'] = f"{py_user_base / 'bin'}:{env.get('PATH', '/usr/bin:/bin')}"
+                extra_env = {
+                    'TZ': 'Asia/Shanghai',
+                    'PYTHONUSERBASE': str(py_user_base),
+                    'PIP_USER': '1',
+                    'PATH': f"{py_user_base / 'bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }
                 if self.store is not None:
-                    env['API_BASE_URL'] = self.store.config.effective_base_url()
-                    env['API_KEY'] = self.store.config.effective_api_key(big=True) or self.store.config.effective_api_key(big=False)
-                    env['DEFAULT_MODEL'] = self.store.config.effective_model(big=True) or self.store.config.effective_model(big=False)
+                    extra_env['API_BASE_URL'] = self.store.config.effective_base_url()
+                    extra_env['DEFAULT_MODEL'] = self.store.config.effective_model(big=True) or self.store.config.effective_model(big=False)
+                env = scrub_subprocess_env(extra=extra_env)
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable,
                     str(Path(__file__).with_name('sandbox.py')),
@@ -620,10 +741,16 @@ class Harness:
                 )
 
                 def kill_group():
+                    if proc.returncode is not None:
+                        return
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                        if sys.platform != 'win32' and hasattr(os, 'killpg'):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        else:
+                            proc.kill()
+                    except (ProcessLookupError, PermissionError, OSError):
+                        with contextlib.suppress(Exception):
+                            proc.kill()
 
                 output = bytearray()
 
@@ -647,7 +774,7 @@ class Harness:
                     if self.store is not None:
                         self.store.sync_from_workspace(force=True)
                     return {
-                        'error': f'命令执行超时 ({timeout_sec}s)，已自动终止。若需长时后台运行请使用 bg_task 工具。',
+                        'error': f'命令执行超时 ({timeout_sec}s)，已自动终止。若需长时后台运行请使用 bash(op="bg_start")，并可用 bash(op="bg_wait", task_id=...) 等待结果。',
                         'timed_out': True,
                         'exit_code': -9,
                         'output': bytes(output).decode('utf-8', errors='replace'),
@@ -661,14 +788,14 @@ class Harness:
                 if self.store is not None:
                     self.store.sync_from_workspace(force=True)
                 out_str_b = out.decode('utf-8', errors='replace')
-                res_bash: dict[str, Any] = {'exit_code': proc.returncode, 'cwd': str(self.root), 'output': out_str_b}
+                res_bash: dict[str, Any] = {'exit_code': proc.returncode, 'node': 'hub_linux_sandbox', 'cwd': str(self.root), 'output': out_str_b}
                 cmd_raw_s = str(args.get('command') or '')
                 if (proc.returncode != 0 or 'No such file or directory' in out_str_b) and any(
                     vp in cmd_raw_s or vp in out_str_b for vp in ('memory_vault', 'notes/', 'profile/', 'timeline/', 'tasks/')
                 ):
                     res_bash['hint'] = (
-                        '提示：memory_vault 位于 Landlock 隔离的独立安全目录，run_bash 工作目录为其同级 workspace；'
-                        '读写或检索 memory_vault 请直接使用 read_file / write_file / edit_file / grep_search 工具，切勿依据 bash 报错误判笔记不存在。'
+                        '提示：memory_vault 位于 Landlock 隔离的独立安全目录，bash 工作目录为其同级 workspace；'
+                        '读写或检索 memory_vault 请直接使用 read_file / write_file / edit_file / search_files(op="grep") 工具，切勿依据 bash 报错误判笔记不存在。'
                     )
                 return res_bash
             if name == 'web_fetch':
@@ -676,11 +803,11 @@ class Harness:
                 if not u_arg:
                     return {'ok': False, 'error': 'url 不能为空'}
                 try:
-                    return await self.fetch(u_arg)
+                    return await self.fetch(u_arg, max_chars=int(args.get('max_chars') or 16000))
                 except httpx.HTTPStatusError as he:
                     return {'ok': False, 'url': u_arg, 'error_code': f'HTTP_{he.response.status_code}', 'error': f'抓取网页失败 (HTTP {he.response.status_code}): {u_arg}'}
                 except httpx.RequestError as re_err:
-                    return {'ok': False, 'url': u_arg, 'error_code': type(re_err).__name__, 'error': f'网络连接失败 ({type(re_err).__name__}: 无法访问 {u_arg}，请检查域名或改用 web_search / cloud_desktop)'}
+                    return {'ok': False, 'url': u_arg, 'error_code': type(re_err).__name__, 'error': f'网络连接失败 ({type(re_err).__name__}: 无法访问 {u_arg}，请检查域名或改用 web(op="search") / cloud)'}
             if name == 'web_search':
                 q = str(args.get('query') or '').strip()
                 if not q:

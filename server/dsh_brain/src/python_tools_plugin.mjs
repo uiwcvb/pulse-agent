@@ -73,7 +73,6 @@ const READ_ONLY_SAFE_TOOLS = new Set([
   'read_file',
   'search_files',
   'web',
-  'memory',
   'subtask',
 ]);
 
@@ -84,8 +83,8 @@ const READ_ONLY_SAFE_TOOLS = new Set([
 export const DEFAULT_TOOL_SCHEMAS = [
   {
     name: 'read_file',
-    description: '读取工作区文本文件、列目录，或直接视觉识别本地图片 (png/jpg/webp/bmp/gif)',
-    parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer' }, limit: { type: 'integer' }, max_chars: { type: 'integer' } }, additionalProperties: true },
+    description: '读取工作区或 memory_vault/ 文本文件（grep 关键字过滤、tail 读末尾、start_line/end_line 分段）、列目录，或视觉识别图片',
+    parameters: { type: 'object', properties: { path: { type: 'string' }, start_line: { type: 'integer' }, end_line: { type: 'integer' }, tail: { type: 'integer' }, grep: { type: 'string' }, context: { type: 'integer' }, literal: { type: 'boolean' }, max_chars: { type: 'integer' } }, additionalProperties: true },
   },
   {
     name: 'write_file',
@@ -94,38 +93,43 @@ export const DEFAULT_TOOL_SCHEMAS = [
   },
   {
     name: 'edit_file',
-    description: '编辑、重命名或删除工作区文件 (op="replace"|"move"|"delete")',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, old: { type: 'string' }, new: { type: 'string' }, dst: { type: 'string' } }, required: ['path'], additionalProperties: true },
+    description: '精确替换、移动重命名或删除工作区与 memory_vault/ 文件 (op="replace"|"move"|"delete")',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, old_text: { type: 'string' }, new_text: { type: 'string' }, replace_all: { type: 'boolean' }, src: { type: 'string' }, dst: { type: 'string' } }, additionalProperties: true },
   },
   {
     name: 'search_files',
-    description: '工作区检索工具 (op="grep"|"glob"|"list")，默认查找当前目录及记忆库',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, query: { type: 'string' }, pattern: { type: 'string' }, max_results: { type: 'integer' } }, additionalProperties: true },
+    description: '工作区检索工具 (op="grep"|"glob"|"list"|"locate")；locate 可跨 hub_workspace / memory_vault / cloud_desktop / pc_windows 定位文件',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, query: { type: 'string' }, pattern: { type: 'string' }, literal: { type: 'boolean' }, max_depth: { type: 'integer' }, limit: { type: 'integer' } }, additionalProperties: true },
   },
   {
     name: 'bash',
-    description: '执行命令、后台任务与 0-Token 定时哨兵 (op="run"|"bg_start"|"bg_logs"|"bg_stdin"|"bg_kill"|"bg_list"|"watchdog_start"|"watchdog_stop"|"watchdog_logs"|"watchdog_run_now"|"watchdog_list")',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, command: { type: 'string' }, timeout: { type: 'integer' }, cwd: { type: 'string' } }, additionalProperties: true },
+    description: '沙箱命令行（最长 300s）、后台任务（支持 bg_wait）与 0-Token 定时哨兵；target="pc_windows" 指向 Windows 电脑',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, command: { type: 'string' }, timeout: { type: 'integer' }, cwd: { type: 'string' }, target: { type: 'string' }, task_id: { type: 'string' } }, additionalProperties: true },
   },
   {
     name: 'web',
-    description: '联网搜索公开资料与抓取网页正文 (op="search"|"fetch")',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, url: { type: 'string' } }, additionalProperties: true },
+    description: '联网搜索 (search)、抓取网页正文 (fetch) 或发起结构化 HTTP/JSON 请求 (request)',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, url: { type: 'string' }, method: { type: 'string' }, headers: { type: 'object' }, body: { type: 'string' }, json_body: { type: 'object' }, limit: { type: 'integer' }, max_chars: { type: 'integer' } }, additionalProperties: true },
   },
   {
     name: 'memory',
     description: '长期记忆与置顶规则 (op="search"|"conversation"|"ctx"|"pin"|"unpin"|"list_pins")',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, text: { type: 'string' }, pin_id: { type: 'string' } }, additionalProperties: true },
+    parameters: { type: 'object', properties: { op: { type: 'string' }, query: { type: 'string' }, ctx_id: { type: 'string' }, text: { type: 'string' }, pin_id: { type: 'string' } }, additionalProperties: true },
   },
   {
     name: 'blackboard',
-    description: '事件驱动共享黑板、跨端 @同事 协作与定时闹钟编排 (action="post"|"read"|"peek"|"claim"|"complete"|"review"|"deliver"|"approve"|"reject"|"schedule"|"alarm"|"cancel"|"list"|"clear_done")',
-    parameters: { type: 'object', properties: { action: { type: 'string' }, text: { type: 'string' }, target: { type: 'string' }, post_id: { type: 'string' }, mentions: { type: 'array', items: { type: 'string' } }, cron_expr: { type: 'string' } }, additionalProperties: true },
+    description: '多 Bot 共享黑板与事件监听协作（跨端 @同事、任务认领/验收、KV/待办共享与 watch 条件触发）',
+    parameters: { type: 'object', properties: { action: { type: 'string' }, text: { type: 'string' }, title: { type: 'string' }, post_id: { type: 'string' }, mentions: { type: 'array', items: { type: 'string' } }, watch: { type: 'string' }, trigger_value: { type: 'string' }, overwrite: { type: 'boolean' } }, additionalProperties: true },
+  },
+  {
+    name: 'schedule',
+    description: '定时提醒、闹钟与周期例程管理 (op="schedule"|"alarm"|"cancel"|"list"|"add_routine"|"update_routine"|"remove_routine"|"list_routines")',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, task_id: { type: 'string' }, post_id: { type: 'string' }, title: { type: 'string' }, text: { type: 'string' }, when: { type: 'string' }, run_at: { type: 'string' }, delay_minutes: { type: 'integer' }, daily_time: { type: 'string' }, cron_expr: { type: 'string' }, overwrite: { type: 'boolean' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'phone',
-    description: '手机隔离虚拟屏 VirtualDisplay 与通知/验证码操控；纯视觉 0..1000 归一化坐标 (nx, ny) 与区域框 box=[nx1,ny1,nx2,ny2]',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, text: { type: 'string' }, target: { type: 'string' }, app: { type: 'string' }, direction: { type: 'string' }, command: { type: 'string' } }, required: ['op'], additionalProperties: true },
+    description: '手机隔离虚拟屏 VirtualDisplay、通知读取与验证码读取 (op="screenshot"|"tap"|"long_press"|"swipe"|"type"|"key"|"back"|"home"|"enter"|"recents"|"keyevent"|"app"|"notifications"|"read_otp"|"ime_policy"|"status"|"zoom"|"send_screenshot")；纯视觉 0..1000 归一化坐标 (nx, ny) 与区域框 box=[nx1,ny1,nx2,ny2]',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, action: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, text: { type: 'string' }, target: { type: 'string' }, app: { type: 'string' }, direction: { type: 'string' }, command: { type: 'string' }, keycode: { type: 'string' }, source: { type: 'string' }, destroy: { type: 'boolean' }, keep_alive: { type: 'boolean' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'pc',
@@ -134,13 +138,13 @@ export const DEFAULT_TOOL_SCHEMAS = [
   },
   {
     name: 'cloud',
-    description: '24/7 共享 Linux 云电脑（桌面、浏览器、Shell、zoom 局部放大、send_screenshot、文件传输）；统一采用 0..1000 坐标 (nx, ny) 与 box=[nx1,ny1,nx2,ny2]',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, ref: { type: 'string' }, command: { type: 'string' }, url: { type: 'string' }, text: { type: 'string' }, direction: { type: 'string' }, full_page: { type: 'boolean' } }, required: ['op'], additionalProperties: true },
+    description: '24/7 共享 Linux 云电脑（桌面、浏览器 CDP、Shell、eval_js、zoom 局部放大、send_screenshot、文件传输 push/pull）；bash/eval_js 默认精简无截图输出（传 screenshot=true 附带截图）；统一 0..1000 坐标 (nx, ny) 与 box=[nx1,ny1,nx2,ny2]',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, nx: { type: 'integer' }, ny: { type: 'integer' }, nx2: { type: 'integer' }, ny2: { type: 'integer' }, box: { type: 'array', items: { type: 'integer' } }, ref: { type: 'string' }, command: { type: 'string' }, script: { type: 'string' }, url: { type: 'string' }, text: { type: 'string' }, direction: { type: 'string' }, full_page: { type: 'boolean' }, lean: { type: 'boolean' }, screenshot: { type: 'boolean' }, include_frame: { type: 'boolean' }, src: { type: 'string' }, dst: { type: 'string' }, path: { type: 'string' }, name: { type: 'string' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'reply',
-    description: '交互控制与分级通知 (op="notify"|"alarm"|"send_image"|"send_file"|"choices"|"silent"|"dnd"|"complete_goal")；需提供快捷按钮时调用 op="choices" 传入 2~3 个用户第一人称点击短句，并在本轮输出完整正文',
-    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, name: { type: 'string' }, caption: { type: 'string' }, choices: { type: 'array', items: { type: 'string' } }, title: { type: 'string' }, body: { type: 'string' }, level: { type: 'string' }, urgent: { type: 'boolean' }, overlay: { type: 'boolean' }, summary: { type: 'string' } }, required: ['op'], additionalProperties: true },
+    description: '交互控制与分级通知 (op="notify"|"alarm"|"send_image"|"send_file"|"sticker"|"choices"|"silent"|"dnd"|"complete_goal")；需提供快捷按钮时调用 op="choices" 传入 2~3 个用户第一人称点击短句，并在本轮输出完整正文',
+    parameters: { type: 'object', properties: { op: { type: 'string' }, path: { type: 'string' }, name: { type: 'string' }, code: { type: 'string' }, caption: { type: 'string' }, crop_box: { type: 'array', items: { type: 'integer' } }, max_side: { type: 'integer' }, choices: { type: 'array', items: { type: 'string' } }, title: { type: 'string' }, body: { type: 'string' }, level: { type: 'string' }, urgent: { type: 'boolean' }, overlay: { type: 'boolean' }, summary: { type: 'string' } }, required: ['op'], additionalProperties: true },
   },
   {
     name: 'subtask',
@@ -231,8 +235,14 @@ export function apply(ctx, opts) {
           if (!value || typeof value !== 'object' || Array.isArray(value)) {
             return [{ type: 'text', text: JSON.stringify(value) }];
           }
-          const { _imageAttachment, ...cleanMeta } = /** @type {any} */ (value);
+          const { _imageAttachment, _ephemeral_ui, _stuck_nudge, ...cleanMeta } = /** @type {any} */ (value);
           const blocks = [{ type: 'text', text: JSON.stringify(cleanMeta) }];
+          if (typeof _ephemeral_ui === 'string' && _ephemeral_ui.trim()) {
+            blocks.push({ type: 'text', text: _ephemeral_ui.trim() });
+          }
+          if (typeof _stuck_nudge === 'string' && _stuck_nudge.trim()) {
+            blocks.push({ type: 'text', text: _stuck_nudge.trim() });
+          }
           if (_imageAttachment && typeof _imageAttachment.attachmentId === 'string') {
             blocks.push({ type: 'image', attachment: _imageAttachment });
           }

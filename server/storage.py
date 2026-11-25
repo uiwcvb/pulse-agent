@@ -1,5 +1,5 @@
 from __future__ import annotations
-import contextlib, copy, json, secrets, threading, time
+import contextlib, copy, json, re, secrets, threading, time
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from vault_manager import TZ, atomic_write, now_iso
@@ -41,11 +41,85 @@ class SMTPConfig(BaseModel):
         if '\r' in v or '\n' in v: raise ValueError('字段包含非法换行')
         return v.strip()
 
+
+def parse_channel_model(spec: str) -> tuple[str, str]:
+    """Parse explicit channel-prefixed model spec: 'ch:<id>/<model>' or '<id>::<model>'."""
+    raw = str(spec or '').strip()
+    if not raw:
+        return '', ''
+    if raw.startswith('ch:') and '/' in raw[3:]:
+        cid, mid = raw[3:].split('/', 1)
+        cid, mid = cid.strip(), mid.strip()
+        if cid and mid:
+            return cid, mid
+    if '::' in raw:
+        cid, mid = raw.split('::', 1)
+        cid, mid = cid.strip(), mid.strip()
+        if cid and mid:
+            return cid, mid
+    return '', raw
+
+
+def _mask_api_key(key: str) -> str:
+    s = str(key or '').strip()
+    if not s:
+        return ''
+    if len(s) <= 8:
+        return '*' * len(s)
+    return f'{s[:4]}...{s[-4:]}'
+
+
+class ProviderChannel(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    id: str = Field('', max_length=64)
+    name: str = Field('', max_length=80)
+    base_url: str = Field('', max_length=500)
+    api_key: str = Field('', max_length=4096)
+    enabled: bool = True
+    priority: int = Field(100, ge=0, le=1000)
+    models: list[str] = Field(default_factory=list)
+
+    @field_validator('id')
+    @classmethod
+    def clean_id(cls, v):
+        s = re.sub(r'[^a-zA-Z0-9_-]', '', str(v or '').strip())
+        return s[:64]
+
+    @field_validator('base_url')
+    @classmethod
+    def validate_channel_url(cls, v):
+        s = str(v or '').strip()
+        return BrainConfig.url(s) if s else ''
+
+    @field_validator('models', mode='before')
+    @classmethod
+    def clean_models(cls, v):
+        if not isinstance(v, list):
+            return []
+        out: list[str] = []
+        for item in v:
+            s = str(item or '').strip()
+            if s and s not in out:
+                out.append(s)
+        return out[:500]
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra='ignore')
     api_base_url: str = 'https://api.openai.com/v1'
     api_key: str = Field('', max_length=4096)
     default_model: str = Field('', max_length=200)
+    worker_model: str = Field('', max_length=200)
+    embedding_tier: str = Field('local_gte_small_zh', max_length=64)
+    embedding_api_base_url: str = Field('', max_length=500)
+    embedding_api_key: str = Field('', max_length=4096)
+    embedding_api_model: str = Field('', max_length=200)
+    cache_keepalive_enabled: bool = True
+    cache_keepalive_interval_sec: int = Field(260, ge=60, le=600)
+    cache_keepalive_max_pings: int = Field(1, ge=0, le=5)
+    idle_compact_minutes: int = Field(9, ge=0, le=120)
+    sleep_consolidate_idle_seconds: int = Field(480, ge=60, le=3600)
+    channels: list[ProviderChannel] = Field(default_factory=list)
     fallback_enabled: bool = False
     fallback_base_url: str = Field('', max_length=500)
     fallback_api_key: str = Field('', max_length=4096)
@@ -77,41 +151,165 @@ class Config(BaseModel):
     def validate_api_base_url(cls, v):
         return BrainConfig.url(v)
 
-    @field_validator('fallback_base_url')
+    @field_validator('fallback_base_url', 'embedding_api_base_url')
     @classmethod
     def validate_fallback_base_url(cls, v):
         s = (v or '').strip()
         return BrainConfig.url(s) if s else ''
 
-    def effective_base_url(self) -> str:
+    @field_validator('embedding_tier')
+    @classmethod
+    def validate_embedding_tier(cls, v):
+        s = str(v or 'local_gte_small_zh').strip().lower()
+        allowed = {'off', 'local_gte_small_zh', 'local_bge_small_zh', 'local_dmeta_zh_small', 'local_gte_base_zh', 'api'}
+        return s if s in allowed else 'local_gte_small_zh'
+
+    def _enabled_channels(self) -> list[ProviderChannel]:
+        items = [ch for ch in (self.channels or []) if ch.enabled and (ch.base_url or '').strip() and (ch.api_key or '').strip()]
+        return sorted(items, key=lambda c: (int(c.priority), c.id))
+
+    def _legacy_base_url(self) -> str:
         if self.api_base_url and self.api_base_url != 'https://api.openai.com/v1':
             return self.api_base_url
         if self.big_brain.base_url and self.big_brain.base_url != 'https://api.openai.com/v1':
             return self.big_brain.base_url
         return self.small_brain.base_url or self.api_base_url or 'https://api.openai.com/v1'
 
-    def effective_api_key(self, big: bool = False) -> str:
+    def _legacy_api_key(self, big: bool = False) -> str:
         primary = self.big_brain.api_key if big else self.small_brain.api_key
         return primary or self.api_key
+
+    def effective_base_url(self) -> str:
+        if self._legacy_api_key(big=True) or self._legacy_api_key(big=False):
+            return self._legacy_base_url()
+        enabled = self._enabled_channels()
+        if enabled:
+            return enabled[0].base_url
+        return self._legacy_base_url()
+
+    def effective_api_key(self, big: bool = False) -> str:
+        legacy = self._legacy_api_key(big=big)
+        if legacy:
+            return legacy
+        enabled = self._enabled_channels()
+        if enabled:
+            return enabled[0].api_key
+        return ''
 
     def effective_model(self, bot_model: str = '', big: bool = False) -> str:
         if bot_model and bot_model.strip():
             return bot_model.strip()
         primary = self.big_brain.model if big else self.small_brain.model
-        return primary or self.default_model
+        if primary:
+            return primary
+        if self.default_model:
+            return self.default_model
+        enabled = self._enabled_channels()
+        for ch in enabled:
+            if ch.models:
+                return ch.models[0]
+        return ''
+
+    def effective_worker_model(self, bot_model: str = '') -> str:
+        wm = str(self.worker_model or '').strip()
+        return wm if wm else self.effective_model(bot_model=bot_model, big=False)
+
+    def resolve_worker_route(self, bot_model: str = '') -> tuple[str, str, str, str]:
+        wm = str(self.worker_model or '').strip()
+        return self.resolve_route(bot_model=wm or bot_model, big=False)
+
+    def resolve_route(self, bot_model: str = '', big: bool = False) -> tuple[str, str, str, str]:
+        """Resolve (base_url, api_key, real_model_id, channel_id) with multi-channel routing."""
+        raw_model = self.effective_model(bot_model=bot_model, big=big)
+        if not raw_model:
+            raw_model = self.effective_model(bot_model=bot_model, big=not big)
+        explicit_cid, real_model = parse_channel_model(raw_model)
+        enabled = self._enabled_channels()
+
+        if explicit_cid:
+            for ch in enabled:
+                if ch.id == explicit_cid:
+                    return ch.base_url.rstrip('/'), ch.api_key, real_model, ch.id
+            for ch in (self.channels or []):
+                if ch.id == explicit_cid and (ch.base_url or '').strip() and (ch.api_key or '').strip():
+                    return ch.base_url.rstrip('/'), ch.api_key, real_model, ch.id
+
+        if real_model:
+            for ch in enabled:
+                if real_model in (ch.models or []):
+                    return ch.base_url.rstrip('/'), ch.api_key, real_model, ch.id
+
+        legacy_key = self._legacy_api_key(big=big) or self._legacy_api_key(big=not big)
+        if legacy_key:
+            return self._legacy_base_url().rstrip('/'), legacy_key, real_model, ''
+
+        if enabled:
+            top = enabled[0]
+            fallback_m = real_model or (top.models[0] if top.models else '')
+            return top.base_url.rstrip('/'), top.api_key, fallback_m, top.id
+
+        return self._legacy_base_url().rstrip('/'), '', real_model, ''
 
     def effective_fallback(self, big: bool = False) -> tuple[str, str, str]:
         if not self.fallback_enabled:
             return '', '', ''
+        fb_raw_model = (self.fallback_model or '').strip()
+        explicit_cid, real_fb_model = parse_channel_model(fb_raw_model)
+        if explicit_cid:
+            for ch in (self.channels or []):
+                if ch.id == explicit_cid and (ch.base_url or '').strip() and (ch.api_key or '').strip():
+                    return ch.base_url.rstrip('/'), ch.api_key, real_fb_model
         fb_url = (self.fallback_base_url or '').strip() or self.effective_base_url()
         fb_key = (self.fallback_api_key or '').strip() or self.effective_api_key(big=big)
-        fb_model = (self.fallback_model or '').strip()
-        return fb_url.rstrip('/'), fb_key, fb_model
+        return fb_url.rstrip('/'), fb_key, real_fb_model
+
+    def effective_fallback_chain(self, bot_model: str = '', big: bool = False) -> list[tuple[str, str, str, str]]:
+        """Build ordered deduplicated [(base_url, api_key, real_model, channel_id), ...] candidates."""
+        candidates: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(url: str, key: str, model: str, cid: str):
+            u, k, m = (url or '').rstrip('/'), (key or '').strip(), (model or '').strip()
+            if not (u and k and m):
+                return
+            sig = (u, m)
+            if sig not in seen:
+                seen.add(sig)
+                candidates.append((u, k, m, cid))
+
+        p_url, p_key, p_model, p_cid = self.resolve_route(bot_model=bot_model, big=big)
+        _add(p_url, p_key, p_model, p_cid)
+
+        # Same-model automatic failover across other enabled channels
+        if p_model:
+            for ch in self._enabled_channels():
+                if ch.id != p_cid and p_model in (ch.models or []):
+                    _add(ch.base_url, ch.api_key, p_model, ch.id)
+
+        # Explicit fallback endpoint/model if enabled
+        fb_url, fb_key, fb_model = self.effective_fallback(big=big)
+        _add(fb_url, fb_key, fb_model, 'fallback')
+        return candidates
 
     def public(self):
         data = self.model_dump()
-        data['has_api_key'] = bool(data.pop('api_key', '') or self.small_brain.api_key or self.big_brain.api_key)
+        enabled_ch = self._enabled_channels()
+        data['has_api_key'] = bool(data.pop('api_key', '') or self.small_brain.api_key or self.big_brain.api_key or enabled_ch)
         data['has_fallback_api_key'] = bool(data.pop('fallback_api_key', ''))
+        data['has_embedding_api_key'] = bool(data.pop('embedding_api_key', ''))
+        pub_channels = []
+        for ch in (self.channels or []):
+            pub_channels.append({
+                'id': ch.id,
+                'name': ch.name or ch.id,
+                'base_url': ch.base_url,
+                'enabled': bool(ch.enabled),
+                'priority': int(ch.priority),
+                'models': list(ch.models or []),
+                'has_api_key': bool((ch.api_key or '').strip()),
+                'api_key_masked': _mask_api_key(ch.api_key),
+            })
+        data['channels'] = pub_channels
         data.pop('cloud_computer_password', None)
         data.pop('cloud_computer_ssh_key', None)
         data.pop('cloud_computer_token', None)
@@ -152,63 +350,6 @@ def node_display_name(raw: str | None) -> str:
     if norm == 'pc2':
         return 'Windows二'
     return str(raw or '安卓一').strip()
-
-
-def compact_trace_list(trace: list | None, finalize: bool = False) -> list[dict]:
-    """
-    Strip heavy tool outputs (read_file content, run_bash stdout, web_fetch HTML, Base64 screenshots)
-    and large write_file/edit_file argument blobs from persisted/broadcast UI trace arrays.
-    The client UI only ever displays tool name, short arguments (path/command/query/op), duration_ms,
-    status, and whether result has an 'error' key.
-    When `finalize=True` (for committed messages in state.json), any leftover 'running' status is normalized to 'done'.
-    """
-    if not isinstance(trace, list):
-        return []
-    compacted: list[dict] = []
-    for step in trace[-256:]:
-        if not isinstance(step, dict):
-            continue
-        raw_args = step.get('arguments')
-        slim_args: dict = {}
-        if isinstance(raw_args, dict):
-            for k, v in raw_args.items():
-                if k in ('content', 'old', 'new', 'code', 'script', 'image', 'base64'):
-                    continue
-                if isinstance(v, str):
-                    slim_args[k] = v[:90]
-                elif isinstance(v, (int, float, bool)):
-                    slim_args[k] = v
-                elif isinstance(v, list):
-                    slim_args[k] = v[:4]
-        raw_res = step.get('result')
-        slim_res: dict = {}
-        if isinstance(raw_res, dict):
-            if raw_res.get('error'):
-                slim_res['error'] = str(raw_res['error'])[:200]
-            if str(step.get('tool') or '') in ('send_message', 'send_message_callback'):
-                for k in ('ok', 'status', 'from_bot_id', 'from_bot_name', 'to_bot_id', 'to_bot_name'):
-                    if k in raw_res:
-                        slim_res[k] = raw_res[k]
-                if raw_res.get('reply'):
-                    slim_res['reply'] = str(raw_res['reply'])[:300]
-        entry: dict = {
-            'tool': str(step.get('tool') or ''),
-            'arguments': slim_args,
-            'duration_ms': int(step.get('duration_ms') or 0),
-        }
-        st_val = str(step.get('status') or '')
-        if finalize and st_val == 'running':
-            st_val = 'done'
-        if st_val:
-            entry['status'] = st_val
-        if slim_res:
-            entry['result'] = slim_res
-        if step.get('step_note'):
-            entry['step_note'] = str(step['step_note'])[:280]
-        if step.get('step_thought'):
-            entry['step_thought'] = str(step['step_thought'])[:280]
-        compacted.append(entry)
-    return compacted
 
 
 class Store:
@@ -648,7 +789,34 @@ class Store:
             has_explicit_small = isinstance(update.get('small_brain'), dict)
             has_explicit_big = isinstance(update.get('big_brain'), dict)
             for k, v in update.items():
-                if isinstance(v, dict) and isinstance(data.get(k), dict):
+                if k == 'channels' and isinstance(v, list):
+                    prev_by_id = {
+                        str(ch.get('id') or '').strip(): ch
+                        for ch in (prev_dump.get('channels') or [])
+                        if isinstance(ch, dict) and str(ch.get('id') or '').strip()
+                    }
+                    merged_channels = []
+                    seen_cids: set[str] = set()
+                    for item in v:
+                        if not isinstance(item, dict):
+                            continue
+                        cid = re.sub(r'[^a-zA-Z0-9_-]', '', str(item.get('id') or '').strip())[:64]
+                        if not cid:
+                            cid = f'ch_{secrets.token_hex(3)}'
+                        if cid in seen_cids:
+                            continue
+                        seen_cids.add(cid)
+                        old_ch = prev_by_id.get(cid, {})
+                        ch_merged = dict(old_ch)
+                        ch_merged.update(item)
+                        ch_merged['id'] = cid
+                        if not str(ch_merged.get('api_key') or '').strip() and old_ch.get('api_key'):
+                            ch_merged['api_key'] = old_ch['api_key']
+                        if not str(ch_merged.get('name') or '').strip():
+                            ch_merged['name'] = old_ch.get('name') or cid
+                        merged_channels.append(ch_merged)
+                    data['channels'] = merged_channels
+                elif isinstance(v, dict) and isinstance(data.get(k), dict):
                     merged = dict(data[k])
                     for sub_k, sub_v in v.items():
                         if k in ('small_brain', 'big_brain'):
@@ -684,13 +852,28 @@ class Store:
                     raise RuntimeError(f'config.json readback verification mismatch on {vk}: expected={new_dump.get(vk)!r}, got={disk_cfg.get(vk)!r}')
             self.config = config
             self._sync_to_workspace(_from_sync=True)
+            def _redact_sensitive_cfg(obj):
+                if isinstance(obj, dict):
+                    out_d = {}
+                    for dk, dv in obj.items():
+                        dkl = str(dk).lower()
+                        if dkl != 'auto_compact_tokens' and ('key' in dkl or 'password' in dkl or 'secret' in dkl or 'token' in dkl):
+                            out_d[dk] = '***' if dv not in (None, '') else dv
+                        else:
+                            out_d[dk] = _redact_sensitive_cfg(dv)
+                    return out_d
+                if isinstance(obj, list):
+                    return [_redact_sensitive_cfg(x) for x in obj]
+                return obj
+
             for k, new_v in new_dump.items():
                 old_v = prev_dump.get(k)
                 if new_v != old_v:
-                    if 'key' in k or 'password' in k or 'token' in k and k != 'auto_compact_tokens':
+                    kl = str(k).lower()
+                    if kl != 'auto_compact_tokens' and ('key' in kl or 'password' in kl or 'secret' in kl or 'token' in kl):
                         changed_summary[k] = ('***', '***')
                     else:
-                        changed_summary[k] = (old_v, new_v)
+                        changed_summary[k] = (_redact_sensitive_cfg(old_v), _redact_sensitive_cfg(new_v))
             if changed_summary:
                 try:
                     audit_p = self.settings_ws_path.parent / 'logs' / 'config_audit.md'
@@ -764,6 +947,7 @@ class Store:
             self.state['messages'].append(m)
             if len(self.state['messages']) > 2400:
                 self.state['messages'] = self.state['messages'][-1800:]
+                self.state['messages_epoch'] = int(self.state.get('messages_epoch') or 1) + 1
                 self.sql.sync_state(self.state)
             else:
                 self.sql.upsert_message(m)
@@ -771,4 +955,4 @@ class Store:
         return m
 
 
-from core.storage_hygiene import run_storage_hygiene, run_storage_maintenance  # noqa: E402, F401
+from core.storage_hygiene import compact_trace_list, run_storage_hygiene, run_storage_maintenance  # noqa: E402, F401

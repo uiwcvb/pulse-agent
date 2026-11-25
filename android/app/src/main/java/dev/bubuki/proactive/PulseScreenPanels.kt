@@ -128,40 +128,34 @@ internal fun NativeLiveStreamBubble(model: NativePulseModel, roomBot: PulseBot) 
             }
         }
 
-        // 2. Framed Streaming Assistant Bubble matching settled NativeMessage (unified timeline inside)
+        // 2. Framed Streaming Assistant Bubble matching settled NativeMessage (unified timeline inside, zero remount flicker)
         val hasStreamContent = s.streamTimeline.isNotEmpty() || s.streamTrace.isNotEmpty() || cleanThought.isNotBlank() || (!isPlaceholder && rawStream.isNotBlank())
         if (hasStreamContent || isPlaceholder) {
             val streamShape = RoundedCornerShape(18.dp, 18.dp, 18.dp, 4.dp)
-            val streamBorder = if (s.dark) Color(0x28FFFFFF) else Color(0x1E000000)
+            val streamBorder = c.line.copy(alpha = 0.72f)
             Column(
                 Modifier.clip(streamShape)
                     .background(c.aiBubble)
-                    .border(0.8.dp, streamBorder, streamShape)
+                    .border(0.5.dp, streamBorder, streamShape)
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (hasStreamContent) {
-                    UnifiedTimelineBubbleContent(
-                        model = model,
-                        cardKey = "live_${roomBot.id}",
-                        timeline = s.streamTimeline,
-                        fallbackTrace = s.streamTrace,
-                        fallbackText = if (!isPlaceholder) rawStream else "",
-                        thought = cleanThought,
-                        isLive = true,
-                        streamStartedAt = s.streamStartedAt,
-                    )
-                } else {
-                    Text(
-                        singleLineToolText,
-                        color = c.muted,
-                        fontSize = 13.5.sp
-                    )
-                }
+                UnifiedTimelineBubbleContent(
+                    model = model,
+                    cardKey = "live_${roomBot.id}",
+                    timeline = s.streamTimeline,
+                    fallbackTrace = s.streamTrace,
+                    fallbackText = if (!isPlaceholder) rawStream else "",
+                    thought = cleanThought.ifBlank { if (!hasStreamContent) singleLineToolText else "" },
+                    isLive = true,
+                    streamStartedAt = s.streamStartedAt,
+                    turnId = model.activeStreamTurnId,
+                )
             }
         }
 
         if (s.streamChoices.isNotEmpty() && !isPlaceholder && rawStream.isNotBlank()) {
+            val reduceChoiceMotion = rememberReducedMotion()
             Column(
                 Modifier.fillMaxWidth()
                     .heightIn(max = 220.dp)
@@ -172,6 +166,7 @@ internal fun NativeLiveStreamBubble(model: NativePulseModel, roomBot: PulseBot) 
                 s.streamChoices.forEach { choice ->
                     Box(
                         Modifier.fillMaxWidth()
+                            .heightIn(min = 40.dp)
                             .clip(RoundedCornerShape(11.dp))
                             .background(c.surface.copy(alpha = 0.92f))
                             .iosPressScale(0.97f) { model.consumeChoiceAndSend("live_stream", choice.value) }
@@ -180,11 +175,14 @@ internal fun NativeLiveStreamBubble(model: NativePulseModel, roomBot: PulseBot) 
                     ) {
                         Text(
                             "✦ ${choice.label}",
-                            modifier = Modifier.fillMaxWidth().basicMarquee(iterations = Int.MAX_VALUE),
+                            modifier = Modifier.fillMaxWidth().then(
+                                if (reduceChoiceMotion) Modifier else Modifier.basicMarquee(iterations = 2)
+                            ),
                             color = c.accent,
                             fontSize = 13.5.sp,
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             textAlign = TextAlign.Center
                         )
                     }
@@ -194,12 +192,36 @@ internal fun NativeLiveStreamBubble(model: NativePulseModel, roomBot: PulseBot) 
     }
 }
 
-// --- 3. Native Markdown Vault Browser & Editor Panel ---
+// --- 3. Native Vector Memory Space & Markdown Vault Fallback Panel ---
 @Composable
 internal fun NativeVaultPanel(model: NativePulseModel, modifier: Modifier) {
     val s = model.ui
     val c = LocalPulsePalette.current
     val focus = LocalFocusManager.current
+    var rawMarkdownMode by remember(s.selectedVaultPath) {
+        mutableStateOf(s.selectedVaultPath.isNotBlank() && s.selectedVaultPath != "INDEX.md")
+    }
+    if (!rawMarkdownMode) {
+        NativeMemoryVectorSpacePanel(
+            model = model,
+            onSwitchToRawMarkdown = { rawMarkdownMode = true },
+            modifier = modifier
+        )
+        return
+    }
+    var pendingDiscardTarget by remember { mutableStateOf<String?>(null) }
+    val handleLeaveOrSwitch: (String) -> Unit = { target ->
+        focus.clearFocus()
+        if (!s.vaultDirty) {
+            when (target) {
+                "__CLOSE__" -> model.closePanel()
+                "__SPACE__" -> rawMarkdownMode = false
+                else -> model.selectVaultFile(target)
+            }
+        } else {
+            pendingDiscardTarget = target
+        }
+    }
     Column(modifier.background(c.bg)) {
         Surface(color = c.surface.copy(alpha = 0.96f), tonalElevation = 0.dp) {
             Column {
@@ -208,28 +230,36 @@ internal fun NativeVaultPanel(model: NativePulseModel, modifier: Modifier) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(
-                        Modifier.clip(RoundedCornerShape(10.dp))
-                            .iosPressScale(0.95f) { focus.clearFocus(); model.closePanel() }
-                            .padding(horizontal = 6.dp, vertical = 6.dp),
+                        Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(10.dp))
+                            .iosPressScale(0.95f) { handleLeaveOrSwitch("__SPACE__") }
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         PulseIcon("back", c.accent, Modifier.size(21.dp))
-                        Text("返回", color = c.accent, fontSize = 16.sp)
+                        Text("向量空间", color = c.accent, fontSize = 15.5.sp)
                     }
                     Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("透明记忆库", color = c.ink, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold)
-                        Text(s.selectedVaultPath, color = c.muted, fontSize = 11.sp)
+                        Text("原始记忆文件", color = c.ink, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (s.vaultDirty) "${s.selectedVaultPath} · 未保存" else s.selectedVaultPath,
+                            color = if (s.vaultDirty) c.warn else c.muted,
+                            fontSize = 11.sp
+                        )
                     }
-                    Text(
-                        if (s.vaultSaving) "保存中…" else "保存",
-                        Modifier.clip(RoundedCornerShape(14.dp))
+                    Box(
+                        Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(14.dp))
                             .background(c.accent)
                             .iosPressScale(0.95f, enabled = !s.vaultSaving) { focus.clearFocus(); model.saveVaultFile() }
                             .padding(horizontal = 14.dp, vertical = 7.dp),
-                        color = Color.White,
-                        fontSize = 13.5.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            if (s.vaultSaving) "保存中…" else "保存",
+                            color = Color.White,
+                            fontSize = 13.5.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
                 HorizontalDivider(color = c.line.copy(alpha = 0.65f), thickness = 0.5.dp)
             }
@@ -238,13 +268,15 @@ internal fun NativeVaultPanel(model: NativePulseModel, modifier: Modifier) {
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(s.vaultFiles) { path ->
+            items(s.vaultFiles, key = { it }) { path ->
                 val selected = path == s.selectedVaultPath
                 Text(
                     path,
                     Modifier.clip(RoundedCornerShape(10.dp))
                         .background(if (selected) c.accent else c.surface)
-                        .iosPressScale(0.95f) { model.selectVaultFile(path) }
+                        .iosPressScale(0.95f) {
+                            if (!selected) handleLeaveOrSwitch(path)
+                        }
                         .padding(horizontal = 12.dp, vertical = 7.dp),
                     color = if (selected) Color.White else c.ink,
                     fontSize = 12.5.sp,
@@ -274,6 +306,33 @@ internal fun NativeVaultPanel(model: NativePulseModel, modifier: Modifier) {
             }
         }
     }
+    pendingDiscardTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingDiscardTarget = null },
+            containerColor = c.surface,
+            titleContentColor = c.ink,
+            textContentColor = c.muted,
+            title = { Text("记忆修改尚未保存", fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold) },
+            text = { Text("当前对「${s.selectedVaultPath}」的修改尚未保存，确定丢弃吗？", fontSize = 13.5.sp) },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDiscardTarget = null
+                    when (target) {
+                        "__CLOSE__" -> model.closePanel()
+                        "__SPACE__" -> rawMarkdownMode = false
+                        else -> model.selectVaultFile(target)
+                    }
+                }) {
+                    Text("放弃修改", color = c.warn)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDiscardTarget = null }) {
+                    Text("继续编辑", color = c.accent)
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -293,9 +352,9 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(
-                        Modifier.clip(RoundedCornerShape(10.dp))
+                        Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(10.dp))
                             .iosPressScale(0.95f) { focus.clearFocus(); model.closePanel() }
-                            .padding(horizontal = 6.dp, vertical = 6.dp),
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         PulseIcon("back", c.accent, Modifier.size(21.dp))
@@ -309,16 +368,20 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
                         fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center
                     )
-                    Text(
-                        if (s.schedulesLoading) "刷新中" else "刷新",
-                        Modifier.clip(RoundedCornerShape(12.dp))
+                    Box(
+                        Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(12.dp))
                             .background(c.fill)
                             .iosPressScale(0.95f) { model.openSchedules() }
                             .padding(horizontal = 12.dp, vertical = 6.dp),
-                        color = c.accent,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium
-                    )
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            if (s.schedulesLoading) "刷新中" else "刷新",
+                            color = c.accent,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
                 HorizontalDivider(color = c.line.copy(alpha = 0.65f), thickness = 0.5.dp)
             }
@@ -329,16 +392,16 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(15.dp),
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("快速设定闹钟或巡检", color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                Text("直接在聊天里告诉主助理时间与目标，它会自动调用 schedule_task 创建准点闹钟或每日例行任务。", color = c.muted, fontSize = 12.sp)
+                Text("快速设定闹钟或巡检", Modifier.padding(start = 6.dp, end = 6.dp, top = 4.dp), color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text("直接在聊天里告诉主助理时间与目标，它会自动调用 schedule_task 创建准点闹钟或每日例行任务。", Modifier.padding(horizontal = 6.dp), color = c.muted, fontSize = 12.sp)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
                         "每天 07:30 晨间课表提醒",
                         Modifier.weight(1f)
-                            .clip(RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(10.dp))
                             .background(c.fill)
                             .iosPressScale(0.96f) {
                                 model.closePanel()
@@ -354,7 +417,7 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
                     Text(
                         "晚间 21:00 查学习通作业",
                         Modifier.weight(1f)
-                            .clip(RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(10.dp))
                             .background(c.fill)
                             .iosPressScale(0.96f) {
                                 model.closePanel()
@@ -371,12 +434,12 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
             }
 
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(15.dp),
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("常驻例行任务 (${routines.size})", color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text("常驻例行任务 (${routines.size})", Modifier.padding(start = 6.dp, end = 6.dp, top = 4.dp), color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, style = TextStyle(fontFeatureSettings = "tnum"))
                 if (routines.isEmpty()) {
-                    Text("暂无常驻例行任务。可在聊天中随时让 Bot 添加。", color = c.muted, fontSize = 12.5.sp)
+                    Text("暂无常驻例行任务。可在聊天中随时让 Bot 添加。", Modifier.padding(start = 6.dp, end = 6.dp, bottom = 4.dp), color = c.muted, fontSize = 12.5.sp)
                 } else {
                     routines.forEach { r ->
                         val id = r.optString("id")
@@ -386,7 +449,7 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
                         val hours = r.optInt("interval_hours", 24)
                         val botName = model.bot(r.optString("bot_id", s.primary))?.name ?: r.optString("bot_id", "主控")
                         Column(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(c.fill).padding(12.dp),
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(c.fill).padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -398,17 +461,17 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
                                     style = TextStyle(fontFeatureSettings = "tnum")
                                 )
                                 Text(" · $botName", color = c.muted, fontSize = 11.5.sp, modifier = Modifier.weight(1f))
-                                Text(
-                                    "立即执行",
+                                Box(
                                     Modifier.padding(end = 8.dp)
+                                        .heightIn(min = 36.dp)
                                         .clip(RoundedCornerShape(8.dp))
                                         .background(c.surface)
                                         .iosPressScale(0.95f) { model.runRoutineItem(id) }
-                                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                                    color = c.accent,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("立即执行", color = c.accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                }
                                 Switch(checked = enabled, onCheckedChange = { model.toggleRoutineItem(id, it) })
                             }
                             Text(goal, color = c.ink, fontSize = 13.5.sp, lineHeight = 19.sp)
@@ -418,27 +481,28 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
             }
 
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(15.dp),
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("零 Token 哨兵监控 (${s.watchdogs.size})", color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text("零 Token 哨兵监控 (${s.watchdogs.size})", Modifier.padding(start = 6.dp, end = 6.dp, top = 4.dp), color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, style = TextStyle(fontFeatureSettings = "tnum"))
                 if (s.watchdogs.isEmpty()) {
-                    Text("暂无活跃哨兵脚本。可让 Bot 调用 watchdog_task 编写低开销网页/接口巡检脚本，仅在检测到目标变化时唤醒大模型。", color = c.muted, fontSize = 12.5.sp)
+                    Text("暂无活跃哨兵脚本。可让 Bot 调用 watchdog_task 编写低开销网页/接口巡检脚本，仅在检测到目标变化时唤醒大模型。", Modifier.padding(start = 6.dp, end = 6.dp, bottom = 4.dp), color = c.muted, fontSize = 12.5.sp)
                 } else {
                     s.watchdogs.forEach { w ->
-                        val wid = w.optString("id")
+                        val wid = w.optString("task_id").ifBlank { w.optString("watchdog_id").ifBlank { w.optString("id") } }
                         val wname = w.optString("name", wid)
-                        val enabled = w.optBoolean("enabled", true)
+                        val wdStatus = w.optString("status").ifBlank { w.optString("last_status", "running") }
+                        val enabled = if (w.has("status")) wdStatus.equals("running", ignoreCase = true) else w.optBoolean("enabled", true)
                         val intervalSec = w.optInt("interval_sec", 60)
-                        val lastStatus = w.optString("last_status", "待运行")
+                        val lastOutput = w.optString("last_output").ifBlank { w.optString("last_status", "待运行") }.trim()
                         val runs = w.optInt("runs", 0)
                         Column(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(c.fill).padding(12.dp),
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(c.fill).padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(5.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
-                                    if (enabled) "● 运行中 · 每 ${intervalSec}s" else "○ 已停止",
+                                    if (enabled) "● 运行中 ($wdStatus) · 每 ${intervalSec}s" else "○ 已停止 ($wdStatus)",
                                     color = if (enabled) c.green else c.faint,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.SemiBold,
@@ -446,22 +510,22 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
                                     style = TextStyle(fontFeatureSettings = "tnum")
                                 )
                                 Text("已巡检 ${runs} 次", color = c.muted, fontSize = 11.5.sp, modifier = Modifier.padding(end = 8.dp), style = TextStyle(fontFeatureSettings = "tnum"))
-                                if (enabled) {
-                                    Text(
-                                        "停止",
-                                        Modifier.clip(RoundedCornerShape(8.dp))
+                                if (enabled && wid.isNotBlank()) {
+                                    Box(
+                                        Modifier.heightIn(min = 36.dp)
+                                            .clip(RoundedCornerShape(8.dp))
                                             .background(c.surface)
                                             .iosPressScale(0.95f) { model.stopWatchdog(wid) }
-                                            .padding(horizontal = 9.dp, vertical = 4.dp),
-                                        color = c.warn,
-                                        fontSize = 11.5.sp,
-                                        fontWeight = FontWeight.Medium
-                                    )
+                                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text("停止", color = c.warn, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
+                                    }
                                 }
                             }
                             Text(wname, color = c.ink, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
-                            if (lastStatus.isNotBlank()) {
-                                Text("最近状态：$lastStatus", color = c.muted, fontSize = 11.5.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            if (lastOutput.isNotBlank()) {
+                                Text("最近输出：$lastOutput", color = c.muted, fontSize = 11.5.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                             }
                         }
                     }
@@ -469,51 +533,51 @@ internal fun NativeSchedulesPanel(model: NativePulseModel, modifier: Modifier) {
             }
 
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(15.dp),
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("静态前缀钉住记忆 (${s.pinnedMemories.size})", color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text("静态前缀钉住记忆 (${s.pinnedMemories.size})", Modifier.padding(start = 6.dp, end = 6.dp, top = 4.dp), color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, style = TextStyle(fontFeatureSettings = "tnum"))
                 if (s.pinnedMemories.isEmpty()) {
-                    Text("暂无钉住记忆。可在任意消息菜单点按「钉住记忆」，将其锁定在缓存静态前缀中永不遗忘。", color = c.muted, fontSize = 12.5.sp)
+                    Text("暂无钉住记忆。可在任意消息菜单点按「钉住记忆」，将其锁定在缓存静态前缀中永不遗忘。", Modifier.padding(start = 6.dp, end = 6.dp, bottom = 4.dp), color = c.muted, fontSize = 12.5.sp)
                 } else {
                     s.pinnedMemories.forEach { p ->
                         val pid = p.optString("id")
                         val ptext = p.optString("text")
                         Row(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(c.fill).padding(12.dp),
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(c.fill).padding(12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(ptext, color = c.ink, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.weight(1f))
-                            Text(
-                                "移除",
+                            Box(
                                 Modifier.padding(start = 8.dp)
+                                    .heightIn(min = 36.dp)
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(c.surface)
                                     .iosPressScale(0.95f) { model.removeMemoryPin(pid) }
-                                    .padding(horizontal = 9.dp, vertical = 4.dp),
-                                color = c.warn,
-                                fontSize = 11.5.sp,
-                                fontWeight = FontWeight.Medium
-                            )
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("移除", color = c.warn, fontSize = 11.5.sp, fontWeight = FontWeight.Medium)
+                            }
                         }
                     }
                 }
             }
 
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(15.dp),
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.surface).padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("已登记截止时间 / 死线 (${deadlines.size})", color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text("已登记截止时间 / 死线 (${deadlines.size})", Modifier.padding(start = 6.dp, end = 6.dp, top = 4.dp), color = c.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, style = TextStyle(fontFeatureSettings = "tnum"))
                 if (deadlines.isEmpty()) {
-                    Text("暂无待办死线。", color = c.muted, fontSize = 12.5.sp)
+                    Text("暂无待办死线。", Modifier.padding(start = 6.dp, end = 6.dp, bottom = 4.dp), color = c.muted, fontSize = 12.5.sp)
                 } else {
                     deadlines.forEach { d ->
                         val title = d.optString("title")
                         val dueAt = d.optDouble("due_at", 0.0)
                         val notified = d.optBoolean("notified", false)
                         Row(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(c.fill).padding(12.dp),
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(c.fill).padding(12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(Modifier.weight(1f)) {

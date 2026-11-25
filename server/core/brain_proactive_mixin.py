@@ -1,6 +1,6 @@
 """主动关怀、空闲研究、定时巡检与睡眠记忆整合模块 (`server/core/brain_proactive_mixin.py`)."""
 from __future__ import annotations
-import asyncio, contextlib, json, secrets, time
+import asyncio, contextlib, json, logging, secrets, time
 from datetime import datetime
 from assistants import get_assistant, resolve_bot_for_source
 from core.task_continuity import TaskContinuityManager
@@ -9,6 +9,8 @@ from core.tool_schemas import is_tool_allowed, normalize_bot_tools
 from harness import TOOLS
 from storage import normalize_node_source
 from vault_manager import TZ, now_iso
+
+logger = logging.getLogger(__name__)
 
 
 class BrainProactiveMixin:
@@ -65,6 +67,17 @@ class BrainProactiveMixin:
                 return {'suppressed': True, 'reason': 'preempted'}
             raise
 
+    def _get_cache_keepalive(self):
+        mgr = getattr(self, 'cache_keepalive', None)
+        if mgr is None:
+            from core.cache_keepalive import CacheKeepaliveManager
+            mgr = CacheKeepaliveManager()
+            self.cache_keepalive = mgr
+        return mgr
+
+    def _touch_cache_keepalive(self, source: str, bot_id: str) -> None:
+        self._get_cache_keepalive().touch(source, bot_id)
+
     def _get_curiosity_engine(self):
         eng = getattr(self, 'curiosity_engine', None)
         if eng is None:
@@ -110,7 +123,6 @@ class BrainProactiveMixin:
                     TaskContinuityManager.touch_foreground_activity(self.store)
                     message = self.store.message('user', goal, bot_id=bot_id)
                     self.stream_seq += 1
-                    message['seq'] = self.stream_seq
                     self.vault.log('用户：' + goal)
                     await self.publish({'type':'message', 'message':message, 'seq':self.stream_seq})
                     visible = {m['id'] for m in self.store.state['messages'] if m.get('bot_id','companion') == bot_id}
@@ -292,7 +304,19 @@ class BrainProactiveMixin:
                         if turn_txt:
                             self.stream_prefix_var.set(turn_txt)
                         messages.append(msg)
-                        running = [(ci, ci['function']['name'], json.loads(ci['function']['arguments']) if ci['function'].get('arguments') else {}, {'tool': ci['function']['name'], 'arguments': {}, 'duration_ms': 0, 'status': 'running'}) for ci in calls[:16]]
+                        def _parse_call_args(raw_a: Any) -> dict:
+                            if isinstance(raw_a, dict):
+                                return raw_a
+                            if not raw_a:
+                                return {}
+                            try:
+                                parsed = json.loads(raw_a)
+                                return parsed if isinstance(parsed, dict) else {}
+                            except (ValueError, TypeError, KeyError) as exc:
+                                logger.warning('proactive tool arguments json parse failed: %s', exc)
+                                return {}
+
+                        running = [(ci, ci['function']['name'], _parse_call_args(ci['function'].get('arguments')), {'tool': ci['function']['name'], 'arguments': {}, 'duration_ms': 0, 'status': 'running'}) for ci in calls[:16]]
                         for _, _, ca, ent in running:
                             ent['arguments'] = ca
                             my_exec['trace'].append(ent)
@@ -507,11 +531,25 @@ class BrainProactiveMixin:
                 # 2.5 Passive background notification convergence every 75s when phone is online and idle
                 if not TaskContinuityManager.is_any_foreground_busy(self) and self.is_phone_online() and now - self._last_notif_bg_poll >= 75.0 and not self.executions_by_bot:
                     await self._poll_and_converge_notifications(timeout=4.5)
-                # 3. Sleep-Time Compute memory consolidation when user has been idle >= 180s (3 min)
+                # 2.6 Bounded KV Prefix Cache keepalive & 9-minute idle hot-compaction (0 overnight burn)
+                if has_api:
+                    with contextlib.suppress(Exception):
+                        await self._get_cache_keepalive().tick(self, now_ts=now)
+                # 2.7 Idle-unload local ONNX embedding session (0 MB idle RAM) & weekly Memory Gardener
+                with contextlib.suppress(Exception):
+                    if hasattr(self.memory_engine, 'get_embedding_engine'):
+                        self.memory_engine.get_embedding_engine().maybe_unload_idle(now)
+                if not TaskContinuityManager.is_any_foreground_busy(self) and (now - float(s.get('last_memory_gardener') or 0)) >= 7 * 86400:
+                    with contextlib.suppress(Exception):
+                        from core.memory_migrator import run_memory_gardener
+                        run_memory_gardener(self, now_ts=now)
+                        s['last_memory_gardener'] = now
+                        self.store.save()
+                # 3. Sleep-Time Compute memory consolidation when user has been idle >= configured threshold (default 480s / 8 min, just before 9m idle hot-compact)
                 if (
                     has_api
                     and not TaskContinuityManager.is_any_foreground_busy(self)
-                    and (now - s.get('last_user', 0)) >= self.memory_engine.SLEEP_CONSOLIDATE_IDLE_SECONDS
+                    and (now - s.get('last_user', 0)) >= self.memory_engine.get_sleep_consolidate_idle_seconds()
                     and s.get('last_user', 0) > s.get('last_sleep_consolidate', 0)
                 ):
                     await self._sleep_time_consolidate()

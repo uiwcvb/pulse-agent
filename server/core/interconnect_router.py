@@ -7,7 +7,7 @@ import secrets
 import time
 from typing import Any
 
-from assistants import get_assistant, resolve_bot_for_source
+from assistants import get_assistant, primary_bot_id_for_source, resolve_bot_for_source, resolve_bots_for_source
 from harness import TOOLS
 from storage import compact_trace_list, node_display_name, normalize_node_source
 
@@ -189,10 +189,11 @@ class InterconnectRouterMixin:
             self.store.state.pop('cached_roster_block', None)
             self.store.save()
             se = getattr(self, 'sync_engine', None)
+            cur_src_create = normalize_node_source(self.source_context.get() or 'phone')
             if se is not None:
-                await se.notify_bots_changed(bot_id=new_id, force=True)
+                await se.notify_bots_changed(bot_id=new_id, source=cur_src_create, force=True)
             else:
-                await self.publish({'type': 'bots_changed', 'bot_id': new_id, 'bots': self.store.state['assistants'], 'primary_bot_id': self.store.state.get('primary_bot_id', 'companion')})
+                await self.publish({'type': 'bots_changed', 'source': cur_src_create, 'bot_id': new_id, 'bots': resolve_bots_for_source(self.store.state['assistants'], cur_src_create), 'primary_bot_id': primary_bot_id_for_source(self.store, cur_src_create)})
             return {'created': True, 'bot': new_bot}
         if action in ('update', 'update_model', 'update_prompt'):
             target_q = str(args.get('bot_id') or args.get('name') or '').strip()
@@ -233,7 +234,7 @@ class InterconnectRouterMixin:
             if se is not None:
                 await se.notify_bots_changed(bot_id=target['id'], source=cur_src, force=True)
             else:
-                await self.publish({'type': 'bots_changed', 'source': cur_src, 'bot_id': target['id'], 'bots': self.store.state['assistants'], 'primary_bot_id': self.store.state.get('primary_bot_id', 'companion')})
+                await self.publish({'type': 'bots_changed', 'source': cur_src, 'bot_id': target['id'], 'bots': resolve_bots_for_source(self.store.state['assistants'], cur_src), 'primary_bot_id': primary_bot_id_for_source(self.store, cur_src)})
             return {'updated': True, 'bot': resolve_bot_for_source(target, cur_src)}
         if action == 'delete':
             target_q = str(args.get('bot_id') or args.get('name') or '').strip()
@@ -254,10 +255,11 @@ class InterconnectRouterMixin:
             self.store.state.pop('cached_roster_block', None)
             self.store.save()
             se = getattr(self, 'sync_engine', None)
+            cur_src_del = normalize_node_source(self.source_context.get() or 'phone')
             if se is not None:
-                await se.notify_bots_changed(bot_id=del_id, force=True)
+                await se.notify_bots_changed(bot_id=del_id, source=cur_src_del, force=True)
             else:
-                await self.publish({'type': 'bots_changed', 'deleted_bot_id': del_id, 'bots': self.store.state['assistants'], 'primary_bot_id': self.store.state.get('primary_bot_id', 'companion')})
+                await self.publish({'type': 'bots_changed', 'source': cur_src_del, 'deleted_bot_id': del_id, 'bots': resolve_bots_for_source(self.store.state['assistants'], cur_src_del), 'primary_bot_id': primary_bot_id_for_source(self.store, cur_src_del)})
             return {'deleted': True, 'bot_id': del_id}
         return {'error': f'未知 manage_bot action: {action}'}
 
@@ -467,6 +469,10 @@ class InterconnectRouterMixin:
 
         reply_box_list: list[dict] = []
         reply_box_key = f'{cur_sig}:{parent_turn_id}'
+        if not hasattr(self, '_reply_box_stacks'):
+            self._reply_box_stacks: dict[str, list[list[dict]]] = {}
+        box_stack = self._reply_box_stacks.setdefault(cur_sig, [])
+        box_stack.append(reply_box_list)
         self._reply_box_by_sig[reply_box_key] = reply_box_list
         self._reply_box_by_sig[cur_sig] = reply_box_list
 
@@ -515,7 +521,6 @@ class InterconnectRouterMixin:
                     source=target_src,
                 )
                 self.stream_seq += 1
-                err_msg_in_target['seq'] = self.stream_seq
                 await self.publish({'type': 'message', 'source': target_src, 'message': err_msg_in_target, 'seq': self.stream_seq})
                 peer_res = err_msg_in_target
             finally:
@@ -537,7 +542,19 @@ class InterconnectRouterMixin:
                 self.hop_depth.reset(depth_token)
                 self.parent_stream_room_var.reset(parent_stream_token)
                 self._reply_box_by_sig.pop(reply_box_key, None)
-                if self._reply_box_by_sig.get(cur_sig) is reply_box_list:
+                stk_cur = getattr(self, '_reply_box_stacks', {}).get(cur_sig)
+                if isinstance(stk_cur, list):
+                    for idx_r in range(len(stk_cur) - 1, -1, -1):
+                        if stk_cur[idx_r] is reply_box_list:
+                            stk_cur.pop(idx_r)
+                            break
+                    if stk_cur:
+                        self._reply_box_by_sig[cur_sig] = stk_cur[-1]
+                    else:
+                        self._reply_box_stacks.pop(cur_sig, None)
+                        if self._reply_box_by_sig.get(cur_sig) is reply_box_list:
+                            self._reply_box_by_sig.pop(cur_sig, None)
+                elif self._reply_box_by_sig.get(cur_sig) is reply_box_list:
                     self._reply_box_by_sig.pop(cur_sig, None)
                 replies = list(reply_box_list)
                 if not replies and isinstance(peer_res, dict) and str(peer_res.get('text') or '').strip():

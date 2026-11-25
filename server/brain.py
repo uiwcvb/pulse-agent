@@ -78,6 +78,8 @@ class Brain(
         self.hop_depth = contextvars.ContextVar('hop_depth', default=0)
         self.turn_origin_context = contextvars.ContextVar('turn_origin_context', default='autonomous')
         self.wake_hop_context = contextvars.ContextVar('wake_hop_context', default=0)
+        self._next_tool_choice_var = contextvars.ContextVar('next_tool_choice', default=None)
+        self._enqueue_locks: dict[str, asyncio.Lock] = {}
         self.call_chain_var = contextvars.ContextVar('call_chain', default=())
         self.turn_id_var = contextvars.ContextVar('turn_id', default='')
         self.stream_prefix_var = contextvars.ContextVar('stream_prefix', default='')
@@ -154,6 +156,17 @@ class Brain(
         self.py_gateway_port: int = int(os.getenv('PORT', '18190') or 18190)
         self.dsh_adapter = DshBrainAdapter(self)
         self.memory_engine = MemoryEngine(store, vault, harness, self.last_prompt_tokens, context_search=self.context_search, last_cached_tokens=self.last_cached_tokens)
+        from core.subtask_store import SubtaskStore
+        self.subtask_store = SubtaskStore(
+            self.context_search.db_path,
+            conn=getattr(self.context_search, '_conn', None),
+            lock=getattr(self.context_search, '_lock', None),
+        )
+        try:
+            self.subtask_store.mark_interrupted_on_boot()
+            self.subtask_store.gc_runs()
+        except Exception:
+            pass
         self.vision_engine = VisionEngine(store, get_assistant, self.llm.fetch_available_models)
         self.scheduler_engine = SchedulerEngine(store, self.wake)
         self.notification_hub = NotificationHub(store, vault)
@@ -173,8 +186,8 @@ class Brain(
         self.harness.vault = vault
         self.harness.vision_reader = self.read_image_file_with_vision
         self.harness.custom_handlers = {
-            'bash': self._tool_bash, 'memory': self._tool_memory,
-            'blackboard': self._tool_blackboard, 'phone': self._tool_phone, 'pc': self._tool_dsh_workspace,
+            'bash': self._tool_bash, 'search_files': self._tool_search_files, 'memory': self._tool_memory,
+            'blackboard': self._tool_blackboard, 'schedule': self._tool_schedule, 'phone': self._tool_phone, 'pc': self._tool_dsh_workspace,
             'cloud': self._tool_cloud_desktop, 'reply': self._tool_reply, 'subtask': self._tool_subtask, 'admin': self._tool_admin,
             # Legacy v3 / v4.3 compatibility aliases
             'send_message': self._tool_send_message, 'message_colleague': self._tool_send_message,
@@ -507,9 +520,11 @@ class Brain(
             bot_notify = True
         default_notify = bool(bot_notify) if kind in ('curiosity', 'deadline', 'escalation_demo') else False
         extra.setdefault('notify', default_notify)
-        text, tag_choices, tag_thought, tag_sticker = self._extract_all_tags(str(text or ''))
+        text, tag_choices, tag_thought, tag_sticker = self._extract_all_tags(str(text or ''), queue_media=True)
+        if isinstance(extra.get('timeline'), list):
+            extra['timeline'] = self._sanitize_timeline_entries(extra['timeline'], queue_media=True)
         if extra.get('llm_text'):
-            clean_llm_txt, _, _, _ = self._extract_all_tags(str(extra['llm_text']))
+            clean_llm_txt, _, _, _ = self._extract_all_tags(str(extra['llm_text']), queue_media=False)
             extra['llm_text'] = clean_llm_txt or text
         else:
             extra['llm_text'] = text
@@ -712,7 +727,38 @@ class Brain(
     async def enqueue_chat(self, text: str, bot_id: str = 'companion', mode: str = 'auto', client_msg_id: str | None = None, source: str = 'phone') -> dict:
         src = normalize_node_source(source)
         nb_enq = f'{src}:{bot_id}'
-        same_src_exec = bool(self.executions_by_node_bot.get(nb_enq))
+        enq_lock = self._enqueue_locks.setdefault(nb_enq, asyncio.Lock())
+        async with enq_lock:
+            return await self._enqueue_chat_locked(text=text, bot_id=bot_id, mode=mode, client_msg_id=client_msg_id, source=src)
+
+    def _is_non_user_execution_context(self) -> bool:
+        hop_val = max(
+            int(self.hop_depth.get() or 0) if hasattr(self, 'hop_depth') else 0,
+            int(self.wake_hop_context.get() or 0) if hasattr(self, 'wake_hop_context') else 0,
+        )
+        if hop_val > 0:
+            return True
+        try:
+            from core.subtask_runner import _SUBTASK_DEPTH_VAR
+            if int(_SUBTASK_DEPTH_VAR.get() or 0) > 0:
+                return True
+        except Exception:
+            pass
+        cur_act = str(getattr(self, 'activity', '') or '')
+        if cur_act in ('curiosity', 'deep_research', 'research'):
+            return True
+        if hasattr(self, 'turn_origin_context') and self.turn_origin_context in contextvars.copy_context():
+            return str(self.turn_origin_context.get() or '').strip().lower() != 'user_direct'
+        return False
+
+    async def _enqueue_chat_locked(self, text: str, bot_id: str = 'companion', mode: str = 'auto', client_msg_id: str | None = None, source: str = 'phone') -> dict:
+        src = normalize_node_source(source)
+        nb_enq = f'{src}:{bot_id}'
+        cur_exec_b = self.executions_by_bot.get(bot_id)
+        same_src_exec = bool(
+            self.executions_by_node_bot.get(nb_enq)
+            or (cur_exec_b and normalize_node_source(cur_exec_b.get('source')) == src)
+        )
         is_bot_busy = (
             same_src_exec
             or self._get_bot_lock(bot_id, src).locked()
@@ -770,17 +816,32 @@ class Brain(
             extra_u = {'turn_id': turn_id}
             if client_msg_id:
                 extra_u['client_msg_id'] = client_msg_id
+            m_user_stk = re.fullmatch(r'\s*\[(?:sticker|表情|贴纸)\s*[:：]\s*([^\]\n]+?)\]\s*', text, flags=re.IGNORECASE)
+            if m_user_stk:
+                stk_info = self.harness.extension_registry.resolve_sticker_info(m_user_stk.group(1))
+                if stk_info:
+                    extra_u['sticker'] = stk_info['url']
+                    extra_u['stickers'] = [stk_info['url']]
+                    extra_u['llm_text'] = f"[用户发送了表情贴纸：{stk_info['label']} ({stk_info['code']})]"
             m = self.store.message('user', text, bot_id=bot_id, source=src, **extra_u)
             self.stream_seq += 1
-            self.vault.log('用户：' + text, bot_id=bot_id)
-            self.store.save()
             await self.publish({'type': 'message', 'source': src, 'message': m, 'seq': self.stream_seq})
-        visible = {msg['id'] for msg in self.store.state['messages'] if msg.get('bot_id', 'companion') == bot_id}
-        ack_ids = [
-            mid for mid, pv in self.store.state['pending'].items()
-            if mid in visible or (str(mid).startswith('notif-') and (not isinstance(pv, dict) or pv.get('bot_id', bot_id) == bot_id))
-        ]
-        await self.escalation.ack(ack_ids)
+
+            async def _deferred_user_housekeeping(txt_v=text, bid_v=bot_id):
+                with contextlib.suppress(Exception):
+                    self.vault.log('用户：' + txt_v, bot_id=bid_v)
+                with contextlib.suppress(Exception):
+                    self.store.save()
+                with contextlib.suppress(Exception):
+                    vis = {msg['id'] for msg in self.store.state['messages'] if msg.get('bot_id', 'companion') == bid_v}
+                    a_ids = [
+                        mid for mid, pv in self.store.state['pending'].items()
+                        if mid in vis or (str(mid).startswith('notif-') and (not isinstance(pv, dict) or pv.get('bot_id', bid_v) == bid_v))
+                    ]
+                    if a_ids:
+                        await self.escalation.ack(a_ids)
+
+            asyncio.create_task(_deferred_user_housekeeping())
 
         marker = self.bot_context.set(bot_id)
         room_marker = self.room_context.set(bot_id)

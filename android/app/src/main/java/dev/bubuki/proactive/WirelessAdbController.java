@@ -10,6 +10,7 @@ import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
 import android.util.Log;
+import androidx.annotation.RequiresApi;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.RemoteInput;
 import io.github.muntashirakon.adb.AbsAdbConnectionManager;
@@ -20,13 +21,17 @@ import kotlinx.coroutines.flow.StateFlowKt;
 import org.conscrypt.Conscrypt;
 import org.json.JSONObject;
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
-import java.nio.charset.StandardCharsets;
+import java.net.NetworkInterface;
 import java.security.PrivateKey;
 import java.security.Security;
 import java.security.cert.Certificate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -90,10 +95,13 @@ public final class WirelessAdbController {
         return t;
     });
     private final Object adbLock = new Object();
+    private final Object nsdLock = new Object();
+    private final Object connectLock = new Object();
     private AbsAdbConnectionManager adbManager;
     private NsdManager nsdManager;
     private NsdManager.DiscoveryListener pairingListener;
     private NsdManager.DiscoveryListener connectListener;
+    private final List<Object> serviceInfoCallbacks = new ArrayList<>();
     private volatile boolean listening;
     private volatile boolean paired;
     private volatile boolean connected;
@@ -138,14 +146,33 @@ public final class WirelessAdbController {
 
     private void persistPrefs() {
         try {
-            synchronized (SecurePrefs.class) {
-                JSONObject s = SecurePrefs.read(appContext);
+            SecurePrefs.update(appContext, s -> {
                 s.put("adbPaired", paired);
                 s.put("adbHost", discoveredHost);
                 s.put("adbConnectPort", discoveredConnectPort);
-                SecurePrefs.save(appContext, s);
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    static boolean isLocalDeviceAddress(InetAddress addr) {
+        if (addr == null) return false;
+        if (addr.isLoopbackAddress()) return true;
+        try {
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            if (ifaces == null) return false;
+            byte[] targetBytes = addr.getAddress();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress local = addrs.nextElement();
+                    if (addr.equals(local) || Arrays.equals(targetBytes, local.getAddress())) {
+                        return true;
+                    }
+                }
             }
         } catch (Throwable ignored) {}
+        return false;
     }
 
     private AbsAdbConnectionManager getOrCreateManager() throws Exception {
@@ -166,22 +193,26 @@ public final class WirelessAdbController {
         }
     }
 
-    public synchronized void startDiscoveryAndShowNotification() {
-        lastError = "";
-        listening = true;
-        statusText = "正在监听无线调试配对端口…";
-        emitState();
-        startNsdDiscoveryLocked();
+    public void startDiscoveryAndShowNotification() {
+        synchronized (nsdLock) {
+            lastError = "";
+            listening = true;
+            statusText = "正在监听无线调试配对端口…";
+            emitState();
+            startNsdDiscoveryLocked();
+        }
         postPairingNotification(null);
     }
 
-    public synchronized void stopDiscoveryAndCancelNotification() {
-        listening = false;
-        stopNsdDiscoveryLocked();
+    public void stopDiscoveryAndCancelNotification() {
+        synchronized (nsdLock) {
+            listening = false;
+            stopNsdDiscoveryLocked();
+            statusText = connected ? "已连接无线调试 (uid 2000)" : (paired ? "已配对，未连接" : "已停止配对监听");
+            emitState();
+        }
         NotificationManager nm = appContext.getSystemService(NotificationManager.class);
         if (nm != null) nm.cancel(NOTIF_PAIR_ID);
-        statusText = connected ? "已连接无线调试 (uid 2000)" : (paired ? "已配对，未连接" : "已停止配对监听");
-        emitState();
     }
 
     private void startNsdDiscoveryLocked() {
@@ -201,10 +232,84 @@ public final class WirelessAdbController {
 
     private void stopNsdDiscoveryLocked() {
         if (nsdManager == null) return;
+        if (Build.VERSION.SDK_INT >= 34 && !serviceInfoCallbacks.isEmpty()) {
+            for (Object cb : serviceInfoCallbacks) {
+                Api34Helper.unregisterCallback(nsdManager, cb);
+            }
+            serviceInfoCallbacks.clear();
+        }
         try { if (pairingListener != null) nsdManager.stopServiceDiscovery(pairingListener); } catch (Throwable ignored) {}
         try { if (connectListener != null) nsdManager.stopServiceDiscovery(connectListener); } catch (Throwable ignored) {}
         pairingListener = null;
         connectListener = null;
+    }
+
+    private InetAddress pickLocalHostAddress(NsdServiceInfo info) {
+        List<InetAddress> candidates;
+        if (Build.VERSION.SDK_INT >= 34) {
+            candidates = info.getHostAddresses();
+        } else {
+            @SuppressWarnings("deprecation")
+            InetAddress legacyHost = info.getHost();
+            candidates = legacyHost != null ? Collections.singletonList(legacyHost) : Collections.emptyList();
+        }
+        InetAddress fallbackLocal = null;
+        for (InetAddress addr : candidates) {
+            if (!isLocalDeviceAddress(addr)) continue;
+            if (addr instanceof Inet4Address) return addr;
+            if (fallbackLocal == null) fallbackLocal = addr;
+        }
+        return fallbackLocal;
+    }
+
+    private void handleResolvedServiceInfo(NsdServiceInfo info, boolean isPairing) {
+        int port = info.getPort();
+        if (port <= 0) return;
+        InetAddress addr = pickLocalHostAddress(info);
+        if (!isLocalDeviceAddress(addr)) {
+            Log.w(TAG, "Ignoring non-local mDNS ADB service advertisement");
+            return;
+        }
+        String hostStr = addr.getHostAddress();
+        if (hostStr != null && !hostStr.isEmpty()) {
+            discoveredHost = hostStr;
+        }
+        if (isPairing) {
+            discoveredPairingPort = port;
+            statusText = "已发现配对端口 " + port + "，下拉通知输入 6 位码";
+            emitState();
+        } else {
+            discoveredConnectPort = port;
+            persistPrefs();
+            emitState();
+            if (paired && !connected) {
+                executor.execute(this::ensureConnected);
+            }
+        }
+    }
+
+    @RequiresApi(34)
+    private static final class Api34Helper {
+        static Object registerCallback(NsdManager mgr, NsdServiceInfo serviceInfo, ExecutorService exec, final WirelessAdbController owner, final boolean isPairing) {
+            NsdManager.ServiceInfoCallback cb = new NsdManager.ServiceInfoCallback() {
+                @Override public void onServiceInfoCallbackRegistrationFailed(int errorCode) {}
+                @Override public void onServiceUpdated(NsdServiceInfo updatedInfo) {
+                    owner.handleResolvedServiceInfo(updatedInfo, isPairing);
+                }
+                @Override public void onServiceLost() {}
+                @Override public void onServiceInfoCallbackUnregistered() {}
+            };
+            mgr.registerServiceInfoCallback(serviceInfo, exec, cb);
+            return cb;
+        }
+
+        static void unregisterCallback(NsdManager mgr, Object cb) {
+            try {
+                if (cb instanceof NsdManager.ServiceInfoCallback) {
+                    mgr.unregisterServiceInfoCallback((NsdManager.ServiceInfoCallback) cb);
+                }
+            } catch (Throwable ignored) {}
+        }
     }
 
     private NsdManager.DiscoveryListener createDiscoveryListener(final boolean isPairing) {
@@ -218,35 +323,28 @@ public final class WirelessAdbController {
                 NsdManager mgr = nsdManager;
                 if (mgr == null) return;
                 try {
-                    mgr.resolveService(serviceInfo, new NsdManager.ResolveListener() {
-                        @Override public void onResolveFailed(NsdServiceInfo info, int errorCode) {}
-                        @Override public void onServiceResolved(NsdServiceInfo info) {
-                            InetAddress addr = info.getHost();
-                            int port = info.getPort();
-                            if (port <= 0) return;
-                            String hostStr = (addr instanceof Inet4Address && addr.getHostAddress() != null)
-                                ? addr.getHostAddress()
-                                : (addr != null && addr.getHostAddress() != null ? addr.getHostAddress() : "127.0.0.1");
-                            if (hostStr != null && !hostStr.isEmpty()) {
-                                discoveredHost = hostStr;
-                            }
-                            if (isPairing) {
-                                discoveredPairingPort = port;
-                                statusText = "已发现配对端口 " + port + "，下拉通知输入 6 位码";
-                                emitState();
-                            } else {
-                                discoveredConnectPort = port;
-                                persistPrefs();
-                                emitState();
-                                if (paired && !connected) {
-                                    executor.execute(() -> ensureConnected());
-                                }
-                            }
+                    if (Build.VERSION.SDK_INT >= 34) {
+                        synchronized (nsdLock) {
+                            if (nsdManager != mgr) return;
+                            Object cb = Api34Helper.registerCallback(mgr, serviceInfo, executor, WirelessAdbController.this, isPairing);
+                            serviceInfoCallbacks.add(cb);
                         }
-                    });
+                    } else {
+                        resolveLegacy(mgr, serviceInfo, isPairing);
+                    }
                 } catch (Throwable ignored) {}
             }
         };
+    }
+
+    @SuppressWarnings("deprecation")
+    private void resolveLegacy(NsdManager mgr, NsdServiceInfo serviceInfo, final boolean isPairing) {
+        mgr.resolveService(serviceInfo, new NsdManager.ResolveListener() {
+            @Override public void onResolveFailed(NsdServiceInfo info, int errorCode) {}
+            @Override public void onServiceResolved(NsdServiceInfo info) {
+                handleResolvedServiceInfo(info, isPairing);
+            }
+        });
     }
 
     @SuppressLint("MissingPermission")
@@ -262,7 +360,7 @@ public final class WirelessAdbController {
                 .build();
             Intent pairIntent = new Intent(appContext, WirelessAdbPairingReceiver.class)
                 .setAction(WirelessAdbPairingReceiver.ACTION_SUBMIT_PAIRING_CODE);
-            int mutFlag = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+            int mutFlag = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE;
             PendingIntent pairPi = PendingIntent.getBroadcast(appContext, 99221, pairIntent, mutFlag);
             NotificationCompat.Action replyAction = new NotificationCompat.Action.Builder(
                 R.drawable.ic_launcher, "输入配对码", pairPi
@@ -353,7 +451,9 @@ public final class WirelessAdbController {
                     throw new IOException("已配对但连接失败，请确认「无线调试」主开关保持开启");
                 }
                 listening = false;
-                stopNsdDiscoveryLocked();
+                synchronized (nsdLock) {
+                    stopNsdDiscoveryLocked();
+                }
                 statusText = "已连接免 Root 无线调试 (uid 2000)";
                 lastError = "";
                 emitState();
@@ -371,51 +471,53 @@ public final class WirelessAdbController {
         });
     }
 
-    public synchronized boolean ensureConnected() {
-        try {
-            AbsAdbConnectionManager mgr = getOrCreateManager();
-            if (mgr.isConnected()) {
-                connected = true;
-                return true;
-            }
-            if (discoveredConnectPort > 0) {
-                String h = (discoveredHost != null && !discoveredHost.isEmpty()) ? discoveredHost : "127.0.0.1";
-                try {
-                    if (mgr.connect(h, discoveredConnectPort)) {
-                        connected = true;
-                        statusText = "已连接免 Root 无线调试 (uid 2000)";
-                        lastError = "";
-                        emitState();
-                        return true;
-                    }
-                } catch (Throwable ignored) {}
-                if (!"127.0.0.1".equals(h)) {
+    public boolean ensureConnected() {
+        synchronized (connectLock) {
+            try {
+                AbsAdbConnectionManager mgr = getOrCreateManager();
+                if (mgr.isConnected()) {
+                    connected = true;
+                    return true;
+                }
+                if (discoveredConnectPort > 0) {
+                    String h = (discoveredHost != null && !discoveredHost.isEmpty()) ? discoveredHost : "127.0.0.1";
                     try {
-                        if (mgr.connect("127.0.0.1", discoveredConnectPort)) {
-                            discoveredHost = "127.0.0.1";
+                        if (mgr.connect(h, discoveredConnectPort)) {
                             connected = true;
-                            persistPrefs();
                             statusText = "已连接免 Root 无线调试 (uid 2000)";
                             lastError = "";
                             emitState();
                             return true;
                         }
                     } catch (Throwable ignored) {}
+                    if (!"127.0.0.1".equals(h)) {
+                        try {
+                            if (mgr.connect("127.0.0.1", discoveredConnectPort)) {
+                                discoveredHost = "127.0.0.1";
+                                connected = true;
+                                persistPrefs();
+                                statusText = "已连接免 Root 无线调试 (uid 2000)";
+                                lastError = "";
+                                emitState();
+                                return true;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
                 }
+                if (paired && mgr.connectTls(appContext, 4000L)) {
+                    connected = true;
+                    statusText = "已连接免 Root 无线调试 (uid 2000)";
+                    lastError = "";
+                    emitState();
+                    return true;
+                }
+            } catch (Throwable t) {
+                lastError = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
             }
-            if (paired && mgr.connectTls(appContext, 4000L)) {
-                connected = true;
-                statusText = "已连接免 Root 无线调试 (uid 2000)";
-                lastError = "";
-                emitState();
-                return true;
-            }
-        } catch (Throwable t) {
-            lastError = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+            connected = false;
+            emitState();
+            return false;
         }
-        connected = false;
-        emitState();
-        return false;
     }
 
     public AdbStream openShellStream(String command) throws Exception {
@@ -427,27 +529,6 @@ public final class WirelessAdbController {
             return mgr.openStream("exec:" + command);
         } catch (Throwable ignored) {
             return mgr.openStream("shell:stty -icanon -echo >/dev/null 2>&1; " + command);
-        }
-    }
-
-    public String runQuickShell(String command, long timeoutMs) throws Exception {
-        AdbStream stream = openShellStream(command);
-        try (InputStream is = stream.openInputStream()) {
-            long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
-            byte[] buf = new byte[4096];
-            StringBuilder sb = new StringBuilder();
-            while (System.currentTimeMillis() < deadline) {
-                if (is.available() > 0 || !stream.isClosed()) {
-                    int n = is.read(buf);
-                    if (n < 0) break;
-                    if (n > 0) sb.append(new String(buf, 0, n, StandardCharsets.UTF_8));
-                } else {
-                    break;
-                }
-            }
-            return sb.toString();
-        } finally {
-            try { stream.close(); } catch (Throwable ignored) {}
         }
     }
 }

@@ -9,7 +9,30 @@ from pathlib import Path
 
 from core.vision_engine import enrich_cloud_desktop_vision, zoom_region_from_args
 
-_OP_ALIASES = {'open_url': 'navigate', 'browser_snapshot': 'screenshot', 'tap': 'click', 'input': 'type', 'press': 'key', 'close': 'close_window', 'inspect': 'ui_tree', 'delay': 'wait', 'sleep': 'wait', 'upload': 'push_file', 'upload_file': 'push_file', 'send_file': 'push_file'}
+_OP_ALIASES = {
+    'open_url': 'navigate',
+    'browser_snapshot': 'screenshot',
+    'tap': 'click',
+    'input': 'type',
+    'press': 'key',
+    'close': 'close_window',
+    'inspect': 'ui_tree',
+    'delay': 'wait',
+    'sleep': 'wait',
+    'push': 'push_file',
+    'upload': 'push_file',
+    'upload_file': 'push_file',
+    'send_file': 'push_file',
+    'pull': 'pull_file',
+    'download': 'pull_file',
+    'download_file': 'pull_file',
+    'get_file': 'pull_file',
+    'cdp': 'eval_js',
+    'js': 'eval_js',
+    'eval': 'eval_js',
+    'run_js': 'eval_js',
+    'execute_js': 'eval_js',
+}
 
 
 def _parse_box_4(val) -> list[float] | None:
@@ -162,6 +185,27 @@ class CloudDesktopControllerMixin:
         raw = str(raw_path or '').strip().replace('\\', '/')
         if not raw or re.match(r'^[A-Za-z]:[/\\]', raw):
             return None
+        for abs_pfx in (
+            str(self.harness.root.resolve()).replace('\\', '/') + '/',
+            '/opt/proactive-agent/data/workspace/',
+            '/workspace-media/',
+            '~/workspace/',
+        ):
+            if raw.startswith(abs_pfx):
+                raw = raw[len(abs_pfx):].lstrip('/')
+                break
+        if getattr(self.harness, 'vault', None) is not None:
+            v_root = str(self.harness.vault.root.resolve()).replace('\\', '/') + '/'
+            if raw.startswith(v_root):
+                raw = 'memory_vault/' + raw[len(v_root):].lstrip('/')
+            elif raw.startswith('/opt/proactive-agent/data/memory_vault/'):
+                raw = 'memory_vault/' + raw[len('/opt/proactive-agent/data/memory_vault/'):].lstrip('/')
+            try:
+                v_cand = self.harness.path(raw)
+                if v_cand.is_file():
+                    return v_cand
+            except ValueError:
+                pass
         root = self.harness.root.resolve()
         rel = raw[len('workspace/'):] if raw.startswith('workspace/') else raw
         candidates = [root / rel] + ([root / 'uploads' / rel] if '/' not in rel else [])
@@ -192,7 +236,18 @@ class CloudDesktopControllerMixin:
                 res['ok'] = True
             return res
         if op == 'pull_file':
-            rel_p = str(args.get('path') or args.get('target') or args.get('text') or '').strip()
+            rel_p = str(args.get('path') or args.get('src') or args.get('target') or args.get('text') or '').strip().replace('\\', '/')
+            for pfx, dst_pfx in (
+                ('/opt/proactive-agent/cloud-computer/desktop-home/workspace/', 'workspace/'),
+                ('/opt/proactive-agent/cloud-computer/desktop-home/Downloads/', 'downloads/'),
+                ('~/workspace/', 'workspace/'),
+                ('~/Downloads/', 'downloads/'),
+                ('~/downloads/', 'downloads/'),
+                ('Downloads/', 'downloads/'),
+            ):
+                if rel_p.startswith(pfx):
+                    rel_p = dst_pfx + rel_p[len(pfx):].lstrip('/')
+                    break
             if not rel_p:
                 files_res = await self.computer.client.call('GET', '/files')
                 items = (files_res.get('files') or []) if isinstance(files_res, dict) else []
@@ -208,9 +263,10 @@ class CloudDesktopControllerMixin:
             return {'ok': True, 'op': 'pull_file', 'source_path': rel_p, 'workspace_path': f'uploads/{clean_name}', 'name': clean_name, 'bytes': receipt.get('bytes', 0)}
         if op == 'push_file':
             inline_content, inline_b64 = args.get('content'), args.get('data_b64')
-            orig_p = str(args.get('name') or args.get('path') or args.get('target') or args.get('text') or '').strip()
+            src_arg = str(args.get('path') or args.get('src') or args.get('target') or args.get('text') or '').strip()
+            dst_name_arg = str(args.get('name') or '').strip()
             if inline_content is not None or inline_b64 is not None:
-                raw_name = Path(orig_p.replace('\\', '/')).name if orig_p else 'upload.txt'
+                raw_name = Path((dst_name_arg or src_arg).replace('\\', '/')).name if (dst_name_arg or src_arg) else 'upload.txt'
                 clean_name = re.sub(r'^[0-9a-f]{10}-', '', raw_name) or raw_name
                 dest_dir = self.harness.root / 'uploads'
                 dest_dir.mkdir(parents=True, exist_ok=True)
@@ -218,10 +274,12 @@ class CloudDesktopControllerMixin:
                 src_file.write_bytes(base64.b64decode(str(inline_b64))) if inline_b64 is not None else src_file.write_text(str(inline_content), encoding='utf-8')
                 rel_p = f'uploads/{clean_name}'
             else:
-                src_file = self._resolve_local_upload_candidate(orig_p) or await self._stage_pc_file_to_cloud_workspace(orig_p)
+                lookup_arg = src_arg or dst_name_arg
+                src_file = self._resolve_local_upload_candidate(lookup_arg) or await self._stage_pc_file_to_cloud_workspace(lookup_arg)
                 if src_file is None or not src_file.is_file():
-                    return {'ok': False, 'error': f'工作区或本机文件不存在: {orig_p}'}
-                clean_name = re.sub(r'^[0-9a-f]{10}-', '', src_file.name) or src_file.name
+                    return {'ok': False, 'error': f'工作区或本机文件不存在: {lookup_arg}'}
+                target_raw_name = Path(dst_name_arg.replace('\\', '/')).name if dst_name_arg else src_file.name
+                clean_name = re.sub(r'^[0-9a-f]{10}-', '', target_raw_name) or target_raw_name
                 try:
                     rel_p = src_file.resolve().relative_to(self.harness.root.resolve()).as_posix()
                 except ValueError:
@@ -354,6 +412,20 @@ class CloudDesktopControllerMixin:
                     'window_count': st.get('window_count', 0), 'dom_elements': st.get('dom_elements', []), 'page_text': st.get('page_text', ''), 'saved_to': 'desktop-latest.jpg',
                 }
                 return await self._finalize_desktop_result(out, 'inspect')
+            if op == 'eval_js':
+                js_code = str(args.get('script') or args.get('command') or args.get('content') or args.get('text') or '').strip()
+                if not js_code:
+                    return {'ok': False, 'op': 'eval_js', 'error': 'cloud(op="eval_js") 需要提供 script（要执行的 JS 表达式）'}
+                want_frame = bool(args.get('screenshot') or args.get('include_frame'))
+                if args.get('lean') is True:
+                    want_frame = False
+                timeout_s = max(2, min(30, int(args.get('timeout') or 8)))
+                res = await self.computer.client.call('POST', '/input', body={'kind': 'eval_js', 'script': js_code, 'timeout': timeout_s, 'include_frame': want_frame})
+                if not want_frame:
+                    if isinstance(res, dict):
+                        return {k: res[k] for k in ('ok', 'op', 'value', 'url', 'title', 'error', 'control', 'user_takeover_locked') if k in res}
+                    return {'ok': False, 'op': 'eval_js', 'error': '云电脑返回无效响应'}
+                return await self._finalize_desktop_result(res, 'eval_js')
             if op in ('bash', 'exec', 'shell', 'terminal') or (op == 'run' and (args.get('command') is not None or args.get('goal') or args.get('is_input'))):
                 is_input = bool(args.get('is_input', False))
                 raw_cmd = args.get('command')
@@ -370,11 +442,22 @@ class CloudDesktopControllerMixin:
                         return {'ok': False, 'error': 'cloud(op="bash") 需要提供 command（向挂起会话发送交互输入请传 is_input=True）'}
                 elif raw_cmd is None and args.get('text') is not None:
                     cmd = str(args.get('text'))
+                want_frame = bool(args.get('screenshot') or args.get('include_frame'))
+                if args.get('lean') is True:
+                    want_frame = False
                 timeout_s = max(5, min(90, int(args.get('timeout') or 25)))
-                res = await self.computer.client.call('POST', '/input', body={'kind': 'bash', 'command': cmd, 'is_input': is_input, 'timeout': timeout_s, 'include_frame': True})
+                res = await self.computer.client.call('POST', '/input', body={'kind': 'bash', 'command': cmd, 'is_input': is_input, 'timeout': timeout_s, 'include_frame': want_frame})
                 if isinstance(res, dict) and (res.get('timed_out') or (res.get('exit_code') is not None and int(res['exit_code']) != 0)):
                     res['ok'] = False
                     res.setdefault('error', f"云电脑命令执行失败 (exit_code={res.get('exit_code')}, timed_out={bool(res.get('timed_out'))})")
+                if not want_frame:
+                    if isinstance(res, dict):
+                        return {
+                            k: res[k]
+                            for k in ('ok', 'op', 'exit_code', 'output', 'timed_out', 'running', 'cwd', 'error', 'control', 'user_takeover_locked')
+                            if k in res
+                        }
+                    return {'ok': False, 'op': 'bash', 'error': '云电脑返回无效响应'}
                 return await self._finalize_desktop_result(res, 'bash')
             if op == 'navigate':
                 return await self._finalize_desktop_result(await self.computer.client.call('POST', '/navigate', body={'url': str(args.get('url') or args.get('target') or args.get('text') or ''), 'include_frame': True}), 'navigate')
@@ -382,8 +465,8 @@ class CloudDesktopControllerMixin:
                 q = str(args.get('query') or args.get('text') or args.get('goal') or args.get('url') or '').strip()
                 return await self._finalize_desktop_result(await self.computer.client.call('POST', '/search', body={'query': q, 'engine': str(args.get('engine') or args.get('target') or 'auto').strip(), 'include_frame': True}), 'search')
             if op in ('launch_app', 'app', 'open_app'):
-                app_name = str(args.get('app') or args.get('target') or args.get('text') or 'lite_browser').strip()
-                return await self._finalize_desktop_result(await self.computer.client.call('POST', '/input', body={'kind': 'launch_app', 'app': app_name, 'text': str(args.get('url') or args.get('text') or ''), 'include_frame': True}), 'launch_app')
+                app_name = str(args.get('app') or args.get('target') or args.get('text') or 'browser').strip()
+                return await self._finalize_desktop_result(await self.computer.client.call('POST', '/input', body={'kind': 'launch_app', 'app': app_name, 'text': str(args.get('url') or args.get('text') or ''), 'include_frame': True, 'actor': 'agent'}), 'launch_app')
             if op == 'batch':
                 steps = args.get('steps') if isinstance(args.get('steps'), list) else []
                 return await self._finalize_desktop_result(await self.computer.client.call('POST', '/input', body={'kind': 'batch', 'steps': steps[:20], 'include_frame': True}), 'batch')
@@ -483,6 +566,15 @@ class CloudDesktopControllerMixin:
                     except (ValueError, TypeError):
                         pass
                 return await self._finalize_desktop_result(res, op, tap_xy=tap_xy)
-            return {'ok': False, 'error': f'未知 cloud op: {op}'}
+            return {
+                'ok': False,
+                'error': f'未知 cloud op: "{op}"',
+                'available_ops': [
+                    'status', 'screenshot', 'navigate', 'search', 'click', 'double_click', 'right_click',
+                    'type', 'key', 'hotkey', 'scroll', 'drag', 'wait', 'zoom', 'send_screenshot',
+                    'shell', 'eval_js', 'push', 'pull', 'files', 'launch_app', 'focus_window',
+                    'close_window', 'tile_windows', 'clipboard', 'batch',
+                ],
+            }
         except Exception as e:
             return {'ok': False, 'error': str(e)[:260]}

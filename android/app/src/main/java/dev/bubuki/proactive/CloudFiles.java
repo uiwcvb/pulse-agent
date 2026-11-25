@@ -84,20 +84,58 @@ final class CloudFiles {
         }
     }
 
-    private static boolean tryCompressImage(Context context, Uri uri, String name, java.io.File targetFile) {
+    private static Bitmap rotateByExifIfNeeded(Context context, Uri uri, Bitmap decoded) {
+        if (decoded == null) return null;
+        try (java.io.InputStream exifIn = context.getContentResolver().openInputStream(uri)) {
+            if (exifIn == null) return decoded;
+            android.media.ExifInterface exif = new android.media.ExifInterface(exifIn);
+            int orientation = exif.getAttributeInt(
+                android.media.ExifInterface.TAG_ORIENTATION,
+                android.media.ExifInterface.ORIENTATION_NORMAL
+            );
+            android.graphics.Matrix matrix = new android.graphics.Matrix();
+            switch (orientation) {
+                case android.media.ExifInterface.ORIENTATION_ROTATE_90:
+                    matrix.postRotate(90f);
+                    break;
+                case android.media.ExifInterface.ORIENTATION_ROTATE_180:
+                    matrix.postRotate(180f);
+                    break;
+                case android.media.ExifInterface.ORIENTATION_ROTATE_270:
+                    matrix.postRotate(270f);
+                    break;
+                case android.media.ExifInterface.ORIENTATION_FLIP_HORIZONTAL:
+                    matrix.preScale(-1f, 1f);
+                    break;
+                case android.media.ExifInterface.ORIENTATION_FLIP_VERTICAL:
+                    matrix.preScale(1f, -1f);
+                    break;
+                default:
+                    return decoded;
+            }
+            Bitmap rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.getWidth(), decoded.getHeight(), matrix, true);
+            if (rotated != decoded) decoded.recycle();
+            return rotated;
+        } catch (Throwable ignored) {
+            return decoded;
+        }
+    }
+
+    /** Compresses large images and returns the normalized format extension ("png" / "jpg"), or null on skip. */
+    private static String tryCompressImage(Context context, Uri uri, String name, java.io.File targetFile) {
         String lower = name == null ? "" : name.toLowerCase(java.util.Locale.ROOT);
         if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp"))) {
-            return false;
+            return null;
         }
         try {
             BitmapFactory.Options bounds = new BitmapFactory.Options();
             bounds.inJustDecodeBounds = true;
             try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
-                if (in == null) return false;
+                if (in == null) return null;
                 BitmapFactory.decodeStream(in, null, bounds);
             }
             int w = bounds.outWidth, h = bounds.outHeight;
-            if (w <= 0 || h <= 0) return false;
+            if (w <= 0 || h <= 0) return null;
             int maxSide = Math.max(w, h);
             int sample = 1;
             while (maxSide / (sample * 2) >= 1600) {
@@ -107,10 +145,12 @@ final class CloudFiles {
             opts.inSampleSize = sample;
             Bitmap decoded;
             try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
-                if (in == null) return false;
+                if (in == null) return null;
                 decoded = BitmapFactory.decodeStream(in, null, opts);
             }
-            if (decoded == null) return false;
+            if (decoded == null) return null;
+            decoded = rotateByExifIfNeeded(context, uri, decoded);
+            if (decoded == null) return null;
             int dw = decoded.getWidth(), dh = decoded.getHeight();
             int longest = Math.max(dw, dh);
             if (longest > 1600) {
@@ -121,17 +161,19 @@ final class CloudFiles {
                 if (scaled != decoded) decoded.recycle();
                 decoded = scaled;
             }
+            boolean asPng = lower.endsWith(".png") && longest <= 1080;
             try (java.io.OutputStream out = new java.io.FileOutputStream(targetFile)) {
-                Bitmap.CompressFormat fmt = lower.endsWith(".png") && longest <= 1080
-                    ? Bitmap.CompressFormat.PNG
-                    : Bitmap.CompressFormat.JPEG;
+                Bitmap.CompressFormat fmt = asPng ? Bitmap.CompressFormat.PNG : Bitmap.CompressFormat.JPEG;
                 decoded.compress(fmt, 82, out);
             } finally {
                 decoded.recycle();
             }
-            return targetFile.exists() && targetFile.length() > 0;
+            if (targetFile.exists() && targetFile.length() > 0) {
+                return asPng ? "png" : "jpg";
+            }
+            return null;
         } catch (Throwable ignored) {
-            return false;
+            return null;
         }
     }
 
@@ -162,9 +204,14 @@ final class CloudFiles {
         SecureTransport transport=new SecureTransport(context);String endpoint="computer".equals(source)?"/api/computer/uploads":"/api/files/uploads",uploadId=null;
         try {
             long total=0;
-            boolean compressed = (rawSize < 0 || rawSize > 450_000) && tryCompressImage(context, uri, name, staged);
-            if (compressed) {
+            String compressedExt = (rawSize < 0 || rawSize > 450_000) ? tryCompressImage(context, uri, name, staged) : null;
+            if (compressedExt != null) {
                 total = staged.length();
+                if ("jpg".equals(compressedExt)) {
+                    int dot = name.lastIndexOf('.');
+                    String stem = dot > 0 ? name.substring(0, dot) : name;
+                    name = stem + ".jpg";
+                }
             } else {
                 try(java.io.InputStream input=context.getContentResolver().openInputStream(uri);java.io.OutputStream output=new java.io.FileOutputStream(staged)){
                     if(input==null)throw new Exception("无法读取所选文件");byte[] buffer=new byte[262144];int n;

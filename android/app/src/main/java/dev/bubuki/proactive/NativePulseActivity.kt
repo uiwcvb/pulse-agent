@@ -15,6 +15,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
@@ -36,7 +37,7 @@ import java.util.concurrent.Future
  * 定義不可變 UI 狀態樹 (`NativePulseState`, `PulseBot`, `PulseMessage`, `PulseAttachment`, `PulseChoice`)，
  * 並封裝核心對話會話操作（打開對話、草稿持久化、發送消息、中止回合、編輯重發與重新生成）。
  * 網絡同步與流式狀態機委派至 [PulseActivitySync]，Bot/Vault/設置管理委派至 [PulseActivityBotOps]，
- * 多媒體與雲端桌面/權限交互委派至 [PulseActivityMedia]。
+ * 消息編輯/重生成/分支切換委派至 [PulseChatActions]，多媒體與雲端桌面/權限交互委派至 [PulseActivityMedia]。
  *
  * [Public API]
  * - `NativePulseActivity`
@@ -50,8 +51,15 @@ class NativePulseActivity : ComponentActivity() {
     private var backHandler: OnBackInvokedCallback? = null
     private val documentPicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> model.documentsPicked(uris) }
     private val visualMediaPicker = registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(8)) { uris -> model.documentsPicked(uris) }
+    private var pendingCameraUri: android.net.Uri? = null
+    private val cameraLauncher = registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        val uri = pendingCameraUri
+        pendingCameraUri = null
+        model.documentsPicked(if (ok && uri != null) listOf(uri) else emptyList())
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingCameraUri = savedInstanceState?.getString("pending_camera_uri")?.let(android.net.Uri::parse)
         if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
         }
@@ -76,17 +84,24 @@ class NativePulseActivity : ComponentActivity() {
     }
     fun pickDocument() { documentPicker.launch(arrayOf("*/*")) }
     fun pickVisualMedia() { visualMediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+    fun captureQuickPhoto() {
+        val dir = java.io.File(cacheDir, "camera-captures").apply { mkdirs() }
+        val photoFile = java.io.File(dir, "photo_${System.currentTimeMillis()}.jpg")
+        val uri = androidx.core.content.FileProvider.getUriForFile(this, "${packageName}.avatar-files", photoFile)
+        pendingCameraUri = uri
+        try {
+            cameraLauncher.launch(uri)
+        } catch (err: Throwable) {
+            pendingCameraUri = null
+            throw err
+        }
+    }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         intent.getStringExtra("openBot")?.let(model::requestOpenBot)
         if (intent.getStringExtra("entryRoute") == "settings") model.openSettings()
         model.handleIncomingShareIntent(intent)
-    }
-    @Deprecated("Legacy detail-page result bridge")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 740 && resultCode == RESULT_OK) data?.getStringExtra("createdBot")?.let(model::requestOpenBot)
     }
     private fun handleNativeBack() {
         when {
@@ -105,18 +120,20 @@ class NativePulseActivity : ComponentActivity() {
         poll?.cancel()
         poll = model.scope.launch {
             var tick = 0
-            while (isActive && (resumed || model.hasInFlightWork())) {
-                if (resumed && tick % 5 == 0) {
+            while (isActive && (resumed || model.hasActiveRemoteTurn())) {
+                if (resumed && tick > 0 && tick % 5 == 0) {
                     AgentForegroundService.ensureHealthyConnection(applicationContext)
                 }
                 val wsOnline = AgentForegroundService.connected
-                val fast = model.hasInFlightWork() || (resumed && model.ui.activePanel == "cloud_desktop")
+                val fast = model.hasInFlightWork()
                 if (resumed && model.ui.activePanel == "cloud_desktop") {
-                    if (!wsOnline) {
+                    if (!wsOnline && tick % 2 == 0) {
                         model.refreshStreamOnly()
                     }
-                    delay(if (wsOnline) 3000L else 1100L)
+                    tick++
+                    delay(if (wsOnline) 4000L else 1800L)
                 } else if (fast) {
+                    tick++
                     if (wsOnline) {
                         delay(4_000L)
                         if (isActive && resumed && model.active) {
@@ -128,13 +145,13 @@ class NativePulseActivity : ComponentActivity() {
                     }
                 } else {
                     if (!resumed) break
+                    tick++
                     if (!wsOnline) {
-                        if (tick % 4 == 0) {
+                        if (tick % 4 == 1) {
                             model.refresh()
                         } else {
                             model.refreshStreamOnly()
                         }
-                        tick++
                         delay(5500L)
                     } else {
                         delay(if (PowerSaveController.isPowerSaveActive(this@NativePulseActivity)) 180_000L else 120_000L)
@@ -146,9 +163,9 @@ class NativePulseActivity : ComponentActivity() {
             }
         }
     }
-    override fun onPause() { resumed = false; if (!model.hasInFlightWork()) poll?.cancel(); model.pause(); model.persistDrafts(); FloatingVirtualDisplay.promoteToSystemOverlayIfPermitted(applicationContext); super.onPause() }
-    override fun onStop() { resumed = false; if (!model.hasInFlightWork()) poll?.cancel(); model.pause(); FloatingVirtualDisplay.promoteToSystemOverlayIfPermitted(applicationContext); super.onStop() }
-    override fun onSaveInstanceState(outState: Bundle) { if (model.ui.chatOpen) outState.putString("chat_bot", model.ui.botId); model.savePicker(outState); super.onSaveInstanceState(outState) }
+    override fun onPause() { resumed = false; if (!model.hasActiveRemoteTurn()) poll?.cancel(); model.pause(); model.persistDrafts(); FloatingVirtualDisplay.promoteToSystemOverlayIfPermitted(applicationContext); super.onPause() }
+    override fun onStop() { resumed = false; if (!model.hasActiveRemoteTurn()) poll?.cancel(); model.pause(); FloatingVirtualDisplay.promoteToSystemOverlayIfPermitted(applicationContext); super.onStop() }
+    override fun onSaveInstanceState(outState: Bundle) { if (model.ui.chatOpen) outState.putString("chat_bot", model.ui.botId); pendingCameraUri?.let { outState.putString("pending_camera_uri", it.toString()) }; model.savePicker(outState); super.onSaveInstanceState(outState) }
     override fun onDestroy() {
         if (android.os.Build.VERSION.SDK_INT >= 33) backHandler?.let { getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(it) }
         model.close(); super.onDestroy()
@@ -160,9 +177,9 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
     var ui by mutableStateOf(NativePulseState(botId = restoredBot ?: "companion", chatOpen = restoredBot != null)); internal set
     var predictiveBack by mutableStateOf<Float?>(null)
     var backFrom: Float? = null
-    var backSettlement by mutableStateOf(0)
+    var backSettlement by mutableIntStateOf(0)
     var navigationRunning = false
-    internal var prefs = JSONObject()
+    @Volatile internal var prefs = JSONObject()
     internal val drafts = mutableMapOf<String, String>()
     internal val attachmentDrafts = mutableMapOf<String, List<PulseAttachment>>()
     internal var localRevision = 0
@@ -172,11 +189,14 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
     internal val draftLock = Any()
     internal val draftWriter = Executors.newSingleThreadExecutor { task -> Thread(task, "native-drafts").apply { priority = Thread.MIN_PRIORITY } }
     internal var draftJob: Job? = null
+    internal var settingsWriteJob: Job? = null
     internal var revision = 0
     internal var active = false
     internal val refreshLock = Mutex()
     internal val streamLock = Mutex()
     internal var lastStreamSeq: Long = 0L
+    internal var confirmedSyncSeq: Long = 0L
+    @Volatile internal var refreshGeneration: Long = 0L
     internal var lastServerBootId: String = ""
     internal var pendingReconnectSync: Boolean = false
     internal var lastMessagesEpoch: Long = 0L
@@ -188,11 +208,12 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
     internal var currentTurnId: String = ""
     internal var activeStreamTurnId: String = ""
     internal val completedTurnIds = LinkedHashSet<String>()
+    internal val switchingVariantMsgIds = mutableSetOf<String>()
+    internal val liveProcessExpandedByBot = mutableMapOf<String, Boolean>()
     internal var sendGuardUntilUptime: Long = 0L
     internal var sendGuardBotId: String? = null
     internal var stoppedGuardBotId: String? = null
     internal var stoppedGuardUntilUptime: Long = 0L
-    internal var typewriterJob: Job? = null
     internal var streamPacerJob: Job? = null
     internal var targetStreamFullText: String = ""
     internal val avatarLoading = mutableSetOf<String>()
@@ -207,13 +228,15 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
     @Volatile internal var lastCloudFrameRefreshAtMs: Long = 0L
     internal var effectiveUpdateServerUrl: String? = null
     internal var resolvedApkDownloadUrl: String? = null
-    internal val stickerCache = android.util.LruCache<String, ImageBitmap>(48)
     internal val clock = SimpleDateFormat("HH:mm", Locale.CHINA).apply { timeZone = TimeZone.getTimeZone("Asia/Shanghai") }
     internal val calendar = SimpleDateFormat("M月d日", Locale.CHINA).apply { timeZone = TimeZone.getTimeZone("Asia/Shanghai") }
     companion object {
         @Volatile private var activeInstance: NativePulseModel? = null
         @JvmStatic internal fun setActiveInstance(inst: NativePulseModel?) {
             activeInstance = inst
+        }
+        @JvmStatic internal fun clearActiveInstanceIf(inst: NativePulseModel) {
+            if (activeInstance === inst) activeInstance = null
         }
         @JvmStatic fun dispatchRealtimeEvent(event: JSONObject) {
             activeInstance?.onRealtimeEvent(event)
@@ -233,6 +256,9 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
         readAttachments(prefs)
         val cached = homeCache(prefs)
         remoteMessages = cached.third
+        confirmedSyncSeq = remoteMessages
+            .filter { !it.optimistic && !isEphemeralMsgId(it.id) }
+            .maxOfOrNull { it.orderSeq } ?: 0L
         val initialBot = cached.first.firstOrNull { it.id == restoredBot }?.id ?: cached.second
         val savedAppearance = prefs.optString("appearance", "dark").let { if (it == "light") "light" else "dark" }
         val dark = savedAppearance != "light"
@@ -321,60 +347,134 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
     fun persistDrafts(): Future<*> {
         val snapshot = synchronized(draftLock) { drafts.toMap() }
         val files = synchronized(draftLock) { attachmentDrafts.toMap() }
+        val appCtx = activity.applicationContext
         return draftWriter.submit {
-            synchronized(SecurePrefs::class.java) {
-                val current = SecurePrefs.read(activity); val stored = current.optJSONObject("drafts") ?: JSONObject()
-                snapshot.forEach { (id, value) -> stored.put(id, value) }
-                val attached = current.optJSONObject("attachmentDrafts") ?: JSONObject()
-                files.forEach { (id, value) -> attached.put(id, JSONArray(value.map { it.json() })) }
-                current.put("drafts", stored).put("attachmentDrafts", attached); SecurePrefs.save(activity, current)
+            runCatching {
+                prefs = SecurePrefs.update(appCtx) { current ->
+                    val stored = current.optJSONObject("drafts") ?: JSONObject()
+                    snapshot.forEach { (id, value) -> stored.put(id, value) }
+                    val attached = current.optJSONObject("attachmentDrafts") ?: JSONObject()
+                    files.forEach { (id, value) -> attached.put(id, JSONArray(value.map { it.json() })) }
+                    current.put("drafts", stored).put("attachmentDrafts", attached)
+                }
             }
         }
     }
     fun secondary(view: String, action: String = "", path: String = "") {
         dismissMenu()
         when {
-            view in listOf("settings", "config") -> { openSettings(); return }
-            view == "vault" -> { openVault(path.ifBlank { "INDEX.md" }); return }
-            view == "computer" -> { openCloudDesktop(); return }
-            view == "profile" -> { openBotEditor(ui.botId); return }
-            action == "createBot" -> { openBotEditor(null); return }
+            view in listOf("settings", "config") -> openSettings()
+            view == "vault" -> openVault(path.ifBlank { "INDEX.md" })
+            view == "computer" -> openCloudDesktop()
+            view == "profile" -> openBotEditor(ui.botId)
+            action == "createBot" -> openBotEditor(null)
             view in listOf("local", "root") -> {
                 if (action == "diagnostic") {
                     activity.startActivity(Intent(activity, NativePhoneActivity::class.java))
                 } else {
                     launchFloatingVirtualDisplay()
                 }
-                return
             }
-        }
-        val selected = ui.botId; val selectedMode = ui.mode; val saved = persistDrafts()
-        perform {
-            withContext(Dispatchers.IO) { saved.get() }
-            activity.startActivityForResult(Intent(activity, MainActivity::class.java).putExtra("nativeParent", true)
-                .putExtra("entryRoute", view).putExtra("entryBot", selected).putExtra("entryAction", action).putExtra("entryMode", selectedMode).putExtra("entryPath", path), 740)
         }
     }
     fun dismissMenu() { ui = ui.copy(menu = null) }
     internal fun menu(title: String, items: List<PulseMenuItem>) { ui = ui.copy(menu = PulseMenu(title, items)) }
-    internal fun perform(task: suspend () -> Unit) { scope.launch { try { task() } catch (e: Exception) { if (e is CancellationException) throw e; toast(MainActivity.safeError(e)) } } }
+    internal fun perform(task: suspend () -> Unit) { scope.launch { try { task() } catch (e: Exception) { if (e is CancellationException) throw e; toast(PulseErrors.safeError(e)) } } }
     fun toast(message: String) { ui = ui.copy(toast = message, toastId = ui.toastId + 1) }
     internal fun ensurePaired(): Boolean { if (ui.paired) return true; openSettings(); return false }
+    internal fun hasActiveRemoteTurn(): Boolean =
+        inFlightSends > 0 || remoteWorkingBot != null || ui.streamBotId != null || ui.busyBot != null
+
+    internal fun clearStreamUi(targetBot: String? = null, clearWorking: Boolean = false) {
+        val matchesStream = targetBot == null || ui.streamBotId == null || ui.streamBotId == targetBot
+        val matchesWork = targetBot == null || ui.workingBot == null || ui.workingBot == targetBot
+        if (matchesStream) {
+            activeStreamTurnId = ""
+            streamPacerJob?.cancel()
+            targetStreamFullText = ""
+        }
+        if (clearWorking && matchesWork) {
+            if (targetBot == null || remoteWorkingBot == targetBot) remoteWorkingBot = null
+            if (targetBot == null || sendGuardBotId == targetBot) {
+                sendGuardBotId = null
+                sendGuardUntilUptime = 0L
+            }
+        }
+        ui = ui.copy(
+            busyBot = if (clearWorking && (targetBot == null || ui.busyBot == targetBot)) null else ui.busyBot,
+            workingBot = if (clearWorking && matchesWork) null else ui.workingBot,
+            streamBotId = if (matchesStream) null else ui.streamBotId,
+            streamSpeakerId = if (matchesStream) null else ui.streamSpeakerId,
+            streamSpeakerName = if (matchesStream) "" else ui.streamSpeakerName,
+            streamText = if (matchesStream) "" else ui.streamText,
+            streamThought = if (matchesStream) "" else ui.streamThought,
+            streamStepText = if (matchesStream) "" else ui.streamStepText,
+            streamTool = if (matchesStream) "" else ui.streamTool,
+            streamTrace = if (matchesStream) emptyList() else ui.streamTrace,
+            streamTurnSteps = if (matchesStream) emptyList() else ui.streamTurnSteps,
+            streamTimeline = if (matchesStream) emptyList() else ui.streamTimeline,
+            streamChoices = if (matchesStream) emptyList() else ui.streamChoices,
+            streamSubAgents = if (matchesStream) emptyList() else ui.streamSubAgents,
+            streamTodos = if (matchesStream) emptyList() else ui.streamTodos,
+            streamStartedAt = if (matchesStream) 0L else ui.streamStartedAt
+        )
+    }
+
     fun sendQuickPrompt(prompt: String) {
-        if (prompt.isBlank()) return
-        setDraft(prompt)
-        send()
+        sendDirect(prompt = prompt, stickerUrl = "", bypassReplyAndEdit = true)
+    }
+    fun sendSticker(code: String, url: String) {
+        sendDirect(prompt = code.ifBlank { "[表情]" }, stickerUrl = url, bypassReplyAndEdit = true)
+    }
+    fun sendDirect(
+        prompt: String,
+        stickerUrl: String = "",
+        bypassReplyAndEdit: Boolean = true,
+        targetBotId: String = ui.botId
+    ) {
+        val clean = prompt.trim()
+        if (clean.isEmpty() && stickerUrl.isBlank()) return
+        if (!bypassReplyAndEdit) {
+            ui.editingMessage?.let { editing ->
+                editMessageAndResend(editing, clean)
+                return
+            }
+        }
+        if (!ensurePaired()) return
+        val replyMsg = if (bypassReplyAndEdit) null else ui.reply
+        sendPayload(
+            id = targetBotId,
+            rawText = clean,
+            sentAttachments = emptyList(),
+            stickerUrl = stickerUrl,
+            replyMsg = replyMsg,
+            clearComposerDraft = false
+        )
     }
     fun consumeChoiceAndSend(messageId: String, prompt: String) {
         if (prompt.isBlank()) return
+        val updated = (ui.consumedChoiceIds + messageId).let { set ->
+            if (set.size > 200) set.drop(set.size - 200).toSet() else set
+        }
         ui = ui.copy(
-            consumedChoiceIds = ui.consumedChoiceIds + messageId,
+            consumedChoiceIds = updated,
             streamChoices = emptyList()
         )
-        sendQuickPrompt(prompt)
+        sendDirect(prompt = prompt, bypassReplyAndEdit = true)
     }
     fun retryMessage(msg: PulseMessage) {
-        rerollMessage(msg)
+        if ((msg.optimistic || isEphemeralMsgId(msg.id)) && msg.role == "user") {
+            optimisticList.removeAll { it.id == msg.id }
+            ui = ui.copy(messages = combinedMessages())
+            sendDirect(
+                prompt = msg.text.ifBlank { if (msg.sticker.isNotBlank()) "[表情]" else "" },
+                stickerUrl = msg.sticker,
+                bypassReplyAndEdit = true,
+                targetBotId = msg.botId
+            )
+        } else {
+            rerollMessage(msg)
+        }
     }
     fun job(kind: String) {
         dismissMenu(); if (!ensurePaired() || ui.busyBot != null) return
@@ -396,33 +496,67 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
             editMessageAndResend(editing, ui.draft)
             return
         }
-        val raw = ui.draft.trim().ifEmpty { if (ui.attachments.isNotEmpty()) "请查看这些附件。" else "" }
+        val typedDraft = ui.draft.trim()
+        val raw = typedDraft.ifEmpty { if (ui.attachments.isNotEmpty()) "请查看这些附件。" else "" }
         if (raw.isEmpty() || ui.uploading) return
         if (!ensurePaired()) return
-        val id = ui.botId
-        val sentAttachments = ui.attachments
-        val withFiles = raw + if (sentAttachments.isEmpty()) "" else "\n\n附件（工作区相对路径，可用 read_file 或 run_bash 读取）：\n" + sentAttachments.joinToString("\n") { it.path.removePrefix("workspace/") }
-        val text = ui.reply?.let { "> " + it.text.take(600).replace("\n", "\n> ") + "\n\n" + withFiles } ?: withFiles
-        val pending = PulseMessage("pending-${System.currentTimeMillis()}-${optimisticList.size}", id, "user", text, "", "", System.currentTimeMillis() / 1000.0, "", "[]", true)
+        sendPayload(
+            id = ui.botId,
+            rawText = raw,
+            sentAttachments = ui.attachments,
+            stickerUrl = "",
+            replyMsg = ui.reply,
+            clearComposerDraft = true,
+            restoreDraftText = typedDraft
+        )
+    }
+    private fun sendPayload(
+        id: String,
+        rawText: String,
+        sentAttachments: List<PulseAttachment>,
+        stickerUrl: String,
+        replyMsg: PulseMessage?,
+        clearComposerDraft: Boolean,
+        restoreDraftText: String = ""
+    ) {
+        val withFiles = rawText + if (sentAttachments.isEmpty()) "" else "\n\n附件（工作区相对路径，可用 read_file 或 run_bash 读取）：\n" + sentAttachments.joinToString("\n") { it.path.removePrefix("workspace/") }
+        val text = replyMsg?.let { "> " + it.text.take(600).replace("\n", "\n> ") + "\n\n" + withFiles } ?: withFiles
+        val pending = PulseMessage(
+            "pending-${System.currentTimeMillis()}-${optimisticList.size}",
+            id,
+            "user",
+            text,
+            "",
+            "",
+            System.currentTimeMillis() / 1000.0,
+            "",
+            "[]",
+            true,
+            sticker = stickerUrl
+        )
         optimisticList.add(pending)
         inFlightSends++
-        draftJob?.cancel()
-        synchronized(draftLock) {
-            drafts[id] = ""
-            attachmentDrafts[id] = attachments(id).filterNot { a -> sentAttachments.any { it.path == a.path && it.source == a.source } }
+        if (clearComposerDraft) {
+            draftJob?.cancel()
+            synchronized(draftLock) {
+                drafts[id] = ""
+                attachmentDrafts[id] = attachments(id).filterNot { a -> sentAttachments.any { it.path == a.path && it.source == a.source } }
+            }
+            localRevision++
+            persistDrafts()
         }
-        localRevision++
-        persistDrafts()
         stoppedGuardBotId = null
         stoppedGuardUntilUptime = 0L
+        streamPacerJob?.cancel()
+        targetStreamFullText = ""
         activeStreamTurnId = ""
         sendGuardBotId = id
         sendGuardUntilUptime = SystemClock.uptimeMillis() + 15_000L
         currentTurnId = "pending-${System.currentTimeMillis()}"
         ui = ui.copy(
-            draft = if (ui.botId == id) "" else ui.draft,
-            attachments = if (ui.botId == id) attachments(id) else ui.attachments,
-            attachmentThumbs = sentAttachments.fold(ui.attachmentThumbs) { acc, a -> acc - a.path },
+            draft = if (clearComposerDraft && ui.botId == id) "" else ui.draft,
+            attachments = if (clearComposerDraft && ui.botId == id) attachments(id) else ui.attachments,
+            attachmentThumbs = if (clearComposerDraft) sentAttachments.fold(ui.attachmentThumbs) { acc, a -> acc - a.path } else ui.attachmentThumbs,
             busyBot = id,
             workingBot = id,
             workingText = "正在思考…",
@@ -433,16 +567,24 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
             streamTool = "",
             streamTrace = emptyList(),
             streamTurnSteps = emptyList(),
+            streamTimeline = emptyList(),
             streamChoices = emptyList(),
             streamSubAgents = emptyList(),
             streamTodos = emptyList(),
             streamStartedAt = System.currentTimeMillis(),
-            reply = null,
+            reply = if (replyMsg != null) null else ui.reply,
             messages = combinedMessages()
         )
         perform {
             try {
-                val res = request("POST", "/api/chat", JSONObject().put("text", text).put("bot_id", id).put("mode", "auto").put("async_ack", true).put("client_msg_id", pending.id))
+                val payload = JSONObject()
+                    .put("text", text)
+                    .put("bot_id", id)
+                    .put("mode", "auto")
+                    .put("async_ack", true)
+                    .put("client_msg_id", pending.id)
+                if (stickerUrl.isNotBlank()) payload.put("sticker", stickerUrl)
+                val res = request("POST", "/api/chat", payload)
                 val respEpoch = res.optLong("messages_epoch", 0L)
                 if (respEpoch > 0L) lastMessagesEpoch = respEpoch
                 val seq = res.optLong("seq", 0L)
@@ -482,38 +624,57 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
                     )
                 } else {
                     remoteWorkingBot = null
-                    ui = ui.copy(
-                        messages = combinedMessages(),
-                        workingBot = if (ui.workingBot == id) null else ui.workingBot,
-                        streamBotId = if (ui.streamBotId == id) null else ui.streamBotId,
-                        streamText = if (ui.streamBotId == id) "" else ui.streamText,
-                        streamTool = if (ui.streamBotId == id) "" else ui.streamTool,
-                        streamTrace = if (ui.streamBotId == id) emptyList() else ui.streamTrace
-                    )
+                    clearStreamUi(targetBot = id, clearWorking = true)
+                    ui = ui.copy(messages = combinedMessages())
                     refresh(force = true)
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 runCatching { refresh(force = true) }
-                val delivered = remoteMessages.takeLast(16).any { it.role == "user" && it.botId == id && it.text.trim() == text.trim() } ||
-                    ui.workingBot == id || ui.streamBotId == id
+                val delivered = remoteMessages.takeLast(20).any {
+                    it.role == "user" && it.botId == id && (
+                        it.clientMsgId == pending.id ||
+                            (it.created >= pending.created - 5.0 && it.text.trim() == text.trim())
+                    )
+                }
                 if (delivered) {
                     optimisticList.removeAll { it.id == pending.id }
                     ui = ui.copy(messages = combinedMessages())
                 } else {
+                    optimisticList.removeAll { it.id == pending.id }
+                    if (clearComposerDraft) {
+                        synchronized(draftLock) {
+                            if (restoreDraftText.isNotBlank() && (drafts[id].isNullOrBlank())) {
+                                drafts[id] = restoreDraftText
+                            }
+                            if (sentAttachments.isNotEmpty()) {
+                                val curAtts = attachments(id)
+                                attachmentDrafts[id] = (sentAttachments + curAtts).distinctBy { it.source to it.path }
+                            }
+                        }
+                        if (ui.botId == id) {
+                            ui = ui.copy(
+                                draft = draft(id),
+                                attachments = attachments(id)
+                            )
+                        }
+                        persistDrafts()
+                    }
+                    clearStreamUi(targetBot = id, clearWorking = true)
                     ui = ui.copy(messages = combinedMessages())
                     throw e
                 }
             } finally {
                 inFlightSends = (inFlightSends - 1).coerceAtLeast(0)
-                if (inFlightSends == 0) ui = ui.copy(busyBot = null)
+                if (inFlightSends == 0 && ui.busyBot == id) ui = ui.copy(busyBot = null)
             }
         }
     }
     fun stop(targetBot: String = ui.botId) {
         val phone = RootPhoneHarness.changes.value
         val hasPhoneToolInTurn = (phone.active && phone.botId == targetBot) ||
-            (ui.streamBotId == targetBot && (ui.streamTool == "phone_workspace" ||
-                ui.streamTrace.any { it.optString("tool") == "phone_workspace" }))
+            (ui.streamBotId == targetBot && (ui.streamTool == "phone_workspace" || ui.streamTool == "phone" ||
+                ui.streamTrace.any { val t = it.optString("tool"); t == "phone_workspace" || t == "phone" }))
         if (hasPhoneToolInTurn) {
             if (phone.active) {
                 RootPhoneHarness.stop(activity, false)
@@ -549,40 +710,17 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
                 bot(targetBot)?.name ?: targetBot,
                 ui.streamChoices,
                 thought = ui.streamThought.trim(),
-                turnSteps = JSONArray(ui.streamTurnSteps).toString()
+                turnSteps = JSONArray(ui.streamTurnSteps).toString(),
+                timeline = JSONArray(ui.streamTimeline).toString()
             )
             mergeRemoteMessages(listOf(frozenMsg), fullReplace = false)
         }
         if (currentTurnId.isNotBlank()) markTurnCompleted(currentTurnId)
         if (activeStreamTurnId.isNotBlank()) markTurnCompleted(activeStreamTurnId)
-        if (isStreamingTarget) {
-            activeStreamTurnId = ""
-            streamPacerJob?.cancel()
-            targetStreamFullText = ""
-        }
         stoppedGuardBotId = targetBot
         stoppedGuardUntilUptime = SystemClock.uptimeMillis() + 2_500L
-        if (remoteWorkingBot == targetBot) remoteWorkingBot = null
-        if (sendGuardBotId == targetBot) {
-            sendGuardBotId = null
-            sendGuardUntilUptime = 0L
-        }
-        ui = ui.copy(
-            messages = combinedMessages(),
-            busyBot = if (ui.busyBot == targetBot) null else ui.busyBot,
-            workingBot = if (ui.workingBot == targetBot) null else ui.workingBot,
-            streamBotId = if (isStreamingTarget) null else ui.streamBotId,
-            streamText = if (isStreamingTarget) "" else ui.streamText,
-            streamThought = if (isStreamingTarget) "" else ui.streamThought,
-            streamStepText = if (isStreamingTarget) "" else ui.streamStepText,
-            streamTool = if (isStreamingTarget) "" else ui.streamTool,
-            streamTrace = if (isStreamingTarget) emptyList() else ui.streamTrace,
-            streamTurnSteps = if (isStreamingTarget) emptyList() else ui.streamTurnSteps,
-            streamChoices = if (isStreamingTarget) emptyList() else ui.streamChoices,
-            streamSubAgents = if (isStreamingTarget) emptyList() else ui.streamSubAgents,
-            streamTodos = if (isStreamingTarget) emptyList() else ui.streamTodos,
-            streamStartedAt = if (isStreamingTarget) 0L else ui.streamStartedAt
-        )
+        clearStreamUi(targetBot = targetBot, clearWorking = true)
+        ui = ui.copy(messages = combinedMessages())
         val stopComputerToo = ui.computerBot == targetBot || ui.cloudDesktopLiveBotId == targetBot
         scope.launch {
             runCatching {
@@ -609,228 +747,12 @@ internal class NativePulseModel(internal val activity: NativePulseActivity, rest
             ui = ui.copy(editingMessage = null)
         }
     }
-    fun editMessageAndResend(message: PulseMessage, newText: String) {
-        val clean = newText.trim()
-        if (clean.isEmpty()) return
-        if (!ensurePaired()) return
-        val id = message.botId
-        draftJob?.cancel()
-        synchronized(draftLock) { drafts[id] = "" }
-        localRevision++
-        persistDrafts()
-        val targetIdx = remoteMessages.indexOfFirst { it.id == message.id }
-        if (targetIdx >= 0) {
-            val updatedList = ArrayList<PulseMessage>(remoteMessages.size)
-            for (i in remoteMessages.indices) {
-                val cur = remoteMessages[i]
-                if (i == targetIdx) {
-                    updatedList.add(cur.copy(text = clean))
-                } else if (i > targetIdx && cur.botId == id) {
-                    continue
-                } else {
-                    updatedList.add(cur)
-                }
-            }
-            remoteMessages = updatedList
-        }
-        optimisticList.removeAll { it.botId == id }
-        streamPacerJob?.cancel()
-        targetStreamFullText = ""
-        stoppedGuardBotId = null
-        stoppedGuardUntilUptime = 0L
-        activeStreamTurnId = ""
-        currentTurnId = "pending-${System.currentTimeMillis()}"
-        sendGuardBotId = id
-        sendGuardUntilUptime = SystemClock.uptimeMillis() + 10_000L
-        ui = ui.copy(
-            editingMessage = null,
-            draft = if (ui.botId == id) "" else ui.draft,
-            busyBot = id,
-            workingBot = id,
-            workingText = "正在思考…",
-            streamBotId = id,
-            streamText = "",
-            streamThought = "",
-            streamStepText = "",
-            streamTool = "",
-            streamTrace = emptyList(),
-            streamTurnSteps = emptyList(),
-            streamChoices = emptyList(),
-            streamSubAgents = emptyList(),
-            streamTodos = emptyList(),
-            streamStartedAt = System.currentTimeMillis(),
-            messages = combinedMessages()
-        )
-        perform {
-            try {
-                val res = request(
-                    "POST",
-                    "/api/messages/edit",
-                    JSONObject()
-                        .put("message_id", message.id)
-                        .put("text", clean)
-                        .put("bot_id", id)
-                        .put("source", SecureTransport.getNodeSource(activity))
-                )
-                val newEpoch = res.optLong("messages_epoch", 0L)
-                if (newEpoch > 0L) lastMessagesEpoch = newEpoch
-                res.optString("turn_id", "").takeIf { it.isNotBlank() }?.let {
-                    completedTurnIds.remove(it)
-                    currentTurnId = it
-                }
-                val removedIds = res.optJSONArray("removed_message_ids")?.let { arr ->
-                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }.toHashSet()
-                }.orEmpty()
-                val editedMsg = res.optJSONObject("edited_message")?.let { runCatching { PulseMessage.from(it) }.getOrNull() }
-                if (removedIds.isNotEmpty() || editedMsg != null) {
-                    remoteMessages = remoteMessages.mapNotNull { m ->
-                        if (m.id in removedIds) null
-                        else if (editedMsg != null && m.id == editedMsg.id) editedMsg
-                        else m
-                    }
-                    ui = ui.copy(messages = combinedMessages())
-                }
-                refresh(force = true)
-            } finally {
-                if (inFlightSends == 0) ui = ui.copy(busyBot = null)
-            }
-        }
-    }
-    fun rerollMessage(message: PulseMessage) {
-        if (!ensurePaired()) return
-        val id = message.botId
-        val msgIdx = remoteMessages.indexOfFirst { it.id == message.id }
-        val userIdx = if (msgIdx >= 0) {
-            if (remoteMessages[msgIdx].role == "user") msgIdx
-            else (msgIdx downTo 0).firstOrNull { remoteMessages[it].botId == id && remoteMessages[it].role == "user" } ?: -1
-        } else {
-            remoteMessages.indexOfLast { it.botId == id && it.role == "user" }
-        }
-        if (userIdx >= 0) {
-            remoteMessages = remoteMessages.filterIndexed { idx, cur ->
-                !(idx > userIdx && cur.botId == id)
-            }
-        }
-        optimisticList.removeAll { it.botId == id }
-        streamPacerJob?.cancel()
-        targetStreamFullText = ""
-        stoppedGuardBotId = null
-        stoppedGuardUntilUptime = 0L
-        activeStreamTurnId = ""
-        currentTurnId = "pending-${System.currentTimeMillis()}"
-        sendGuardBotId = id
-        sendGuardUntilUptime = SystemClock.uptimeMillis() + 10_000L
-        ui = ui.copy(
-            busyBot = id,
-            workingBot = id,
-            workingText = "正在重新生成…",
-            streamBotId = id,
-            streamText = "正在重新生成…",
-            streamThought = "",
-            streamTool = "",
-            streamTrace = emptyList(),
-            streamChoices = emptyList(),
-            streamSubAgents = emptyList(),
-            streamTodos = emptyList(),
-            streamStartedAt = System.currentTimeMillis(),
-            messages = combinedMessages()
-        )
-        perform {
-            try {
-                val res = request(
-                    "POST",
-                    "/api/messages/reroll",
-                    JSONObject()
-                        .put("bot_id", id)
-                        .put("message_id", message.id)
-                        .put("source", SecureTransport.getNodeSource(activity))
-                )
-                val newEpoch = res.optLong("messages_epoch", 0L)
-                if (newEpoch > 0L) lastMessagesEpoch = newEpoch
-                res.optString("turn_id", "").takeIf { it.isNotBlank() }?.let {
-                    completedTurnIds.remove(it)
-                    currentTurnId = it
-                }
-                val removedIds = res.optJSONArray("removed_message_ids")?.let { arr ->
-                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }.toHashSet()
-                }.orEmpty()
-                if (removedIds.isNotEmpty()) {
-                    remoteMessages = remoteMessages.filterNot { it.id in removedIds }
-                    ui = ui.copy(messages = combinedMessages())
-                }
-                refresh(force = true)
-            } finally {
-                if (inFlightSends == 0) ui = ui.copy(busyBot = null)
-            }
-        }
-    }
-    fun switchMessageVariant(message: PulseMessage, variantIdx: Int) {
-        if (!ensurePaired()) return
-        val vars = message.variants
-        if (variantIdx !in vars.indices) return
-        val sel = vars[variantIdx]
-        val idxInRemote = remoteMessages.indexOfFirst { it.id == message.id }
-        if (idxInRemote >= 0) {
-            remoteMessages = remoteMessages.toMutableList().also { list ->
-                list[idxInRemote] = list[idxInRemote].copy(
-                    text = sel.text,
-                    thought = sel.thought,
-                    trace = sel.trace,
-                    turnSteps = sel.turnSteps,
-                    sticker = sel.sticker,
-                    attachments = sel.attachments,
-                    choices = sel.choices,
-                    apiCalls = sel.apiCalls,
-                    ttftMs = sel.ttftMs,
-                    tps = sel.tps,
-                    cacheHitPct = sel.cacheHitPct,
-                    totalMs = sel.totalMs,
-                    activeVariantIdx = variantIdx
-                )
-            }
-            ui = ui.copy(
-                consumedChoiceIds = ui.consumedChoiceIds - message.id,
-                messages = combinedMessages()
-            )
-        }
-        perform {
-            val res = request(
-                "POST",
-                "/api/messages/variant",
-                JSONObject()
-                    .put("message_id", message.id)
-                    .put("variant_idx", variantIdx)
-                    .put("bot_id", message.botId)
-                    .put("source", SecureTransport.getNodeSource(activity))
-            )
-            val newEpoch = res.optLong("messages_epoch", 0L)
-            if (newEpoch > 0L) lastMessagesEpoch = newEpoch
-            res.optJSONObject("message")?.let { mObj ->
-                val updated = PulseMessage.from(mObj)
-                val pos = remoteMessages.indexOfFirst { it.id == updated.id }
-                if (pos >= 0) {
-                    remoteMessages = remoteMessages.toMutableList().also { it[pos] = updated }
-                }
-            }
-            res.optJSONObject("context_by_bot")?.let { rawCtx ->
-                val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(rawCtx)
-                if (ctxTokensMap.isNotEmpty()) {
-                    ui = ui.copy(
-                        contextTokensByBot = ctxTokensMap,
-                        contextCachedByBot = ctxCachedMap,
-                        contextMsgsByBot = ctxMsgsMap
-                    )
-                }
-            }
-            ui = ui.copy(messages = combinedMessages())
-        }
-    }
     fun reply(message: PulseMessage?) { ui = ui.copy(reply = message) }
     fun copy(text: String) { activity.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("DSB", text)); toast("已复制。") }
     fun confirm(message: PulseMessage, accepted: Boolean) = perform {
         request("POST", "/api/confirm", JSONObject().put("id", message.id).put("accepted", accepted)); refresh()
     }
     fun ackDemo(message: PulseMessage) = perform { request("POST", "/api/ack", JSONObject().put("ids", JSONArray().put(message.id))); refresh(); toast("演练已结束。") }
-    fun close() { setActiveInstance(null); draftJob?.cancel(); persistDrafts(); draftWriter.shutdown(); scope.cancel() }
+    fun close() { clearActiveInstanceIf(this); draftJob?.cancel(); settingsWriteJob?.cancel(); flushSettingsPersistence(); persistDrafts(); draftWriter.shutdown(); scope.cancel() }
 }
 

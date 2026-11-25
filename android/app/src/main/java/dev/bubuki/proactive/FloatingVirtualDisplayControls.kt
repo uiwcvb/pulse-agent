@@ -1,63 +1,21 @@
 package dev.bubuki.proactive
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
-import android.util.Base64
 import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.animation.LinearInterpolator
 import android.widget.ImageView
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.AnimationSpec
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.snap
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.Canvas as ComposeCanvas
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Text
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.ui.input.pointer.util.VelocityTracker as ComposeVelocityTracker
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.*
 import org.json.JSONObject
 import kotlin.math.PI
 import kotlin.math.abs
@@ -149,6 +107,7 @@ internal object PipSpringPhysics {
         return 0
     }
 }
+@SuppressLint("ViewConstructor")
 internal class PipVectorIconButton(
     context: Context,
     private val kind: IconKind,
@@ -395,7 +354,17 @@ internal fun FloatingVirtualDisplay.attachSpringDragAndTap(
     var startWinY = 0
     var dragging = false
     var tracker: VelocityTracker? = null
-    handleView.setOnTouchListener { _, event ->
+    handleView.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+        override fun onViewAttachedToWindow(v: View) {}
+        override fun onViewDetachedFromWindow(v: View) {
+            tracker?.recycle()
+            tracker = null
+        }
+    })
+    if (onTap != null) {
+        handleView.setOnClickListener { mainHandler.post { onTap() } }
+    }
+    handleView.setOnTouchListener { v, event ->
         val lp = params ?: return@setOnTouchListener false
         val container = rootView ?: return@setOnTouchListener false
         val wm = windowManager ?: return@setOnTouchListener false
@@ -431,12 +400,17 @@ internal fun FloatingVirtualDisplay.attachSpringDragAndTap(
                     runCatching { wm.updateViewLayout(container, lp) } }
                 true }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                tracker?.addMovement(event)
-                tracker?.computeCurrentVelocity(1000)
-                val vx = tracker?.xVelocity ?: 0f
-                val vy = tracker?.yVelocity ?: 0f
-                tracker?.recycle()
-                tracker = null
+                var vx = 0f
+                var vy = 0f
+                try {
+                    tracker?.addMovement(event)
+                    tracker?.computeCurrentVelocity(1000)
+                    vx = tracker?.xVelocity ?: 0f
+                    vy = tracker?.yVelocity ?: 0f
+                } finally {
+                    tracker?.recycle()
+                    tracker = null
+                }
                 if (dragging) {
                     val metrics = context.resources.displayMetrics
                     val dockSide = if (dockOnEdge) {
@@ -449,7 +423,7 @@ internal fun FloatingVirtualDisplay.attachSpringDragAndTap(
                         animateSpringToNearestCorner(context, vx, vy)
                     }
                 } else if (event.actionMasked == MotionEvent.ACTION_UP) {
-                    mainHandler.post { onTap?.invoke() } }
+                    if (onTap != null) v.performClick() else mainHandler.post { } }
                 dragging = false
                 true }
             else -> false }
@@ -475,6 +449,13 @@ internal fun FloatingVirtualDisplay.attachExpandedScreenTouchAndDrag(
     var lastSentX = -1
     var lastSentY = -1
     var tracker: VelocityTracker? = null
+    imageView.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+        override fun onViewAttachedToWindow(v: View) {}
+        override fun onViewDetachedFromWindow(v: View) {
+            tracker?.recycle()
+            tracker = null
+        }
+    })
     imageView.setOnTouchListener { v, event ->
         val lp = params ?: return@setOnTouchListener false
         val container = rootView ?: return@setOnTouchListener false
@@ -540,12 +521,17 @@ internal fun FloatingVirtualDisplay.attachExpandedScreenTouchAndDrag(
                 true }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (windowDragMode) {
-                    tracker?.addMovement(event)
-                    tracker?.computeCurrentVelocity(1000)
-                    val vx = tracker?.xVelocity ?: 0f
-                    val vy = tracker?.yVelocity ?: 0f
-                    tracker?.recycle()
-                    tracker = null
+                    var vx = 0f
+                    var vy = 0f
+                    try {
+                        tracker?.addMovement(event)
+                        tracker?.computeCurrentVelocity(1000)
+                        vx = tracker?.xVelocity ?: 0f
+                        vy = tracker?.yVelocity ?: 0f
+                    } finally {
+                        tracker?.recycle()
+                        tracker = null
+                    }
                     if (draggingWindow) {
                         animateSpringToNearestCorner(context, vx, vy) }
                     draggingWindow = false
@@ -586,9 +572,16 @@ internal fun FloatingVirtualDisplay.animateSpringToNearestCorner(context: Contex
     val startY = lp.y.toFloat()
     if (abs(startX - targetX) < 1f && abs(startY - targetY) < 1f) return
     springAnimator?.cancel()
+    if (animationsOff(context) || PowerSaveController.isPowerSaveActive(context)) {
+        lp.x = targetX
+        lp.y = targetY
+        runCatching { wm.updateViewLayout(container, lp) }
+        return
+    }
     springAnimator = ValueAnimator.ofFloat(0f, 0.42f).apply {
         duration = 420L
         interpolator = LinearInterpolator()
+        var canceled = false
         addUpdateListener { anim ->
             val tSec = anim.animatedValue as Float
             lp.x = PipSpringPhysics.stepCriticalSpring(startX, targetX.toFloat(), vx, tSec).roundToInt()
@@ -596,9 +589,22 @@ internal fun FloatingVirtualDisplay.animateSpringToNearestCorner(context: Contex
             if (rootView === container) {
                 runCatching { wm.updateViewLayout(container, lp) } }
         }
+        addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationCancel(animation: Animator) {
+                canceled = true
+            }
+            override fun onAnimationEnd(animation: Animator) {
+                if (!canceled && rootView === container) {
+                    lp.x = targetX
+                    lp.y = targetY
+                    runCatching { wm.updateViewLayout(container, lp) }
+                }
+            }
+        })
         start() }
 }
 
+@SuppressLint("ClickableViewAccessibility")
 internal fun FloatingVirtualDisplay.attachEdgeBubbleDragAndTap(
     context: Context,
     bubbleView: View,
@@ -610,7 +616,8 @@ internal fun FloatingVirtualDisplay.attachEdgeBubbleDragAndTap(
     var startWinX = 0
     var startWinY = 0
     var dragging = false
-    bubbleView.setOnTouchListener { _, event ->
+    bubbleView.setOnClickListener { mainHandler.post { onTap() } }
+    bubbleView.setOnTouchListener { v, event ->
         val lp = params ?: return@setOnTouchListener false
         val container = rootView ?: return@setOnTouchListener false
         val wm = windowManager ?: return@setOnTouchListener false
@@ -648,18 +655,35 @@ internal fun FloatingVirtualDisplay.attachEdgeBubbleDragAndTap(
                     val targetX = if (dockPillOnLeft) dp(context, 4) else (metrics.widthPixels - lp.width - dp(context, 4)).coerceAtLeast(dp(context, 4))
                     val startX = lp.x.toFloat()
                     springAnimator?.cancel()
-                    springAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-                        duration = 200L
-                        interpolator = android.view.animation.PathInterpolator(0.22f, 1.0f, 0.32f, 1.0f)
-                        addUpdateListener { anim ->
-                            val t = anim.animatedValue as Float
-                            lp.x = (startX + (targetX - startX) * t).roundToInt()
-                            if (rootView === container) runCatching { wm.updateViewLayout(container, lp) }
+                    if (animationsOff(context) || PowerSaveController.isPowerSaveActive(context)) {
+                        lp.x = targetX
+                        runCatching { wm.updateViewLayout(container, lp) }
+                    } else {
+                        springAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                            duration = 200L
+                            interpolator = android.view.animation.PathInterpolator(0.22f, 1.0f, 0.32f, 1.0f)
+                            var canceled = false
+                            addUpdateListener { anim ->
+                                val t = anim.animatedValue as Float
+                                lp.x = (startX + (targetX - startX) * t).roundToInt()
+                                if (rootView === container) runCatching { wm.updateViewLayout(container, lp) }
+                            }
+                            addListener(object : AnimatorListenerAdapter() {
+                                override fun onAnimationCancel(animation: Animator) {
+                                    canceled = true
+                                }
+                                override fun onAnimationEnd(animation: Animator) {
+                                    if (!canceled && rootView === container) {
+                                        lp.x = targetX
+                                        runCatching { wm.updateViewLayout(container, lp) }
+                                    }
+                                }
+                            })
+                            start()
                         }
-                        start()
                     }
                 } else if (event.actionMasked == MotionEvent.ACTION_UP) {
-                    mainHandler.post { onTap() }
+                    v.performClick()
                 }
                 dragging = false
                 true

@@ -324,11 +324,140 @@ class CanonicalToolHandlersMixin:
         from core.subtask_runner import execute_run_subtask
         return await execute_run_subtask(self, args or {})
 
+    async def _tool_locate_files(self, args: dict):
+        import fnmatch as _fnmatch
+        from datetime import datetime as _dt
+        query = str(args.get('query') or args.get('pattern') or args.get('name') or args.get('path') or '').strip()
+        if not query:
+            return {'ok': False, 'op': 'locate', 'matches': [], 'error': 'locate 需要提供文件名/关键词 query 或 glob pattern'}
+        limit = max(1, min(100, int(args.get('limit') or 40)))
+        q_low = query.lower()
+        is_glob = any(ch in query for ch in ('*', '?', '['))
+        skip_dirs = {'.history', '.cache', '.config', '.python_packages', '.transfers', '.versions', '__pycache__', 'node_modules', '.git', 'pylibs', '.venv', 'venv', '.local', 'imapwork'}
+        matches: list[dict[str, Any]] = []
+        nodes_checked: list[str] = []
+        nodes_unavailable: list[dict[str, str]] = []
+
+        def _is_match(rel_s: str, fname: str) -> bool:
+            if is_glob:
+                return _fnmatch.fnmatch(fname.lower(), q_low) or _fnmatch.fnmatch(rel_s.lower(), q_low)
+            return q_low in fname.lower() or q_low in rel_s.lower()
+
+        def _scan_local():
+            root = self.harness.root
+            if root.is_dir():
+                nodes_checked.append('hub_workspace')
+                for f in sorted(root.rglob('*')):
+                    if not f.is_file() or f.is_symlink():
+                        continue
+                    rel_parts = f.relative_to(root).parts
+                    if any(part in skip_dirs or part.startswith('org.chromium.') for part in rel_parts):
+                        continue
+                    rel_p = f.relative_to(root).as_posix()
+                    if _is_match(rel_p, f.name):
+                        st = f.stat()
+                        matches.append({
+                            'node': 'hub_workspace',
+                            'path': rel_p,
+                            'size_bytes': st.st_size,
+                            'mtime_iso': _dt.fromtimestamp(st.st_mtime, TZ).isoformat(timespec='seconds'),
+                        })
+                        if len(matches) >= limit:
+                            return
+            vault = getattr(self.harness, 'vault', None)
+            if vault is not None and vault.root.is_dir():
+                nodes_checked.append('memory_vault')
+                for f in sorted(vault.root.rglob('*.md')):
+                    if not f.is_file() or f.is_symlink():
+                        continue
+                    rel_parts = f.relative_to(vault.root).parts
+                    if '.history' in rel_parts or self.harness._is_other_bot_private_file(f):
+                        continue
+                    rel_p = 'memory_vault/' + f.relative_to(vault.root).as_posix()
+                    if _is_match(rel_p, f.name):
+                        st = f.stat()
+                        matches.append({
+                            'node': 'memory_vault',
+                            'path': rel_p,
+                            'size_bytes': st.st_size,
+                            'mtime_iso': _dt.fromtimestamp(st.st_mtime, TZ).isoformat(timespec='seconds'),
+                        })
+                        if len(matches) >= limit:
+                            return
+
+        await asyncio.to_thread(_scan_local)
+
+        async def _scan_cloud():
+            cc = getattr(self, 'computer', None)
+            if cc is None or getattr(cc, 'client', None) is None:
+                nodes_unavailable.append({'node': 'cloud_desktop', 'reason': '未部署或未挂载'})
+                return
+            try:
+                res = await asyncio.wait_for(cc.client.call('GET', '/files'), timeout=4.0)
+                nodes_checked.append('cloud_desktop')
+                for item in (res.get('files') or []) if isinstance(res, dict) else []:
+                    p_str = str(item.get('path') or item.get('name') or '')
+                    if not p_str:
+                        continue
+                    if _is_match(p_str, p_str.rsplit('/', 1)[-1]):
+                        mt = float(item.get('modified_at') or 0)
+                        matches.append({
+                            'node': 'cloud_desktop',
+                            'path': p_str,
+                            'size_bytes': int(item.get('size') or item.get('bytes') or 0),
+                            'mtime_iso': _dt.fromtimestamp(mt, TZ).isoformat(timespec='seconds') if mt > 0 else '',
+                        })
+            except Exception as exc:
+                nodes_unavailable.append({'node': 'cloud_desktop', 'reason': str(exc)[:120]})
+
+        async def _scan_pc():
+            cur_src = normalize_node_source(self.source_context.get())
+            if cur_src in ('pc', 'pc2') and self.is_dsh_online():
+                try:
+                    pat = query if is_glob else f'*{query}*'
+                    pc_res = await self._raw_dsh_rpc('pc_fs', {'fs_op': 'glob_files', 'pattern': pat}, timeout=4.0)
+                    if isinstance(pc_res, dict) and pc_res.get('ok'):
+                        nodes_checked.append('pc_windows')
+                        for item in (pc_res.get('matches') or [])[:limit]:
+                            p_s = str(item) if isinstance(item, str) else str((item or {}).get('path') or '')
+                            if p_s:
+                                matches.append({'node': 'pc_windows', 'path': p_s, 'size_bytes': None, 'mtime_iso': ''})
+                except Exception as exc:
+                    nodes_unavailable.append({'node': 'pc_windows', 'reason': str(exc)[:120]})
+            elif cur_src in ('pc', 'pc2'):
+                nodes_unavailable.append({'node': 'pc_windows', 'reason': 'DSH 电脑代理未在线'})
+
+        await asyncio.gather(_scan_cloud(), _scan_pc())
+        return {
+            'ok': True,
+            'op': 'locate',
+            'query': query,
+            'count': len(matches[:limit]),
+            'nodes_checked': nodes_checked,
+            'nodes_unavailable': nodes_unavailable,
+            'matches': matches[:limit],
+            'note': '已跨全部在线节点检索；如需把 hub_workspace 文件送到云电脑请调 cloud(op="push", path="...")，取回请调 cloud(op="pull", path="...")。',
+        }
+
+    async def _tool_search_files(self, args: dict):
+        eff = dict(args or {})
+        op = str(eff.get('op') or eff.get('action') or '').strip().lower()
+        if op in ('locate', 'find_anywhere', 'cross_locate'):
+            return await self._tool_locate_files(eff)
+        # Dispatch directly to concrete harness ops (never re-enter 'search_files' -> avoids RecursionError!)
+        if op in ('list', 'list_dir', 'ls', 'dir') or (not op and not eff.get('query') and not eff.get('pattern')):
+            target_tool = 'list_dir'
+        elif op in ('glob', 'glob_files', 'find') or (not op and not eff.get('query') and eff.get('pattern')):
+            target_tool = 'glob_files'
+        else:
+            target_tool = 'grep_search'
+        return await self.harness.execute(target_tool, eff)
+
     async def _tool_bash(self, args: dict):
         eff = dict(args or {})
         op = str(eff.get('op') or eff.get('action') or 'run').strip().lower()
-        if op in ('bg_start', 'bg_logs', 'bg_stdin', 'bg_kill', 'bg_list'):
-            sub = {'bg_start': 'start', 'bg_logs': 'logs', 'bg_stdin': 'send_stdin', 'bg_kill': 'kill', 'bg_list': 'list'}[op]
+        if op in ('bg_start', 'bg_wait', 'bg_logs', 'bg_stdin', 'bg_kill', 'bg_list'):
+            sub = {'bg_start': 'start', 'bg_wait': 'wait', 'bg_logs': 'logs', 'bg_stdin': 'send_stdin', 'bg_kill': 'kill', 'bg_list': 'list'}[op]
             return await self._tool_bg_task({**eff, 'action': sub})
         if op in ('watchdog_start', 'watchdog_stop', 'watchdog_logs', 'watchdog_run_now', 'watchdog_list'):
             return await self._tool_watchdog_task({**eff, 'action': op[len('watchdog_'):]})
@@ -336,8 +465,24 @@ class CanonicalToolHandlersMixin:
             return await self._tool_bg_task({**eff, 'action': 'start'})
         if op in ('logs', 'send_stdin', 'kill') and eff.get('task_id'):
             return await self._tool_bg_task({**eff, 'action': op})
-        if normalize_node_source(self.source_context.get()) in ('pc', 'pc2') and self.is_dsh_online():
-            return await self._raw_dsh_rpc('pc_shell', eff, timeout=float(eff.get('timeout') or 25.0))
+        cur_src = normalize_node_source(self.source_context.get())
+        req_node = str(eff.get('node') or eff.get('target') or '').strip().lower()
+        want_pc_shell = (
+            req_node in ('pc', 'pc2', 'pc_windows', 'windows')
+            or (cur_src in ('pc', 'pc2') and req_node not in ('server', 'hub', 'cloud_sandbox'))
+        )
+        if want_pc_shell:
+            if self.is_dsh_online():
+                res_pc = await self._raw_dsh_rpc('pc_shell', eff, timeout=float(eff.get('timeout') or 25.0))
+                if isinstance(res_pc, dict):
+                    res_pc.setdefault('node', 'pc_windows')
+                return res_pc
+            return {
+                'ok': False,
+                'pc_online': False,
+                'node': 'pc_offline',
+                'error': 'Windows 电脑端代理当前未在线，已阻止将本机 bash 静默回退到云端 Linux 沙箱。请等待电脑端重连，或改用 cloud(op="shell") 操作云电脑，或显式传 target="cloud_sandbox" 在中枢沙箱执行。',
+            }
         return await self.harness.execute('run_command', eff)
 
     async def _tool_memory(self, args: dict):
@@ -353,20 +498,108 @@ class CanonicalToolHandlersMixin:
             return await self._tool_conversation_search(eff)
         if op in ('ctx', 'context'):
             return await self._tool_ctx_search(eff)
+        if op in ('query_facts', 'facts', 'table'):
+            tables = self.memory_engine.get_memory_tables()
+            hits = tables.query_facts(
+                query=str(eff.get('query') or ''),
+                entity=str(eff.get('entity') or ''),
+                attr=str(eff.get('attr') or ''),
+                include_history=bool(eff.get('include_history', False)),
+                limit=int(eff.get('limit') or 12),
+            )
+            return {'ok': True, 'count': len(hits), 'facts': hits}
+        if op in ('upsert_fact', 'set_fact', 'record_fact'):
+            tables = self.memory_engine.get_memory_tables()
+            return tables.upsert_fact_reconciled(
+                entity=str(eff.get('entity') or ''),
+                attr=str(eff.get('attr') or ''),
+                value=str(eff.get('value') or eff.get('text') or ''),
+                aliases=eff.get('aliases') if isinstance(eff.get('aliases'), list) else [],
+                ttl_type=str(eff.get('ttl_type') or 'stateful'),
+                source_ref=f"tool:{self.bot_context.get() or 'companion'}",
+                search_cues=str(eff.get('search_cues') or eff.get('query') or ''),
+                bot_id=str(eff.get('bot_id') or 'all'),
+            )
+        if op in ('delete_fact', 'remove_fact', 'forget_fact'):
+            tables = self.memory_engine.get_memory_tables()
+            res_del = tables.delete_fact(
+                fact_id=str(eff.get('fact_id') or eff.get('id') or ''),
+                entity=str(eff.get('entity') or ''),
+                attr=str(eff.get('attr') or ''),
+                hard=bool(eff.get('hard', True)),
+            )
+            if res_del.get('deleted') and getattr(self, 'vault', None) is not None:
+                with contextlib.suppress(Exception):
+                    self.vault.write('profile/memory_ledger.md', tables.render_memory_ledger_markdown())
+            return res_del
+        if op in ('delete_episode', 'remove_episode'):
+            tables = self.memory_engine.get_memory_tables()
+            res_del = tables.delete_episode(
+                episode_id=str(eff.get('episode_id') or eff.get('id') or ''),
+                title_keyword=str(eff.get('query') or eff.get('text') or ''),
+                hard=bool(eff.get('hard', True)),
+            )
+            if res_del.get('deleted') and getattr(self, 'vault', None) is not None:
+                with contextlib.suppress(Exception):
+                    self.vault.write('profile/memory_ledger.md', tables.render_memory_ledger_markdown())
+            return res_del
+        if op in ('reorganize', 'migrate', 'rebuild'):
+            if bool(eff.get('dry_run', False)):
+                from core.memory_migrator import reorganize_legacy_memory
+                return await reorganize_legacy_memory(self, dry_run=True, use_llm=True)
+            from core.subtask_runner import spawn_memory_reorganize_subtask
+            return await spawn_memory_reorganize_subtask(
+                self,
+                parent_bot_id=self.bot_context.get() or 'companion',
+                parent_source=normalize_node_source(self.source_context.get()),
+            )
+        if op in ('rollback', 'restore_backup'):
+            from core.memory_migrator import rollback_memory_backup
+            return rollback_memory_backup(self, backup_id=str(eff.get('backup_id') or eff.get('id') or ''))
+        if op in ('list_backups', 'backups'):
+            from core.memory_migrator import list_memory_backups
+            from pathlib import Path
+            vroot = Path(self.vault.root) if getattr(self, 'vault', None) is not None else (self.store.root / 'memory_vault')
+            return {'ok': True, 'backups': list_memory_backups(vroot)}
+        if op in ('gardener', 'maintain', 'prune'):
+            from core.memory_migrator import run_memory_gardener
+            return run_memory_gardener(self)
+        if op in ('ledger', 'stats', 'status'):
+            tables = self.memory_engine.get_memory_tables()
+            return {'ok': True, 'stats': tables.stats(), 'ledger_preview': tables.render_memory_ledger_markdown()[:2400]}
+        if op in ('embedding_status', 'embed_status'):
+            return {'ok': True, **self.memory_engine.get_embedding_engine().status()}
+        if op in ('download_embedding', 'install_embedding'):
+            import asyncio as _aio
+            eng = self.memory_engine.get_embedding_engine()
+            dl = await _aio.to_thread(eng.download_tier_model, eff.get('tier'))
+            if dl.get('ok'):
+                idx_res = await _aio.to_thread(self.memory_engine.get_memory_tables().reindex_vectors)
+                dl['reindex'] = idx_res
+            return dl
         return await self._tool_memory_search(eff)
+
+    async def _tool_schedule(self, args: dict):
+        eff = dict(args or {})
+        op = str(eff.get('op') or eff.get('action') or 'list').strip().lower()
+        eff['action'] = op
+        return await self._tool_blackboard(eff)
 
     async def _tool_reply(self, args: dict):
         eff = dict(args or {})
         op = str(eff.get('op') or eff.get('action') or '').strip().lower()
+        src = normalize_node_source(self.source_context.get())
         if op in ('send_image', 'image'):
-            src = normalize_node_source(self.source_context.get())
             return await stage_and_execute_send_image(self, src, eff)
         if op in ('send_file', 'file', 'send_pdf', 'send_doc'):
-            src = normalize_node_source(self.source_context.get())
             return await stage_and_execute_send_file(self, src, eff)
+        if op in ('sticker', 'send_sticker', 'emoji'):
+            return await self._tool_send_sticker(eff)
         if op in ('choices', 'present_choices'):
             return await self._tool_present_choices(eff)
         if op in ('notify', 'notify_user'):
+            if src in ('pc', 'pc2'):
+                return {'ok': False, 'error': 'PC 节点不支持直接触发手机端通知，请通过 blackboard @主助理 转达'}
             return await self._tool_notify_user(eff)
         if op in ('silent', 'stay_silent'):
             return await self._tool_stay_silent(eff)
@@ -374,10 +607,35 @@ class CanonicalToolHandlersMixin:
             sn = eff.get('snooze_minutes') if eff.get('snooze_minutes') is not None else eff.get('minutes', 60)
             return await self._tool_stay_silent({**eff, 'snooze_minutes': sn})
         if op in ('alarm', 'emergency_alarm'):
+            if src in ('pc', 'pc2'):
+                return {'ok': False, 'error': 'PC 节点不支持直接触发手机端强闹钟，请通过 blackboard @主助理 转达'}
             return await self._tool_emergency_alarm(eff)
         if op in ('complete_goal', 'finish_goal'):
             return await self._tool_complete_goal(eff)
-        return {'ok': False, 'error': f'未知 reply op: {op}（支持 send_image/send_file/choices/notify/silent/dnd/alarm/complete_goal）'}
+        return {'ok': False, 'error': f'未知 reply op: {op}（支持 send_image/send_file/sticker/choices/notify/silent/dnd/alarm/complete_goal）'}
+
+    async def _tool_send_sticker(self, args: dict):
+        raw_code = str(
+            args.get('code') or args.get('sticker') or args.get('name') or args.get('id') or args.get('label') or ''
+        ).strip()
+        info = self.harness.extension_registry.resolve_sticker_info(raw_code)
+        if not info:
+            avail = [f"{s['code']}={s['label']}" for s in self.harness.extension_registry.list_active_stickers()[:16]]
+            return {
+                'ok': False,
+                'error': f'未找到匹配的表情贴纸: {raw_code!r}，请从可用代码中选择',
+                'available_codes': avail,
+            }
+        self._queue_turn_image(info['url'])
+        return {
+            'ok': True,
+            'queued': True,
+            'sticker': info['url'],
+            'pack_id': info['pack_id'],
+            'code': info['code'],
+            'label': info['label'],
+            'note': f"贴纸「{info['label']}」({info['code']}) 已挂载到本轮回复，直接输出自然回复正文即可，严禁在正文手写 <sticker:...> 标签。",
+        }
 
     async def _tool_subtask(self, args: dict):
         return await self._tool_run_subtask(args)

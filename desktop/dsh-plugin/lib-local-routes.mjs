@@ -66,6 +66,8 @@ let localHttpServer = null;
 let dshHostIpcServer = null;
 let localLoopbackRetryTimer = null;
 let localHttpServerBinding = false;
+let cachedStickersPayload = null;
+let cachedStickersAt = 0;
 
 export function isPrimaryGatewayListening() {
   return Boolean(localHttpServer && localHttpServer.listening);
@@ -233,13 +235,16 @@ export async function handleLocalRequest(localPath, method = "GET", body = null)
         const pVer = Boolean(body?.force) ? "" : String(runtimeState.cloudPinsVer || "");
         const cVer = Boolean(body?.force) ? "" : String(runtimeState.cloudConfigVer || "");
         const syncPath = `/api/sync?since_seq=0&source=pc&bots_ver=${encodeURIComponent(bVer)}&pins_ver=${encodeURIComponent(pVer)}&config_ver=${encodeURIComponent(cVer)}`;
-        Promise.all([
+        const syncPromise = Promise.all([
           cloudFetch(syncPath, "GET", null, 8000).catch(() => null),
           cloudFetch("/api/dsh/status", "GET", null, 8000).catch(() => null),
         ]).then(([syncRes, dshSt]) => {
           if (dshSt?.ok && typeof dshSt.phone_online === "boolean") runtimeState.phoneOnline = dshSt.phone_online;
           if (syncRes) applyCloudSyncPayload(syncRes);
         }).catch(() => {});
+        if (Boolean(body?.force)) {
+          await syncPromise;
+        }
       }
       return {
         ok: true,
@@ -278,10 +283,11 @@ export async function handleLocalRequest(localPath, method = "GET", body = null)
       const cloudBotId = resolveCloudBotId(bot.id);
       try { runtimeState.inflightControllersByBot.get(bot.id)?.abort(); } catch {}
       runtimeState.inflightControllersByBot.delete(bot.id);
+      delete runtimeState.liveStreamsByBot[bot.id];
       runtimeState.abortedEpochByBot.set(bot.id, (runtimeState.abortedEpochByBot.get(bot.id) || 0) + 1);
       const stopRes = await cloudFetch("/api/stop", "POST", { bot_id: cloudBotId, source: "pc" }, 10000).catch(() => null);
       saveLocalChatCache(loadLocalChatCache(), true, true);
-      return { ok: true, stopped: true, bot_id: bot.id, messages: loadLocalChatCache(), messages_epoch: runtimeState.messagesEpoch, cloud_stop: stopRes };
+      return { ok: true, stopped: true, bot_id: bot.id, messages: loadLocalChatCache(), messages_epoch: runtimeState.messagesEpoch, streams_by_bot: runtimeState.liveStreamsByBot, cloud_stop: stopRes };
     }
 
     if (op === "pin") {
@@ -435,6 +441,30 @@ export async function handleLocalRequest(localPath, method = "GET", body = null)
     return await callCuaTool(body?.action || body?.tool || "list_windows", body || {}, body?.bot_name || "主助理");
   }
 
+  if (clean === "/local/stickers") {
+    const nowMs = Date.now();
+    if (!body?.force && cachedStickersPayload && nowMs - cachedStickersAt < 30000) {
+      return cachedStickersPayload;
+    }
+    const r = await cloudFetch("/api/plugins/stickers", "GET", null, 12000).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+    if (r && r.ok !== false && !r.error) {
+      const rawPacks = Array.isArray(r.sticker_packs) ? r.sticker_packs : (Array.isArray(r.packs) ? r.packs : []);
+      const packs = rawPacks.filter((p) => p && p.enabled !== false);
+      cachedStickersPayload = { ok: true, sticker_packs: packs };
+      cachedStickersAt = nowMs;
+      return cachedStickersPayload;
+    }
+    return { ok: false, sticker_packs: [], error: r?.error || r?.detail || "获取表情包列表失败" };
+  }
+
+  if (clean === "/local/reconnect") {
+    const seq = triggerInstantReconnect("ui_manual_reconnect");
+    if (!runtimeState.bridgeRunning) {
+      startNativePcBridge(runtimeState.activeCtx);
+    }
+    return { ok: true, reconnecting: true, reconnect_seq: seq };
+  }
+
   if (clean === "/cloud/shared-memory") {
     const res = await cloudFetch("/api/dsh/shared-memory", method || "POST", { source: "pc", ...(body || {}) }, 25000);
     if (res?.shared_memories) runtimeState.sharedMemories = { ...runtimeState.sharedMemories, ...res.shared_memories };
@@ -466,15 +496,116 @@ export async function forwardRequest(localPath, cloudPath, method = "GET", body 
   try { return await cloudFetch(cloudPath, method, body, 175000); } catch (err) { return { ok: false, error: String(err?.message || err) }; }
 }
 
+const MAX_BRIDGE_POST_BYTES = 25 * 1024 * 1024;
+const ALLOWED_PROXY_MEDIA_PREFIXES = ["/workspace-media/", "/stickers/", "/static/avatars/", "/avatars/", "/api/files/"];
+const SAFE_WEB_CLOUD_PATH_PREFIXES = ["/api/sync", "/api/dsh/", "/api/chat", "/api/messages", "/api/bots", "/api/plugins/stickers", "/api/files", "/api/models", "/api/status", "/api/vault", "/api/memories"];
+
+function _isLoopbackHost(host) {
+  const h = String(host || "").trim().toLowerCase();
+  return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]";
+}
+
+export function inspectBridgeOrigin(originHeader, cfg = loadLocalConfig()) {
+  if (originHeader === undefined || originHeader === null || String(originHeader).trim() === "") {
+    return { trusted: true, origin: null, isNonLoopbackWeb: false };
+  }
+  const raw = String(originHeader).trim();
+  if (raw.toLowerCase() === "null") {
+    return { trusted: false, origin: null, isNonLoopbackWeb: true };
+  }
+  try {
+    const u = new URL(raw);
+    if (
+      u.protocol === "dsh-app:" ||
+      u.protocol === "app:" ||
+      u.protocol === "file:" ||
+      u.protocol === "capacitor:" ||
+      u.protocol === "tauri:" ||
+      u.protocol === "chrome-extension:"
+    ) {
+      return { trusted: true, origin: raw, isNonLoopbackWeb: false };
+    }
+    if (u.protocol === "http:" || u.protocol === "https:") {
+      if ("Origin" in globalThis && typeof globalThis.Origin?.parse === "function") {
+        try {
+          const parsedOrigin = globalThis.Origin.parse(raw);
+          if (!parsedOrigin || parsedOrigin.opaque) {
+            return { trusted: false, origin: null, isNonLoopbackWeb: true };
+          }
+        } catch {}
+      }
+      if (_isLoopbackHost(u.hostname)) {
+        return { trusted: true, origin: u.origin, isNonLoopbackWeb: false };
+      }
+      if (cfg?.server_url) {
+        try {
+          const srvOrigin = new URL(cfg.server_url).origin;
+          if (u.origin === srvOrigin) {
+            return { trusted: true, origin: u.origin, isNonLoopbackWeb: true };
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+  return { trusted: false, origin: null, isNonLoopbackWeb: true };
+}
+
+export function validateProxyMediaPath(mediaPath, serverUrl) {
+  const raw = String(mediaPath || "").trim();
+  if (!raw || raw.length > 2048 || !serverUrl) return null;
+  if (/^https?:/i.test(raw) || raw.startsWith("//") || raw.includes("\\") || raw.includes("..") || raw.includes("@") || /[\x00-\x1f\x7f\s]/.test(raw)) {
+    return null;
+  }
+  const normalized = raw.startsWith("/") ? raw : `/${raw}`;
+  if (!ALLOWED_PROXY_MEDIA_PREFIXES.some((pfx) => normalized.startsWith(pfx))) {
+    return null;
+  }
+  try {
+    const base = new URL(serverUrl);
+    const target = new URL(normalized, base);
+    if (target.origin !== base.origin) return null;
+    if (!ALLOWED_PROXY_MEDIA_PREFIXES.some((pfx) => target.pathname.startsWith(pfx))) return null;
+    return target.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function isSensitiveBridgeRpcAllowed(originInfo, localPath, cloudPath) {
+  if (!originInfo?.isNonLoopbackWeb) return true;
+  const cleanLocal = String(localPath || "").split("?")[0].trim();
+  if (cleanLocal === "/local/pc-shell" || cleanLocal === "/local/pc-fs" || cleanLocal === "/local/cua") {
+    return false;
+  }
+  if (cloudPath) {
+    const cleanCloud = String(cloudPath).split("?")[0].trim();
+    if (!SAFE_WEB_CLOUD_PATH_PREFIXES.some((pfx) => cleanCloud.startsWith(pfx))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function createBridgeHttpHandler() {
   return (req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    const cfg0 = loadLocalConfig();
+    const originHdr = req.headers?.origin;
+    const originInfo = inspectBridgeOrigin(originHdr, cfg0);
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Vary", "Origin");
     res.setHeader("Connection", "close");
+    if (!originInfo.trusted) {
+      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: "Forbidden origin" }));
+      return;
+    }
+    if (originInfo.origin) {
+      res.setHeader("Access-Control-Allow-Origin", originInfo.origin);
+    }
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     if (req.method === "GET" && (req.url === "/health" || req.url === "/status")) {
-      const cfg = loadLocalConfig();
+      const cfg = cfg0;
       const hbAgeSec = runtimeState.lastHeartbeatOkMs > 0
         ? Math.max(0, Math.round((Date.now() - runtimeState.lastHeartbeatOkMs) / 1000))
         : -1;
@@ -526,15 +657,13 @@ export function createBridgeHttpHandler() {
       try {
         const u = new URL(req.url, "http://127.0.0.1");
         const mediaPath = String(u.searchParams.get("path") || "").trim();
-        const cfg = loadLocalConfig();
-        if (!mediaPath || !cfg.server_url) {
-          res.writeHead(404);
-          res.end();
+        const cfg = cfg0;
+        const fullUrl = validateProxyMediaPath(mediaPath, cfg.server_url);
+        if (!fullUrl) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "Forbidden or invalid media path" }));
           return;
         }
-        const fullUrl = mediaPath.startsWith("http")
-          ? mediaPath
-          : `${cfg.server_url.replace(/\/$/, "")}/${mediaPath.replace(/^\//, "")}`;
         const headers = {};
         if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
         fetch(fullUrl, { method: "GET", headers, signal: AbortSignal.timeout(20000) })
@@ -550,8 +679,16 @@ export function createBridgeHttpHandler() {
             const respHeaders = {
               "Content-Type": ct,
               "Cache-Control": "public, max-age=3600",
+              "X-Content-Type-Options": "nosniff",
+              "Content-Security-Policy": "default-src 'none'; sandbox",
             };
-            if (cd) respHeaders["Content-Disposition"] = cd;
+            const isActiveMarkup = /\.(?:svg|html?|xhtml|xml)(?:$|\?)/i.test(mediaPath) || /(?:image\/svg\+xml|text\/html|application\/xhtml\+xml|application\/xml|text\/xml)/i.test(ct);
+            if (isActiveMarkup) {
+              const safeName = path.basename(mediaPath.split("?")[0] || "file").replace(/["\r\n]/g, "") || "file";
+              respHeaders["Content-Disposition"] = `attachment; filename="${safeName}"`;
+            } else if (cd) {
+              respHeaders["Content-Disposition"] = cd;
+            }
             res.writeHead(200, respHeaders);
             res.end(buf);
           })
@@ -565,11 +702,38 @@ export function createBridgeHttpHandler() {
       }
       return;
     }
-    let rawBody = "";
-    req.on("data", (c) => { rawBody += c.toString("utf8"); });
+    const reqCt = String(req.headers?.["content-type"] || "").trim().toLowerCase();
+    if (req.method === "POST" && !reqCt.startsWith("application/json")) {
+      res.writeHead(415, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: "Unsupported Content-Type; application/json required" }));
+      return;
+    }
+    const bodyChunks = [];
+    let bodyBytes = 0;
+    let bodyTooLarge = false;
+    req.on("data", (c) => {
+      if (bodyTooLarge) return;
+      const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      bodyBytes += chunk.length;
+      if (bodyBytes > MAX_BRIDGE_POST_BYTES) {
+        bodyTooLarge = true;
+        res.writeHead(413, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, error: "Payload too large" }));
+        try { req.destroy(); } catch {}
+        return;
+      }
+      bodyChunks.push(chunk);
+    });
     req.on("end", async () => {
+      if (bodyTooLarge) return;
       try {
+        const rawBody = bodyChunks.length ? Buffer.concat(bodyChunks, bodyBytes).toString("utf8") : "";
         const payload = rawBody ? JSON.parse(rawBody) : {};
+        if (!isSensitiveBridgeRpcAllowed(originInfo, payload.localPath, payload.cloudPath)) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "Forbidden RPC from non-loopback web origin" }));
+          return;
+        }
         const data = await forwardRequest(payload.localPath || null, payload.cloudPath || null, payload.method || req.method || "GET", payload.body ?? null);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(data));

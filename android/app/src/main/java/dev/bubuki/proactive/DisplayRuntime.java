@@ -2,26 +2,21 @@ package dev.bubuki.proactive;
 
 import android.content.*;
 import android.content.res.Resources;
-import android.graphics.*;
 import android.hardware.display.*;
-import android.media.Image;
-import android.media.ImageReader;
 import android.os.*;
-import android.util.Base64;
-import android.view.Display;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.Surface;
 import org.json.*;
-import java.io.*;
 import java.lang.reflect.*;
 import java.util.concurrent.*;
 
-/** VirtualDisplay lifecycle, ImageReader frame pipeline, JSON RPC dispatcher & containment. */
+/** VirtualDisplay lifecycle, DisplayFramePipeline integration, JSON RPC dispatcher & containment. */
 @android.annotation.SuppressLint({"PrivateApi", "DiscouragedPrivateApi", "BlockedPrivateApi", "SoonBlockedPrivateApi", "WrongConstant"})
 final class DisplayRuntime {
     private static final String SHELL_PACKAGE = DisplayInputHelper.SHELL_PACKAGE;
     private static final int SHELL_UID = DisplayInputHelper.SHELL_UID;
+    private static final long KEEP_AWAKE_WINDOW_MS = 45_000L;
 
     private final HandlerThread thread = new HandlerThread("pulse-independent-display");
     private final Handler handler;
@@ -29,36 +24,17 @@ final class DisplayRuntime {
     private final Handler inputHandler;
     private final Context context;
     private volatile VirtualDisplay display;
-    private ImageReader reader;
-    private final HandlerThread frames = new HandlerThread("pulse-root-frames");
-    private final Handler frameHandler;
+    private final DisplayFramePipeline framePipeline = new DisplayFramePipeline();
     private final ScheduledExecutorService awakeTimer = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "pulse-display-awake");
         t.setDaemon(true);
         return t;
     });
-    private ScheduledFuture<?> awakeTask;
-    private final Object frameLock = new Object();
+    private volatile ScheduledFuture<?> awakeTask;
     private final Object displayOpLock = new Object();
     private volatile long displayCreateEpoch = 0L;
-    private Bitmap latestFrame;
-    private Bitmap previewBuffer;
-    private final Paint bitmapPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-    private int frameRotation;
-    private volatile long frameSequence;
-    private boolean framePending = false;
-    private long lastFrameProcessedAt = 0L;
-    private static final long FRAME_INTERVAL_ACTIVE_MS = 45L; // ~22fps while user finger touches PiP
-    private static final long FRAME_INTERVAL_IDLE_MS = 180L;  // ~5.5fps lightweight buffer copy when not touching
-    private static final long FRAME_INTERVAL_DEEP_IDLE_MS = 420L; // ~2.4fps when static & no recent touch/preview
     private volatile int previewShortSide = 460;
     private volatile long liveTouchDownTime = 0L;
-    private volatile long lastLiveTouchAt = 0L;
-    private volatile long lastInteractionAtMs = 0L;
-    private volatile long lastPreviewRequestedAtMs = 0L;
-    private volatile boolean skippedStaleFrames = false;
-
-    private volatile DisplayFrameCodec.PreviewSnapshot latestPreview = null;
 
     private volatile boolean trustedDisplay = true;
     private volatile boolean releasedToBackground = false;
@@ -69,15 +45,6 @@ final class DisplayRuntime {
     // Sandbox task containment & main-display anti-jump state
     private final java.util.Set<String> managedVirtualPackages = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
     private final DisplayTaskContainment containment = new DisplayTaskContainment();
-
-    private final Runnable processFrameRunnable = new Runnable() {
-        @Override
-        public void run() {
-            framePending = false;
-            lastFrameProcessedAt = SystemClock.uptimeMillis();
-            processLatestFrame();
-        }
-    };
 
     DisplayRuntime(Context base) {
         final int myUid = android.os.Process.myUid();
@@ -114,8 +81,6 @@ final class DisplayRuntime {
         handler = new Handler(thread.getLooper());
         inputThread.start();
         inputHandler = new Handler(inputThread.getLooper());
-        frames.start();
-        frameHandler = new Handler(frames.getLooper());
         clipboard = new RootClipboard(context);
     }
 
@@ -125,7 +90,7 @@ final class DisplayRuntime {
             JSONObject fastCmd = new JSONObject(command);
             String fastOp = fastCmd.optString("op", "");
             if ("preview".equals(fastOp)) {
-                return fastPreview(fastCmd).toString();
+                return framePipeline.fastPreview(fastCmd, this::state).toString();
             }
             if ("status".equals(fastOp)) {
                 return state().toString();
@@ -139,6 +104,7 @@ final class DisplayRuntime {
                     || fastCmd.optBoolean("user_close", false);
                 if (destroyReq) {
                     releasedToBackground = true;
+                    framePipeline.setReleasedToBackground(true);
                     stopKeepAwake();
                     FutureTask<String> relTask = new FutureTask<>(() -> run(fastCmd).toString());
                     handler.post(relTask);
@@ -165,63 +131,21 @@ final class DisplayRuntime {
         });
         handler.post(task);
         try {
-            return task.get(18, TimeUnit.SECONDS);
+            long waitSec = 18;
+            try {
+                JSONObject c = new JSONObject(command);
+                if ("shell".equals(c.optString("op"))) {
+                    waitSec = Math.max(18, Math.min(90, c.optInt("timeout_sec", 18) + 4));
+                }
+            } catch (Throwable ignored) {}
+            return task.get(waitSec, TimeUnit.SECONDS);
         } catch (Exception e) {
             return "{\"error\":\"虚拟屏操作超时\"}";
         }
     }
 
-    private JSONObject fastPreview(JSONObject cmd) throws Exception {
-        VirtualDisplay vd = this.display;
-        if (vd == null || vd.getDisplay() == null || vd.getDisplay().getDisplayId() <= 0) {
-            return state().put("hasFrame", false);
-        }
-        lastPreviewRequestedAtMs = SystemClock.uptimeMillis();
-        if (cmd.optBoolean("fresh", false) || skippedStaleFrames) {
-            skippedStaleFrames = false;
-            processLatestFrame();
-        }
-        long since = cmd.optLong("since", -1);
-        long curSeq = this.frameSequence;
-        DisplayFrameCodec.PreviewSnapshot snap = this.latestPreview;
-        if (since >= 0 && curSeq > 0 && curSeq == since && snap != null && snap.sequence == curSeq) {
-            return state().put("hasFrame", true).put("unchanged", true).put("frameSequence", curSeq);
-        }
-        if (snap == null || snap.sequence != curSeq) {
-            snap = encodeLatestPreviewOnDemand();
-        }
-        if (snap == null) {
-            return state().put("hasFrame", false).put("frameSequence", 0);
-        }
-        if (since >= 0 && snap.sequence == since) {
-            return state().put("hasFrame", true).put("unchanged", true).put("frameSequence", snap.sequence);
-        }
-        return state()
-            .put("hasFrame", true)
-            .put("width", snap.width)
-            .put("height", snap.height)
-            .put("image_width", snap.imageWidth)
-            .put("image_height", snap.imageHeight)
-            .put("rotation", snap.rotation)
-            .put("frameSequence", snap.sequence)
-            .put("frameHash", snap.frameHash)
-            .put("image", snap.base64);
-    }
-
-    private DisplayFrameCodec.PreviewSnapshot encodeLatestPreviewOnDemand() {
-        synchronized (frameLock) {
-            if (latestFrame == null || display == null) return latestPreview;
-            long seq = frameSequence;
-            if (latestPreview != null && latestPreview.sequence == seq) return latestPreview;
-            Bitmap[] outBuf = new Bitmap[]{previewBuffer};
-            DisplayFrameCodec.PreviewSnapshot snap = DisplayFrameCodec.encodePreview(
-                latestFrame, seq, this.width, this.height, frameRotation,
-                previewShortSide, previewBuffer, bitmapPaint, outBuf
-            );
-            previewBuffer = outBuf[0];
-            this.latestPreview = snap;
-            return snap;
-        }
+    private void scheduleFrameProcess() {
+        framePipeline.scheduleFrameProcess();
     }
 
     private JSONObject fastTouch(JSONObject cmd) throws Exception {
@@ -230,17 +154,18 @@ final class DisplayRuntime {
             return state().put("ok", false);
         }
         releasedToBackground = false;
+        framePipeline.setReleasedToBackground(false);
         final int displayId = vd.getDisplay().getDisplayId();
         final int rot = vd.getDisplay().getRotation();
         final int lw = (rot % 2 == 0) ? width : height;
         final int lh = (rot % 2 == 0) ? height : width;
-        final String actionStr = cmd.optString("action", "move").trim().toLowerCase();
+        final String actionStr = cmd.optString("action", "move").trim().toLowerCase(java.util.Locale.ROOT);
         final float x = (float) Math.max(0, Math.min(Math.max(1, lw) - 1, cmd.optInt("x", 0)));
         final float y = (float) Math.max(0, Math.min(Math.max(1, lh) - 1, cmd.optInt("y", 0)));
         boolean posted = inputHandler.post(() -> {
             try {
                 long now = SystemClock.uptimeMillis();
-                lastLiveTouchAt = now;
+                framePipeline.markLiveTouch();
                 int action;
                 if ("down".equals(actionStr)) {
                     liveTouchDownTime = now;
@@ -277,71 +202,13 @@ final class DisplayRuntime {
         return new JSONObject().put("uid", android.os.Process.myUid()).put("ok", posted).put("displayId", displayId);
     }
 
-    private void onFrameAvailable(ImageReader source) {
-        if (releasedToBackground || display == null) {
-            try (Image img = source.acquireLatestImage()) {} catch (Throwable ignored) {}
-            return;
-        }
-        long now = SystemClock.uptimeMillis();
-        if (latestFrame != null && (now - lastPreviewRequestedAtMs > 4000L) && (now - lastInteractionAtMs > 4000L)) {
-            try (Image img = source.acquireLatestImage()) {} catch (Throwable ignored) {}
-            skippedStaleFrames = true;
-            return;
-        }
-        scheduleFrameProcess();
-    }
-
-    private void scheduleFrameProcess() {
-        if (framePending || display == null || releasedToBackground) return;
-        framePending = true;
-        long now = SystemClock.uptimeMillis();
-        long recentMs = Math.max(lastInteractionAtMs, lastPreviewRequestedAtMs);
-        long interval;
-        if (now - lastLiveTouchAt < 1200L) {
-            interval = FRAME_INTERVAL_ACTIVE_MS;
-        } else if (now - recentMs < 5000L) {
-            interval = FRAME_INTERVAL_IDLE_MS;
-        } else {
-            interval = FRAME_INTERVAL_DEEP_IDLE_MS;
-        }
-        long wait = lastFrameProcessedAt + interval - now;
-        if (wait > 0) {
-            frameHandler.postDelayed(processFrameRunnable, wait);
-        } else {
-            frameHandler.post(processFrameRunnable);
-        }
-    }
-
-    private void processLatestFrame() {
-        ImageReader src = this.reader;
-        VirtualDisplay vd = this.display;
-        if (src == null || vd == null) return;
-        try (Image image = src.acquireLatestImage()) {
-            if (image == null || releasedToBackground) return;
-            int rot = vd.getDisplay().getRotation();
-            int bufH = this.height;
-            synchronized (frameLock) {
-                if (this.reader != src || this.display == null) return;
-                Image.Plane plane = image.getPlanes()[0];
-                int padded = plane.getRowStride() / plane.getPixelStride();
-                if (latestFrame == null || latestFrame.getWidth() != padded || latestFrame.getHeight() != bufH) {
-                    if (latestFrame != null) latestFrame.recycle();
-                    latestFrame = Bitmap.createBitmap(padded, bufH, Bitmap.Config.ARGB_8888);
-                }
-                latestFrame.copyPixelsFromBuffer(plane.getBuffer().rewind());
-                frameRotation = rot;
-                frameSequence++;
-            }
-        } catch (Throwable ignored) {}
-    }
-
     @android.annotation.SuppressLint("WrongConstant")
     private JSONObject run(JSONObject cmd) throws Exception {
         String op = cmd.getString("op");
         if (op.equals("create")) {
             int myUid = android.os.Process.myUid();
             if (myUid != 0 && myUid != 2000) throw new Exception("虚拟屏需要 Root (uid 0) 或 Shell 权限");
-            String requestedTier = cmd.optString("tier", activeTier).trim().toLowerCase();
+            String requestedTier = cmd.optString("tier", activeTier).trim().toLowerCase(java.util.Locale.ROOT);
             if (requestedTier.isEmpty()) requestedTier = "compact";
             synchronized (displayOpLock) {
                 long myEpoch = displayCreateEpoch;
@@ -354,29 +221,26 @@ final class DisplayRuntime {
                 int wantDpi = cmd.optInt("dpi", spec[2]);
                 if (wantDpi < 120 || wantDpi > 800) wantDpi = spec[2];
 
+                boolean explicitGeom = cmd.has("width") || cmd.has("height") || cmd.has("dpi");
                 if (display != null && display.getDisplay() != null && display.getDisplay().getDisplayId() > 0 && !cmd.optBoolean("recreate", false)) {
                     releasedToBackground = false;
                     activeTier = requestedTier;
                     previewShortSide = cmd.optInt("preview_short_side", spec[3]);
                     int existingId = display.getDisplay().getDisplayId();
-                    if (wantW != width || wantH != height || wantDpi != densityDpi) {
-                        // Never resize an existing VirtualDisplay in-place via setSurface/resize;
-                        // release & recreate cleanly so SurfaceFlinger/ImageReader buffers stay healthy.
+                    if (explicitGeom && (wantW != width || wantH != height || wantDpi != densityDpi)) {
+                        // Only tear down & recreate when caller explicitly requested different geometry
                         release(true);
                     } else {
                         DisplayInputHelper.ensureAwakeAndUnlocked(existingId);
                         startKeepAwake(existingId);
                         String curTop = DisplayInputHelper.topPackageOnDisplay(existingId);
-                        if (curTop == null || curTop.isEmpty()
-                            || (!cmd.optBoolean("skip_home", false) && "com.android.launcher".equals(curTop))) {
+                        if (!cmd.optBoolean("skip_home", false)
+                            && (curTop == null || curTop.isEmpty() || "com.android.launcher".equals(curTop))) {
                             try {
                                 DisplayInputHelper.launchOnDisplay(existingId, "dev.bubuki.proactive/.DisplayTestActivity", 0);
                             } catch (Throwable ignored) {}
                         }
-                        if (reader != null) {
-                            reader.setOnImageAvailableListener(this::onFrameAvailable, frameHandler);
-                            frameHandler.post(this::scheduleFrameProcess);
-                        }
+                        framePipeline.reattachIfPresent(display, previewShortSide);
                         return state().put("newly_created", false).put("reused_display", true);
                     }
                 }
@@ -393,8 +257,7 @@ final class DisplayRuntime {
                 previewShortSide = cmd.optInt("preview_short_side", spec[3]);
                 if (width < 128 || width > 4096 || height < 128 || height > 4096) throw new Exception("虚拟屏尺寸超出范围");
 
-                reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-                Surface surface = reader.getSurface();
+                Surface surface = framePipeline.prepareSurface(width, height, previewShortSide);
                 // 5-tier cascade: keep FLAG_TRUSTED (+ OWN_FOCUS / STEAL_TOP_FOCUS_DISABLED)
                 // even when OEMs reject OWN_DISPLAY_GROUP or ALWAYS_UNLOCKED.
                 final boolean[][] tiers = {
@@ -407,16 +270,24 @@ final class DisplayRuntime {
                 Throwable lastCreateErr = null;
                 display = null;
                 for (boolean[] tCfg : tiers) {
+                    VirtualDisplay candidate = null;
                     try {
                         trustedDisplay = tCfg[0];
                         int flags = DisplayInputHelper.displayFlags(
                             Build.VERSION.SDK_INT, tCfg[0], tCfg[1], tCfg[2], tCfg[3]
                         );
-                        display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, flags);
-                        if (display != null && display.getDisplay() != null && display.getDisplay().getDisplayId() > 0) {
+                        candidate = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, flags);
+                        if (candidate != null && candidate.getDisplay() != null && candidate.getDisplay().getDisplayId() > 0) {
+                            display = candidate;
                             break;
                         }
+                        if (candidate != null) {
+                            try { candidate.release(); } catch (Throwable ignored) {}
+                        }
                     } catch (Throwable err) {
+                        if (candidate != null) {
+                            try { candidate.release(); } catch (Throwable ignored) {}
+                        }
                         lastCreateErr = err;
                         display = null;
                     }
@@ -442,55 +313,48 @@ final class DisplayRuntime {
             DisplayInputHelper.setImePolicy(displayId);
             DisplayInputHelper.ensureAwakeAndUnlocked(displayId);
             startKeepAwake(displayId);
-            String initialTop = DisplayInputHelper.topPackageOnDisplay(displayId);
-            if (!cmd.optBoolean("skip_home", false) || initialTop == null || initialTop.isEmpty()) {
+            if (!cmd.optBoolean("skip_home", false)) {
                 try {
                     DisplayInputHelper.launchOnDisplay(displayId, "dev.bubuki.proactive/.DisplayTestActivity", 0);
                 } catch (Throwable ignored) {}
             }
 
-            reader.setOnImageAvailableListener(this::onFrameAvailable, frameHandler);
-            frameHandler.post(this::scheduleFrameProcess);
+            framePipeline.bindDisplay(display);
             return state().put("newly_created", true).put("reused_display", false);
             }
         } else if (op.equals("resize")) {
-            requireDisplay();
-            Constructor<DisplayManager> ctor = DisplayManager.class.getDeclaredConstructor(Context.class);
-            ctor.setAccessible(true);
-            DisplayManager dm = ctor.newInstance(context);
-            String requestedTier = cmd.optString("tier", activeTier).trim().toLowerCase();
-            if (requestedTier.isEmpty()) requestedTier = "compact";
-            int[] spec = DisplayInputHelper.computeAdaptiveDisplaySpec(dm, requestedTier);
-            activeTier = requestedTier;
-            previewShortSide = cmd.optInt("preview_short_side", spec[3]);
-            latestPreview = null;
-            if (cmd.optBoolean("force_display_resize", false)) {
-                int newW = cmd.optInt("width", spec[0]);
-                int newH = cmd.optInt("height", spec[1]);
-                int newDpi = cmd.optInt("dpi", spec[2]);
-                synchronized (frameLock) {
-                    if (newW != width || newH != height) {
-                        width = newW;
-                        height = newH;
-                        ImageReader oldReader = this.reader;
-                        this.reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-                        this.reader.setOnImageAvailableListener(this::onFrameAvailable, frameHandler);
-                        display.setSurface(this.reader.getSurface());
-                        if (oldReader != null) {
-                            try { oldReader.setOnImageAvailableListener(null, null); oldReader.close(); } catch (Throwable ignored) {}
+            synchronized (displayOpLock) {
+                requireDisplay();
+                Constructor<DisplayManager> ctor = DisplayManager.class.getDeclaredConstructor(Context.class);
+                ctor.setAccessible(true);
+                DisplayManager dm = ctor.newInstance(context);
+                String requestedTier = cmd.optString("tier", activeTier).trim().toLowerCase(java.util.Locale.ROOT);
+                if (requestedTier.isEmpty()) requestedTier = "compact";
+                int[] spec = DisplayInputHelper.computeAdaptiveDisplaySpec(dm, requestedTier);
+                activeTier = requestedTier;
+                previewShortSide = cmd.optInt("preview_short_side", spec[3]);
+                framePipeline.setPreviewShortSide(previewShortSide);
+                if (cmd.optBoolean("force_display_resize", false)) {
+                    int newW = cmd.optInt("width", spec[0]);
+                    int newH = cmd.optInt("height", spec[1]);
+                    int newDpi = cmd.optInt("dpi", spec[2]);
+                    VirtualDisplay vd = this.display;
+                    if (vd != null) {
+                        if (newW != width || newH != height) {
+                            width = newW;
+                            height = newH;
+                            framePipeline.replaceSurfaceForResize(vd, newW, newH);
                         }
-                        if (latestFrame != null) {
-                            latestFrame.recycle();
-                            latestFrame = null;
+                        densityDpi = newDpi;
+                        vd.resize(width, height, densityDpi);
+                        if (vd.getDisplay() != null) {
+                            DisplayInputHelper.setFullscreenWindowingMode(vd.getDisplay().getDisplayId(), width, height, densityDpi);
                         }
                     }
-                    densityDpi = newDpi;
-                    display.resize(width, height, densityDpi);
                 }
-                DisplayInputHelper.setFullscreenWindowingMode(display.getDisplay().getDisplayId(), width, height, densityDpi);
+                scheduleFrameProcess();
+                return state().put("resized", true).put("tier", activeTier);
             }
-            scheduleFrameProcess();
-            return state().put("resized", true).put("tier", activeTier);
         } else if (op.equals("promote") || op.equals("expand_to_foreground") || op.equals("to_foreground") || op.equals("fullscreen")) {
             if (display == null || display.getDisplay() == null || display.getDisplay().getDisplayId() <= 0) {
                 return state().put("ok", false).put("error", "虚拟屏未启动");
@@ -554,7 +418,7 @@ final class DisplayRuntime {
             release(true);
             return state().put("ok", true).put("released", true).put("released_to_background", true).put("destroyed", true);
         } else if (op.equals("preview")) {
-            return fastPreview(cmd);
+            return framePipeline.fastPreview(cmd, this::state);
         } else if (op.equals("shell")) {
             String rawCmd = cmd.optString("command", cmd.optString("cmd", "")).trim();
             if (rawCmd.isEmpty()) throw new Exception("shell 操作需要提供 command");
@@ -588,49 +452,9 @@ final class DisplayRuntime {
                     .put("text", text);
             }
         } else if (op.equals("capture")) {
-            requireDisplay();
-            lastPreviewRequestedAtMs = SystemClock.uptimeMillis();
-            skippedStaleFrames = false;
-            processLatestFrame();
-            Bitmap upright = null;
-            long sequence = 0;
-            for (int i = 0; i < 40 && upright == null; i++) {
-                synchronized (frameLock) {
-                    if (latestFrame != null) {
-                        upright = DisplayFrameCodec.renderUprightBitmap(latestFrame, width, height, frameRotation);
-                        sequence = frameSequence;
-                    }
-                }
-                if (upright == null) Thread.sleep(50);
-            }
-            if (upright == null) throw new Exception("尚未收到工作区画面，先在虚拟屏打开一个应用");
-            int logicalW = upright.getWidth();
-            int logicalH = upright.getHeight();
-            Bitmap encodeBmp = upright;
-            try {
-                int minDim = Math.min(logicalW, logicalH);
-                if (minDim > 720) {
-                    float capScale = 720f / (float) minDim;
-                    int encW = Math.max(1, Math.round(logicalW * capScale));
-                    int encH = Math.max(1, Math.round(logicalH * capScale));
-                    encodeBmp = Bitmap.createScaledBitmap(upright, encW, encH, true);
-                }
-                if (cmd.optBoolean("grid", false)) {
-                    DisplayInputHelper.drawAiGridOverlay(encodeBmp);
-                }
-                ByteArrayOutputStream out = new ByteArrayOutputStream(65536);
-                encodeBmp.compress(Bitmap.CompressFormat.JPEG, 84, out);
-                return state().put("width", logicalW).put("height", logicalH)
-                    .put("image_width", encodeBmp.getWidth())
-                    .put("image_height", encodeBmp.getHeight())
-                    .put("frameSequence", sequence)
-                    .put("image", Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP));
-            } finally {
-                if (encodeBmp != null && encodeBmp != upright) {
-                    encodeBmp.recycle();
-                }
-                upright.recycle();
-            }
+            int capId = requireDisplay();
+            if (awakeTask == null) startKeepAwake(capId);
+            return framePipeline.capture(cmd, this::state);
         } else if (op.equals("tap")) {
             int id = requireDisplay(), x = cmd.getInt("x"), y = cmd.getInt("y");
             checkTarget(cmd, id);
@@ -671,7 +495,7 @@ final class DisplayRuntime {
         } else if (op.equals("key")) {
             int id = requireDisplay();
             checkTarget(cmd, id);
-            String key = cmd.optString("key", "").trim().toLowerCase();
+            String key = cmd.optString("key", "").trim().toLowerCase(java.util.Locale.ROOT);
             int explicitCode = cmd.optInt("keycode", cmd.optInt("key_code", -1));
             if ("home".equals(key) || explicitCode == android.view.KeyEvent.KEYCODE_HOME) {
                 onBeforeVirtualInteraction(id);
@@ -703,7 +527,8 @@ final class DisplayRuntime {
             onBeforeVirtualInteraction(id);
             String out = DisplayInputHelper.openUriOnDisplay(id, uri, cmd.optInt("user_id", 0));
             scheduleEscapeContainment(id);
-            return state().put("opened_uri", uri).put("output", out);
+            String topPkg = DisplayInputHelper.topPackageOnDisplay(id);
+            return state().put("opened_uri", uri).put("output", out).put("package", topPkg != null ? topPkg : "");
         } else if (op.equals("long_press")) {
             int id = requireDisplay(), x = cmd.getInt("x"), y = cmd.getInt("y");
             int duration = Math.max(450, Math.min(2000, cmd.optInt("duration_ms", 650)));
@@ -722,7 +547,7 @@ final class DisplayRuntime {
             if (rawPolicy instanceof Number) {
                 policyVal = ((Number) rawPolicy).intValue();
             } else {
-                String p = cmd.optString("policy", "local").trim().toLowerCase();
+                String p = cmd.optString("policy", "local").trim().toLowerCase(java.util.Locale.ROOT);
                 if ("fallback".equals(p) || "1".equals(p)) policyVal = 1;
                 else if ("hide".equals(p) || "2".equals(p)) policyVal = 2;
                 else if ("local".equals(p) || "0".equals(p) || p.isEmpty()) policyVal = 0;
@@ -748,21 +573,33 @@ final class DisplayRuntime {
             int userId = cmd.optInt("user_id", 0);
             String output = DisplayInputHelper.launchOnDisplay(id, component, userId);
             scheduleEscapeContainment(id);
-            return state().put("output", output);
+            String topPkg = DisplayInputHelper.topPackageOnDisplay(id);
+            return state().put("output", output).put("package", topPkg != null && !topPkg.isEmpty() ? topPkg : pkg);
         } else if (op.equals("ui_tree")) {
             int id = requireDisplay();
+            framePipeline.markInteraction();
+            if (awakeTask == null) startKeepAwake(id);
             int rot = display.getDisplay().getRotation();
             int lw = rot % 2 == 0 ? width : height;
             int lh = rot % 2 == 0 ? height : width;
             return VirtualDisplayUiTreeHelper.dumpDisplay(id, lw, lh);
+        } else if (op.equals("keep_awake")) {
+            if (display != null && display.getDisplay() != null && display.getDisplay().getDisplayId() > 0) {
+                int id = display.getDisplay().getDisplayId();
+                framePipeline.markInteraction();
+                if (awakeTask == null) startKeepAwake(id);
+                DisplayInputHelper.pokeDisplayAwake(id, true);
+                return state().put("ok", true).put("awake_poked", true);
+            }
+            return state().put("ok", true).put("awake_poked", false);
         } else if (!op.equals("status")) {
-            throw new Exception("未知虚拟屏操作");
+            throw new Exception("未知虚拟屏操作: " + op + "（支持 create/release/status/capture/ui_tree/tap/swipe/long_press/text/key/launch/open_uri/ime_policy/shell/clipboard/promote/pull_back/keep_awake）");
         }
         return state();
     }
 
     private void onBeforeVirtualInteraction(int displayId) {
-        lastInteractionAtMs = SystemClock.uptimeMillis();
+        framePipeline.markInteraction();
         if (awakeTask == null && display != null) {
             startKeepAwake(displayId);
         }
@@ -775,10 +612,10 @@ final class DisplayRuntime {
 
     private void startKeepAwake(int displayId) {
         stopKeepAwake();
-        lastInteractionAtMs = SystemClock.uptimeMillis();
+        framePipeline.markInteraction();
         awakeTask = awakeTimer.scheduleWithFixedDelay(() -> {
             try {
-                if (SystemClock.uptimeMillis() - lastInteractionAtMs > 45_000L) {
+                if (SystemClock.uptimeMillis() - framePipeline.lastInteractionAtMs() > KEEP_AWAKE_WINDOW_MS) {
                     stopKeepAwake();
                     return;
                 }
@@ -790,10 +627,11 @@ final class DisplayRuntime {
         }, 0, 2500, TimeUnit.MILLISECONDS);
     }
 
-    private void stopKeepAwake() {
-        if (awakeTask != null) {
-            awakeTask.cancel(false);
-            awakeTask = null;
+    private synchronized void stopKeepAwake() {
+        ScheduledFuture<?> task = awakeTask;
+        awakeTask = null;
+        if (task != null) {
+            task.cancel(false);
         }
     }
 
@@ -828,25 +666,19 @@ final class DisplayRuntime {
         );
     }
 
-    private String release() {
-        return release(false);
-    }
-
-    private String release(boolean destroy) {
+    private void release(boolean destroy) {
         synchronized (displayOpLock) {
             if (destroy) {
                 displayCreateEpoch++;
             }
             stopKeepAwake();
             inputHandler.removeCallbacksAndMessages(null);
-            frameHandler.removeCallbacksAndMessages(null);
-            framePending = false;
             if (!destroy && display != null) {
                 releasedToBackground = true;
-                return "";
+                framePipeline.setReleasedToBackground(true);
+                return;
             }
             releasedToBackground = false;
-            latestPreview = null;
             containment.lastPromotedTaskId = -1;
             containment.lastPromotedPkg = "";
             containment.preActionMainTaskIds.clear();
@@ -855,22 +687,7 @@ final class DisplayRuntime {
                 display = null;
                 DisplayTaskContainment.releaseTasksAndDisplay(vd, managedVirtualPackages);
             }
-            synchronized (frameLock) {
-                if (reader != null) {
-                    try { reader.setOnImageAvailableListener(null, null); reader.close(); } catch (Throwable ignored) {}
-                    reader = null;
-                }
-                if (latestFrame != null) {
-                    latestFrame.recycle();
-                    latestFrame = null;
-                }
-                if (previewBuffer != null) {
-                    previewBuffer.recycle();
-                    previewBuffer = null;
-                }
-                frameSequence = 0;
-            }
-            return "";
+            framePipeline.releaseBuffers();
         }
     }
 
@@ -881,7 +698,7 @@ final class DisplayRuntime {
         awakeTimer.shutdownNow();
         inputThread.quitSafely();
         thread.quitSafely();
-        frames.quitSafely();
+        framePipeline.quit();
     }
 
     static Context systemContext() throws Exception {

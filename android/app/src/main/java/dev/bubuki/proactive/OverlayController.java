@@ -38,7 +38,8 @@ final class OverlayController {
     private boolean animate() {
         try {
             return android.animation.ValueAnimator.areAnimatorsEnabled()
-                && SecurePrefs.read(context).optBoolean("motion", true);
+                && !PowerSaveController.isPowerSaveActive(context)
+                && SecurePrefs.readFastConfig(context).motion;
         } catch (Exception ignored) {
             return false;
         }
@@ -70,7 +71,7 @@ final class OverlayController {
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xF5151720);
         bg.setCornerRadius(dp(26));
-        bg.setStroke(dp(1), 0xFF343846);
+        bg.setStroke(Math.max(1, (int) (0.5f * dm.density)), 0xFF343846);
         card.setBackground(bg);
         card.setElevation(dp(24));
 
@@ -126,7 +127,7 @@ final class OverlayController {
         GradientDrawable ackBg = new GradientDrawable();
         ackBg.setColor(0xFF232735);
         ackBg.setCornerRadius(dp(22));
-        ackBg.setStroke(dp(1), 0xFF3A4054);
+        ackBg.setStroke(Math.max(1, (int) (0.5f * dm.density)), 0xFF3A4054);
         ackBtn.setBackground(ackBg);
         LinearLayout.LayoutParams ackLp = new LinearLayout.LayoutParams(0, -2, 1f);
         btnRow.addView(ackBtn, ackLp);
@@ -150,10 +151,8 @@ final class OverlayController {
         );
         p.gravity = Gravity.CENTER;
         p.dimAmount = .62f;
-        if (Build.VERSION.SDK_INT >= 31) {
-            p.flags |= WindowManager.LayoutParams.FLAG_BLUR_BEHIND;
-            p.setBlurBehindRadius(dp(20));
-        }
+        p.flags |= WindowManager.LayoutParams.FLAG_BLUR_BEHIND;
+        p.setBlurBehindRadius(dp(20));
         view = card;
         try {
             boolean motion = animate();
@@ -191,6 +190,7 @@ final class OverlayController {
     private void finish(String id, int minutes, boolean openChat, String botId) {
         if (replying) return;
         replying = true;
+        AgentForegroundService.clearPendingOverlay(id);
         hideAnimated();
         if (openChat) {
             try {

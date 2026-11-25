@@ -196,8 +196,10 @@ def test_task3_sleep_consolidate_180s_and_tail_appended_memory_deltas(env):
     brain = app.state.brain
     mem = brain.memory_engine
 
-    # 1. Idle threshold must be 180 seconds
-    assert mem.SLEEP_CONSOLIDATE_IDLE_SECONDS == 180
+    # 1. Default idle threshold is 480 seconds (8 minutes, just before 9m idle hot-compact) & configurable
+    assert mem.SLEEP_CONSOLIDATE_IDLE_SECONDS == 480
+    assert mem.get_sleep_consolidate_idle_seconds() == 480
+    assert '45 秒' not in mem.build_prompt_context()
 
     # Add an outdated pin about Tencent Video auto-renewal and 2 new messages
     mem.add_pin("提醒用户解除腾讯视频自动续订", source="phone")
@@ -210,7 +212,7 @@ def test_task3_sleep_consolidate_180s_and_tail_appended_memory_deltas(env):
                 "source": "phone",
                 "role": "user",
                 "text": "我已经把腾讯视频自动续订解除掉啦！",
-                "created_at": now_ts - 200,
+                "created_at": now_ts - 520,
             },
             {
                 "id": "m-a1",
@@ -218,11 +220,11 @@ def test_task3_sleep_consolidate_180s_and_tail_appended_memory_deltas(env):
                 "source": "phone",
                 "role": "assistant",
                 "text": "太好啦您好，腾讯视频自动续订已解除喵！",
-                "created_at": now_ts - 195,
+                "created_at": now_ts - 515,
             },
         ]
     )
-    app.state.store.state["last_user"] = now_ts - 190
+    app.state.store.state["last_user"] = now_ts - 510
     app.state.store.state["last_sleep_consolidate"] = 0.0
 
     # 2. If LLM fails, last_sleep_consolidate MUST NOT be updated

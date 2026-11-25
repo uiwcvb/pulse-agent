@@ -7,6 +7,7 @@ internal object StreamingMarkdown {
     private val unfinishedLink = Regex("""!?\[([^\]\n]*)\]\([^\)\n]*$""")
     private val unfinishedLabel = Regex("""!?\[([^\]\n]*)$""")
     private val fenceLine = Regex("""^ {0,3}(`{3,}|~{3,})(.*)$""")
+    private val dividerCell = Regex(""":?-+:?""")
 
     fun preview(markdown: String): String {
         if (markdown.isEmpty()) return markdown
@@ -31,12 +32,18 @@ internal object StreamingMarkdown {
 
     private fun softenPendingTable(source: String): String {
         val lines = source.split('\n').toMutableList()
-        if (lines.size >= 2 && lines.zipWithNext().any { (header, separator) ->
-                header.trimStart().startsWith('|') && completeDivider(separator, cells(header).size)
-            }) return source
         val last = lines.lastIndex
+        if (last < 0) return source
+        val blockStart = (last downTo 0).firstOrNull { lines[it].isBlank() }?.plus(1) ?: 0
+        if (last - blockStart >= 1) {
+            for (i in blockStart until last) {
+                if (lines[i].trimStart().startsWith('|') && completeDivider(lines[i + 1], cells(lines[i]).size)) {
+                    return source
+                }
+            }
+        }
         val current = lines[last]
-        if (last > 0 && current.trim().all { it in "|:- " } && lines[last - 1].trimStart().startsWith('|')) {
+        if (last > blockStart && current.trim().all { it in "|:- " } && lines[last - 1].trimStart().startsWith('|')) {
             lines[last - 1] = cells(lines[last - 1]).joinToString(" · ")
             lines[last] = ""
         } else if (current.trimStart().startsWith('|')) {
@@ -48,7 +55,7 @@ internal object StreamingMarkdown {
     private fun cells(line: String): List<String> = line.trim().trim('|').split('|').map(String::trim)
 
     private fun completeDivider(line: String, columns: Int): Boolean = columns > 0 &&
-        cells(line).let { parts -> parts.size == columns && parts.all { it.matches(Regex(""":?-+:?""")) } }
+        cells(line).let { parts -> parts.size == columns && parts.all { it.matches(dividerCell) } }
 
     private fun runLength(source: String, start: Int, c: Char): Int {
         var end = start

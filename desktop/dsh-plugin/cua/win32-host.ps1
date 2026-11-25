@@ -405,7 +405,7 @@ public static class DsbWin32Cua {
                     char ch = char.ToUpperInvariant(t[0]);
                     if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) return (ushort)ch;
                 }
-                return 0x0D;
+                throw new ArgumentException("Unknown key token: " + tok);
         }
     }
 

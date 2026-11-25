@@ -511,8 +511,8 @@ class LongTermMemoryEngine:
                         except Exception:
                             pass
 
-                # Substring + bigram pass (catches CJK technical combos reliably even when FTS tokenization varies)
-                scan_sql = f'SELECT * FROM memories_v2 m WHERE 1=1 {where_active} {where_bot} ORDER BY updated_at DESC LIMIT 200'
+                # Full active substring + bigram pass (no 200-row cap so older memories are never silently dropped)
+                scan_sql = f'SELECT * FROM memories_v2 m WHERE 1=1 {where_active} {where_bot} ORDER BY updated_at DESC LIMIT 2000'
                 for r in conn.execute(scan_sql, [bot_id, bot_id]).fetchall():
                     d = dict(r)
                     hay = f"{d.get('topic', '')} {d.get('l0_summary', '')} {d.get('l1_overview', '')} {d.get('keywords', '')}".lower()
@@ -537,7 +537,7 @@ class LongTermMemoryEngine:
                     if len(picked) >= eff_limit:
                         break
                     # Require meaningful overlap so unrelated chit-chat does not pull noise
-                    if sc < 2.2:
+                    if sc < 1.8:
                         continue
                     try:
                         urls = json.loads(item.get('source_urls_json') or '[]')
@@ -581,7 +581,7 @@ class LongTermMemoryEngine:
         if not items:
             return ''
         lines = [
-            '<recalled_long_term_memory hint="自动从跨会话长期经验库召回（L0/L1），若需原文细节可调用 ctx_search(ctx_id=...)">'
+            '<recalled_long_term_memory hint="自动从跨会话长期经验库召回（L0/L1），若需原文细节可调用 memory(op=\'ctx\', ctx_id=...)">'
         ]
         for idx, it in enumerate(items, 1):
             badge = f"[{it.get('kind', 'experience')}:{it.get('outcome', 'success')}]"

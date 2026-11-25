@@ -79,7 +79,7 @@ async def test_harness_compaction_preserves_tools_recent_turn_and_retains_ltm(tm
     replay_blob = str(replay_msgs)
     assert 'https://linux.do/t/topic/998877' in replay_blob
     assert 'X-Custom-Mode: fast' in replay_blob
-    assert any(m.get('role') == 'tool' for m in replay_msgs)
+    assert '[Tool Result]:' in replay_blob
 
     # 2. Manual compaction (`force=True`) MUST:
     #    a) Feed tool output (L-station URL + command) to the summarizer
@@ -90,7 +90,7 @@ async def test_harness_compaction_preserves_tools_recent_turn_and_retains_ltm(tm
     async def fake_silent(msgs, **kw):
         seen_prompts.append(str(msgs))
         joined = str(msgs)
-        if '提炼最多 4 条' in joined:
+        if '提炼最多' in joined:
             return {
                 'role': 'assistant',
                 'content': '[{"topic":"linuxdo_ratelimit_bypass","kind":"experience","outcome":"success","l0":"在 L 站找到接口限流绕过请求头设置","l1":"使用 X-Custom-Mode: fast 且 config.retry=3，来源 https://linux.do/t/topic/998877","urls":["https://linux.do/t/topic/998877"]}]',
@@ -148,9 +148,11 @@ async def test_harness_compaction_preserves_tools_recent_turn_and_retains_ltm(tm
     bot = next(b for b in store.state['assistants'] if b['id'] == 'companion')
     built_msgs, _, _, _ = await brain._build_turn_messages_and_tools('companion', 'phone', bot)
     tail_user = str(built_msgs[-1]['content'])
-    assert '<recalled_long_term_memory>' in tail_user or 'recalled_long_term_memory' in tail_user
-    assert 'X-Custom-Mode: fast' in tail_user
-    assert 'https://linux.do/t/topic/998877' in tail_user
+    mem_env = (getattr(brain, '_last_turn_memory_envelope', None) or {}).get('phone:companion') or {}
+    combined_recall = tail_user + '\n' + str(mem_env.get('ephemeral_recall') or '') + '\n' + str(mem_env.get('compaction_checkpoint') or '')
+    assert ('<recalled_memory' in combined_recall or 'recalled_long_term_memory' in combined_recall)
+    assert 'X-Custom-Mode: fast' in combined_recall
+    assert 'https://linux.do/t/topic/998877' in combined_recall
 
     # 4. Graphiti Bi-Temporal superseding: newer solution on same topic replaces older one in active recall!
     ltm.retain(

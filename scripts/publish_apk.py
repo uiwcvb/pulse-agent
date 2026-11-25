@@ -21,10 +21,9 @@ ver_name = re.search(r"versionName\s+'([^']+)'", gradle_txt).group(1)
 ver_code = int(re.search(r"versionCode\s+(\d+)", gradle_txt).group(1))
 notes = (
     f"v{ver_name} (Build {ver_code}): "
-    "1) 苹果级「纯享正文阅读体 + 顶部唯一过程眉标 + 左滑 1:1 线性拉出工程遥测（缓存命中/TTFT/TPS/轮次）」极简美学 UI（桌面/手机全统一，过程 0 跳动不回弹）；"
-    "2) 根治 Node DSH Sidecar 中途意外中断（`python_tools_plugin` 全面告别 Node 22 undici 改走原生 `http`，增加 4 图滑动折叠防 256MB 堆 OOM，提升内存配额）；"
-    "3) 全局统一 0..1000 归一化坐标系（去黑边零偏移、DOM 不混发像素、支持 Alipay/收银台二维码智能框选与截图回看确认）；"
-    "4) Prompt 与 Tool Schema 瘦身降噪 + 静态前缀锁死 Prefix Cache + 原生 choices 快捷按钮回归。"
+    "1) 全新「向量记忆空间」交互画布：基于真实 512 维向量 2D PCA 语义投影、余弦相似度稀疏连线、关键词簇联动高亮与实时搜索向量探针，支持事实在线编辑/彻底硬删除、一键整理与时光机回滚（保留原始 Markdown 兜底入口）；"
+    "2) 后台闲置记忆提炼改为默认 8 分钟（480s，设置页可调，错开 9 分钟空闲热压缩），修正过时 45 秒文案，并接通增量写入新 5+1 事实表与向量索引；"
+    "3) 同步公开正式版 Release（含免 Root Shizuku / 无线 ADB 三引擎与 v4.0.42 1:1 子任务对话页）。"
 )
 release_meta = {
     'version': ver_name,

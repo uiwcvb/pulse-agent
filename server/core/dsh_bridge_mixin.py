@@ -88,6 +88,14 @@ class DshBridgeMixin:
             'status': merged_status,
         }
         peers[raw_dev_id] = peer_entry
+        if len(peers) > 32:
+            active_keep = str(self.dsh_bridge_info.get('active_device_id') or '')
+            evictable = sorted(
+                ((k, float(v.get('last_seen') or 0.0) if isinstance(v, dict) else 0.0) for k, v in peers.items() if k not in (raw_dev_id, active_keep)),
+                key=lambda it: it[1],
+            )
+            for ek, _ in evictable[:len(peers) - 32]:
+                peers.pop(ek, None)
         if raw_dev_id != 'pc_dsh' or not self.dsh_bridge_info.get('active_device_id'):
             self.dsh_bridge_info['active_device_id'] = raw_dev_id
         return raw_dev_id
@@ -246,7 +254,6 @@ class DshBridgeMixin:
                 res = await asyncio.wait_for(fut, timeout=timeout)
                 return res if isinstance(res, dict) else {'ok': True}
             except asyncio.TimeoutError:
-                self.dsh_pending.pop(req_id, None)
                 if op == 'status' and self.is_dsh_online():
                     return {'ok': True, 'pc_online': True, 'device_id': target_id, **peer_status}
                 if op == 'list_sessions' and isinstance(peer_status.get('sessions'), list):
@@ -261,8 +268,9 @@ class DshBridgeMixin:
                     }
                 return {'ok': False, 'timed_out': True, 'device_id': target_id, 'op': op, 'error': f'电脑端 DeepSeek Harness ({target_id}) 在 {int(timeout)}s 内未返回响应'}
             except Exception as e:
-                self.dsh_pending.pop(req_id, None)
                 return {'ok': False, 'device_id': target_id, 'op': op, 'error': f'发送指令至电脑端失败: {str(e)[:200]}'}
+            finally:
+                self.dsh_pending.pop(req_id, None)
 
         plugin_dir = Path(__file__).resolve().parent.parent.parent / 'dsh-plugin'
         if not (plugin_dir / 'dsh_core.py').is_file() and Path(r'D:\dsh-baike-plugin\dsh_core.py').is_file():

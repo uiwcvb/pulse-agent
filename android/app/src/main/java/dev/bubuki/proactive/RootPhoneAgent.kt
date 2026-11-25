@@ -6,7 +6,6 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -20,7 +19,11 @@ import java.util.concurrent.TimeUnit
  */
 internal class RootPhoneAgent {
     @Volatile private var currentCall: Call? = null
-    private val client = OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS).readTimeout(90, TimeUnit.SECONDS).callTimeout(110, TimeUnit.SECONDS).build()
+    private val client = SecureTransport.HTTP.newBuilder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .callTimeout(110, TimeUnit.SECONDS)
+        .build()
     fun cancel() { currentCall?.cancel() }
     data class Outcome(val text: String, val needsUser: Boolean = false)
 
@@ -68,7 +71,7 @@ internal class RootPhoneAgent {
                 val start = android.os.SystemClock.uptimeMillis()
                 val result = try { execute(name, arguments) } catch (error: Exception) {
                     if (error is kotlinx.coroutines.CancellationException) throw error
-                    JSONObject().put("error", MainActivity.safeError(error))
+                    JSONObject().put("error", PulseErrors.safeError(error))
                 }
                 val image = result.optString("image").ifBlank { result.optString("_image_b64") }
                 val clean = RootPhoneHarness.shallowCopyWithoutImage(result)

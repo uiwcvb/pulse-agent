@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color as AndroidColor
 import android.net.Uri
+import android.os.SystemClock
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.compose.foundation.background
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -36,13 +38,17 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.UriHandler
 import androidx.compose.ui.text.AnnotatedString
@@ -59,6 +65,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import dev.bubuki.proactive.PulseTheme
+import dev.bubuki.proactive.iosPressScale
 
 /** 按 Markdown 显示一段回答；流式草稿用临时闭合的语法预览，始终保留上一帧防止闪烁。 */
 @Composable
@@ -66,12 +73,24 @@ fun MarkdownText(markdown: String, style: TextStyle, modifier: Modifier = Modifi
     val colors = PulseTheme.colors
     val styles = remember(colors) { MarkdownModel.Styles.of(colors) }
     var streamingBlocks by remember { mutableStateOf<List<MdBlock>>(emptyList()) }
-    LaunchedEffect(markdown, styles, streaming) {
-        if (streaming) {
-            if (streamingBlocks.isNotEmpty() && markdown.length > 160) {
-                kotlinx.coroutines.delay(36L)
+    val latestMarkdown by rememberUpdatedState(markdown)
+    val latestStyles by rememberUpdatedState(styles)
+    LaunchedEffect(streaming) {
+        if (!streaming) {
+            streamingBlocks = emptyList()
+            return@LaunchedEffect
+        }
+        var lastEmitMs = 0L
+        snapshotFlow { latestMarkdown to latestStyles }.collect {
+            val now = SystemClock.uptimeMillis()
+            val elapsed = now - lastEmitMs
+            if (elapsed < 36L && streamingBlocks.isNotEmpty() && latestMarkdown.length > 160) {
+                kotlinx.coroutines.delay(36L - elapsed)
             }
-            streamingBlocks = withContext(Dispatchers.Default) { MarkdownModel.parseStreaming(markdown, styles) }
+            val mdSnap = latestMarkdown
+            val stSnap = latestStyles
+            streamingBlocks = withContext(Dispatchers.Default) { MarkdownModel.parseStreaming(mdSnap, stSnap) }
+            lastEmitMs = SystemClock.uptimeMillis()
         }
     }
     val blocks = if (streaming) {
@@ -103,6 +122,8 @@ private fun Blocks(blocks: List<MdBlock>, style: TextStyle, modifier: Modifier =
     }
 }
 
+private val gfmCalloutPrefixRegex = Regex("""^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)]\s*""", RegexOption.IGNORE_CASE)
+
 @Composable
 private fun Block(b: MdBlock, style: TextStyle, depth: Int) {
     when (b) {
@@ -119,26 +140,40 @@ private fun Block(b: MdBlock, style: TextStyle, depth: Int) {
         )
         is MdBlock.Code -> {
             val trimmed = b.code.trim()
-            val isSvg = (b.info.equals("svg", ignoreCase = true) || trimmed.startsWith("<svg", ignoreCase = true)) &&
+            val isSvg = (b.info.equals("svg", ignoreCase = true) ||
+                b.info.equals("image/svg+xml", ignoreCase = true) ||
+                b.info.equals("svg+xml", ignoreCase = true) ||
+                trimmed.startsWith("<svg", ignoreCase = true)) &&
                 trimmed.contains("</svg>", ignoreCase = true)
             if (isSvg) {
                 SvgBlock(trimmed)
             } else {
                 val context = LocalContext.current
+                val haptics = LocalHapticFeedback.current
+                val mdPalette = PulseTheme.colors
                 val langLabel = b.info.trim().lowercase().ifBlank { "code" }
-                val highlightedCode = remember(b.code, langLabel) { highlightCodeBlock(b.code, langLabel) }
+                val highlightedCode = remember(b.code, langLabel, mdPalette.isDark) {
+                    highlightCodeBlock(b.code, langLabel, mdPalette.isDark)
+                }
+                var copied by remember(b.code) { mutableStateOf(false) }
+                LaunchedEffect(copied) {
+                    if (copied) {
+                        kotlinx.coroutines.delay(1600L)
+                        copied = false
+                    }
+                }
                 Column(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
-                        .background(PulseTheme.colors.fill)
-                        .border(0.5.dp, PulseTheme.colors.hair, RoundedCornerShape(12.dp))
+                        .background(mdPalette.codeBg)
+                        .border(0.5.dp, mdPalette.hair, RoundedCornerShape(12.dp))
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(PulseTheme.colors.hair.copy(alpha = 0.28f))
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                            .background(mdPalette.codeHeader)
+                            .padding(start = 12.dp, end = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
@@ -147,26 +182,32 @@ private fun Block(b: MdBlock, style: TextStyle, depth: Int) {
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 11.5.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = PulseTheme.colors.ink2
+                                color = mdPalette.ink2
                             )
                         )
                         Spacer(Modifier.weight(1f))
-                        Text(
-                            text = "复制",
-                            style = style.copy(
-                                fontSize = 11.5.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = PulseTheme.colors.accent
-                            ),
+                        Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .clickable {
+                                .defaultMinSize(minWidth = 44.dp, minHeight = 40.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .iosPressScale(0.94f) {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                                     cm?.setPrimaryClip(ClipData.newPlainText("code", b.code))
-                                    Toast.makeText(context, "代码已复制", Toast.LENGTH_SHORT).show()
+                                    copied = true
                                 }
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
+                                .padding(horizontal = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = if (copied) "已复制 ✓" else "复制",
+                                style = style.copy(
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = if (copied) Color(0xFF10B981) else mdPalette.accent
+                                )
+                            )
+                        }
                     }
                     Box(
                         Modifier
@@ -184,16 +225,27 @@ private fun Block(b: MdBlock, style: TextStyle, depth: Int) {
             }
         }
         is MdBlock.Quote -> {
-            val firstText = (b.blocks.firstOrNull() as? MdBlock.Para)?.text?.text?.trim().orEmpty()
-            val calloutColor = when {
-                firstText.startsWith("[!NOTE]", ignoreCase = true) -> Color(0xFF3B82F6)
-                firstText.startsWith("[!TIP]", ignoreCase = true) -> Color(0xFF10B981)
-                firstText.startsWith("[!IMPORTANT]", ignoreCase = true) -> Color(0xFF8B5CF6)
-                firstText.startsWith("[!WARNING]", ignoreCase = true) -> Color(0xFFD97706)
-                firstText.startsWith("[!CAUTION]", ignoreCase = true) -> Color(0xFFE11D48)
+            val firstPara = b.blocks.firstOrNull() as? MdBlock.Para
+            val rawFirstStr = firstPara?.text?.text.orEmpty()
+            val calloutMatch = gfmCalloutPrefixRegex.find(rawFirstStr)
+            val calloutKind = calloutMatch?.groupValues?.getOrNull(1)?.uppercase()
+            val calloutInfo = when (calloutKind) {
+                "NOTE" -> Color(0xFF3B82F6) to "备注"
+                "TIP" -> Color(0xFF10B981) to "提示"
+                "IMPORTANT" -> Color(0xFF8B5CF6) to "重要"
+                "WARNING" -> Color(0xFFD97706) to "警告"
+                "CAUTION" -> Color(0xFFE11D48) to "注意"
                 else -> null
             }
-            if (calloutColor != null) {
+            if (calloutInfo != null && calloutMatch != null && firstPara != null) {
+                val (calloutColor, badgeLabel) = calloutInfo
+                val strippedBlocks = remember(b.blocks, calloutMatch.range.last) {
+                    var startIdx = calloutMatch.range.last + 1
+                    while (startIdx < rawFirstStr.length && rawFirstStr[startIdx].isWhitespace()) startIdx++
+                    val tail = if (startIdx < firstPara.text.length) firstPara.text.subSequence(startIdx, firstPara.text.length) else null
+                    val rest = b.blocks.drop(1)
+                    if (tail != null && tail.text.isNotBlank()) listOf(MdBlock.Para(tail)) + rest else rest
+                }
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -203,7 +255,15 @@ private fun Block(b: MdBlock, style: TextStyle, depth: Int) {
                         .padding(end = 10.dp, top = 8.dp, bottom = 8.dp)
                 ) {
                     Box(Modifier.width(3.5.dp).fillMaxHeight().background(calloutColor, RoundedCornerShape(2.dp)))
-                    Blocks(b.blocks, style.copy(color = PulseTheme.colors.ink), Modifier.padding(start = 10.dp), depth + 1)
+                    Column(Modifier.padding(start = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            badgeLabel,
+                            style = style.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Bold, color = calloutColor)
+                        )
+                        if (strippedBlocks.isNotEmpty()) {
+                            Blocks(strippedBlocks, style.copy(color = PulseTheme.colors.ink), Modifier, depth + 1)
+                        }
+                    }
                 }
             } else {
                 Row(Modifier.height(IntrinsicSize.Min)) {
@@ -298,6 +358,8 @@ private fun SvgBlock(rawSvg: String) {
                     setBackgroundColor(AndroidColor.TRANSPARENT)
                     setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null)
                     settings.javaScriptEnabled = false
+                    settings.blockNetworkLoads = true
+                    settings.loadsImagesAutomatically = false
                     settings.allowFileAccess = false
                     settings.allowContentAccess = false
                     isVerticalScrollBarEnabled = false
@@ -309,6 +371,13 @@ private fun SvgBlock(rawSvg: String) {
                     webView.tag = htmlDoc
                     webView.loadDataWithBaseURL(null, htmlDoc, "text/html", "UTF-8", null)
                 }
+            },
+            onRelease = { webView ->
+                webView.stopLoading()
+                webView.loadUrl("about:blank")
+                webView.clearHistory()
+                webView.removeAllViews()
+                webView.destroy()
             }
         )
     }
@@ -318,9 +387,13 @@ private val codeTokenRegex = Regex(
     """("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(def|class|return|import|from|async|await|if|elif|else|for|while|try|except|finally|with|as|pass|break|continue|True|False|None|const|let|var|function|export|default|switch|case|new|throw|catch|true|false|null|undefined|fun|val|object|interface|override|private|public|protected|internal|when|is|in|companion|data|sealed|suspend)\b|\b(\d+(?:\.\d+)?)\b"""
 )
 
-private fun highlightCodeBlock(code: String, lang: String): AnnotatedString = buildAnnotatedString {
+private fun highlightCodeBlock(code: String, lang: String, isDark: Boolean): AnnotatedString = buildAnnotatedString {
     val lines = code.split('\n')
     val isDiff = lang == "diff" || lang == "patch"
+    val colComment = if (isDark) Color(0xFF8B949E) else Color(0xFF6E7781)
+    val colString = if (isDark) Color(0xFF7EE787) else Color(0xFF0A66C2)
+    val colKeyword = if (isDark) Color(0xFFFF7B72) else Color(0xFFCF222E)
+    val colNumber = if (isDark) Color(0xFF79C0FF) else Color(0xFF953800)
     lines.forEachIndexed { idx, line ->
         val trimmed = line.trimStart()
         when {
@@ -331,7 +404,7 @@ private fun highlightCodeBlock(code: String, lang: String): AnnotatedString = bu
                 withStyle(SpanStyle(color = Color(0xFFE11D48), background = Color(0x18E11D48))) { append(line) }
             }
             trimmed.startsWith("#") || trimmed.startsWith("//") -> {
-                withStyle(SpanStyle(color = Color(0xFF6B7280))) { append(line) }
+                withStyle(SpanStyle(color = colComment)) { append(line) }
             }
             else -> {
                 var pos = 0
@@ -340,9 +413,9 @@ private fun highlightCodeBlock(code: String, lang: String): AnnotatedString = bu
                         append(line.substring(pos, m.range.first))
                     }
                     when {
-                        m.groupValues[1].isNotEmpty() -> withStyle(SpanStyle(color = Color(0xFF059669))) { append(m.value) }
-                        m.groupValues[2].isNotEmpty() -> withStyle(SpanStyle(color = Color(0xFF7C3AED), fontWeight = FontWeight.SemiBold)) { append(m.value) }
-                        m.groupValues[3].isNotEmpty() -> withStyle(SpanStyle(color = Color(0xFFD97706))) { append(m.value) }
+                        m.groupValues[1].isNotEmpty() -> withStyle(SpanStyle(color = colString)) { append(m.value) }
+                        m.groupValues[2].isNotEmpty() -> withStyle(SpanStyle(color = colKeyword, fontWeight = FontWeight.SemiBold)) { append(m.value) }
+                        m.groupValues[3].isNotEmpty() -> withStyle(SpanStyle(color = colNumber)) { append(m.value) }
                         else -> append(m.value)
                     }
                     pos = m.range.last + 1

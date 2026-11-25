@@ -17,6 +17,7 @@ Gives all Bots a single, zero-context-bloat meta-tool (`integration_hub`) that u
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import email
 from email.header import decode_header
 from email.message import EmailMessage
@@ -30,8 +31,10 @@ import ssl
 import threading
 import time
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 import httpx
+from core.tool_schemas import public_url, scrub_subprocess_env
 
 IMAP_PRESETS = {
     'gmail': {'imap_host': 'imap.gmail.com', 'imap_port': 993, 'smtp_host': 'smtp.gmail.com', 'smtp_port': 465},
@@ -171,13 +174,23 @@ class IntegrationHubPlugin:
         'required': ['op'],
     }
 
-    def _config_path(self, root: Path) -> Path:
+    def _config_path(self, root: Path, data_dir: Path | None = None) -> Path:
+        legacy_p = root / '.config' / 'integrations.json'
+        if data_dir is not None:
+            safe_dir = Path(data_dir)
+            safe_dir.mkdir(parents=True, exist_ok=True)
+            dst_p = safe_dir / 'integrations.json'
+            if legacy_p.exists() and not dst_p.exists():
+                with contextlib.suppress(Exception):
+                    dst_p.write_text(legacy_p.read_text('utf-8'), encoding='utf-8')
+                    legacy_p.unlink(missing_ok=True)
+            return dst_p
         cfg_dir = root / '.config'
         cfg_dir.mkdir(parents=True, exist_ok=True)
         return cfg_dir / 'integrations.json'
 
-    def _load_config(self, root: Path) -> dict[str, Any]:
-        p = self._config_path(root)
+    def _load_config(self, root: Path, data_dir: Path | None = None) -> dict[str, Any]:
+        p = self._config_path(root, data_dir=data_dir)
         if not p.exists():
             return {}
         try:
@@ -187,8 +200,8 @@ class IntegrationHubPlugin:
 
     _cfg_lock = threading.Lock()
 
-    def _save_config(self, root: Path, data: dict[str, Any]) -> None:
-        p = self._config_path(root)
+    def _save_config(self, root: Path, data: dict[str, Any], data_dir: Path | None = None) -> None:
+        p = self._config_path(root, data_dir=data_dir)
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         with self._cfg_lock:
             tmp = p.with_suffix(p.suffix + '.tmp')
@@ -197,12 +210,14 @@ class IntegrationHubPlugin:
 
     async def execute(self, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         root = Path(context.get('root') or '.')
+        data_dir_raw = context.get('data_dir')
+        data_dir = Path(data_dir_raw) if data_dir_raw else None
         op = str(args.get('op') or 'catalog').strip().lower()
         app_name = str(args.get('app') or '').strip().lower()
         action = str(args.get('action') or '').strip()
         query = str(args.get('query') or '').strip()
         params = args.get('params') if isinstance(args.get('params'), dict) else {}
-        cfg_all = self._load_config(root)
+        cfg_all = self._load_config(root, data_dir=data_dir)
 
         if op == 'catalog':
             return {
@@ -249,7 +264,7 @@ class IntegrationHubPlugin:
             merged = dict(cfg_all.get(norm_app) or {})
             merged.update(new_cfg)
             cfg_all[norm_app] = merged
-            self._save_config(root, cfg_all)
+            self._save_config(root, cfg_all, data_dir=data_dir)
             return {'saved': True, 'app': norm_app, 'keys': list(merged.keys())}
 
         if op == 'search_actions':
@@ -464,8 +479,16 @@ class IntegrationHubPlugin:
                 cwd=str(cli_script.parent),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=scrub_subprocess_env(),
             )
-            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+            try:
+                out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await proc.wait()
+                return {'ok': False, 'auth_mode': 'oauth2_outlook_cli', 'error': 'Outlook OAuth CLI 超时 (25s)'}
             out_s = out_b.decode('utf-8', errors='replace').strip()
             err_s = err_b.decode('utf-8', errors='replace').strip()
             if proc.returncode != 0:
@@ -602,8 +625,9 @@ class IntegrationHubPlugin:
         return {'sent': True, 'from': resolved['address'], 'to': to_addr, 'subject': subject}
 
     async def _fetch_ics_events(self, ics_url: str, limit: int = 15) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(ics_url)
+        safe_url = await public_url(ics_url)
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
+            r = await client.get(safe_url)
             r.raise_for_status()
             text = r.text
         events = []
@@ -649,9 +673,16 @@ class IntegrationHubPlugin:
                 r = await client.post(f'https://api.github.com/repos/{repo}/issues', json={'title': params.get('title'), 'body': params.get('body', '')})
                 return {'status_code': r.status_code, 'issue': r.json()}
             method = str(params.get('method') or 'GET').upper()
-            endpoint = str(params.get('endpoint') or '/user').strip()
-            if not endpoint.startswith('http'):
-                endpoint = 'https://api.github.com/' + endpoint.lstrip('/')
+            raw_ep = str(params.get('endpoint') or '/user').strip()
+            if raw_ep.startswith('http://') or raw_ep.startswith('https://'):
+                endpoint = raw_ep
+            elif '://' in raw_ep or raw_ep.startswith('//'):
+                return {'error': f'仅允许访问 https://api.github.com/ 端点: {raw_ep[:120]}'}
+            else:
+                endpoint = 'https://api.github.com/' + raw_ep.lstrip('/')
+            u_ep = urlsplit(endpoint)
+            if u_ep.scheme != 'https' or (u_ep.hostname or '').lower() != 'api.github.com' or u_ep.username or u_ep.password or (u_ep.port not in (None, 443)) or '..' in u_ep.path.split('/'):
+                return {'error': f'拒绝向非 GitHub 官方 API 域名发送凭证 ({endpoint[:120]})'}
             r = await client.request(method, endpoint, json=params.get('body') if method != 'GET' else None, params=params.get('query'))
             return {'status_code': r.status_code, 'data': r.json() if 'json' in r.headers.get('content-type', '') else r.text[:2000]}
 
@@ -728,8 +759,9 @@ class IntegrationHubPlugin:
             if app_name == 'bark' or bark_url:
                 if not bark_url:
                     return {'error': '尚未配置 bark_url'}
+                safe_bark = await public_url(bark_url.rstrip('/'))
                 title = str(params.get('title') or 'DSB 通知').strip()
-                r = await client.post(bark_url.rstrip('/'), json={'title': title, 'body': text})
+                r = await client.post(safe_bark, json={'title': title, 'body': text})
                 return {'status_code': r.status_code, 'text': r.text[:400]}
             webhook = str(
                 params.get('webhook')
@@ -738,15 +770,16 @@ class IntegrationHubPlugin:
                 or ''
             ).strip()
             if webhook:
-                if app_name == 'discord' or 'discord.com/api/webhooks' in webhook:
+                safe_webhook = await public_url(webhook)
+                if app_name == 'discord' or 'discord.com/api/webhooks' in safe_webhook:
                     payload = {'content': text}
-                elif app_name == 'dingtalk' or 'oapi.dingtalk.com' in webhook:
+                elif app_name == 'dingtalk' or 'oapi.dingtalk.com' in safe_webhook:
                     payload = {'msgtype': 'text', 'text': {'content': text}}
-                elif app_name == 'feishu' or 'open.feishu.cn' in webhook or 'open.larksuite.com' in webhook:
+                elif app_name == 'feishu' or 'open.feishu.cn' in safe_webhook or 'open.larksuite.com' in safe_webhook:
                     payload = {'msg_type': 'text', 'content': {'text': text}}
                 else:
                     payload = {'msg_type': 'text', 'msgtype': 'text', 'content': {'text': text}, 'text': text}
-                r = await client.post(webhook, json=payload)
+                r = await client.post(safe_webhook, json=payload)
                 return {'status_code': r.status_code, 'text': r.text[:400]}
             return {'error': f'尚未配置 {app_name} 的 webhook 或 bot_token'}
 

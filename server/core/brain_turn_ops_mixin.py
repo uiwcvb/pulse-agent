@@ -24,6 +24,7 @@ class BrainTurnOpsMixin:
             'llm_text': str(m.get('llm_text') or m.get('text') or ''),
             'thought': str(m.get('thought') or ''),
             'trace': list(m.get('trace') or []),
+            'timeline': list(m.get('timeline') or []),
             'turn_steps': list(m.get('turn_steps') or []),
             'sticker': str(m.get('sticker') or ''),
             'stickers': list(m.get('stickers') or []),
@@ -162,8 +163,12 @@ class BrainTurnOpsMixin:
 
     async def _preempt_if_bot_busy(self, bot_id: str, reason: str, source: str | None = None):
         norm_src = normalize_node_source(source or self.source_context.get())
+        nb_key = f'{norm_src}:{bot_id}'
         cur_exec_for_bot = self.executions_by_bot.get(bot_id)
-        same_src_exec = bool(cur_exec_for_bot and normalize_node_source(cur_exec_for_bot.get('source')) == norm_src)
+        same_src_exec = bool(
+            self.executions_by_node_bot.get(nb_key)
+            or (cur_exec_for_bot and normalize_node_source(cur_exec_for_bot.get('source')) == norm_src)
+        )
         is_bot_busy = (
             same_src_exec
             or self._get_bot_lock(bot_id, norm_src).locked()
@@ -210,7 +215,7 @@ class BrainTurnOpsMixin:
                 if m.get('id') == message_id or (message_id and m.get('client_msg_id') == message_id):
                     target_idx = idx
                     break
-        if target_idx < 0 and source:
+        if target_idx < 0 and not message_id and source:
             req_src = normalize_node_source(source)
             for idx in range(len(msgs) - 1, -1, -1):
                 m = msgs[idx]
@@ -346,6 +351,7 @@ class BrainTurnOpsMixin:
         for fld, default_val in (
             ('thought', ''),
             ('trace', []),
+            ('timeline', []),
             ('turn_steps', []),
             ('sticker', ''),
             ('stickers', []),

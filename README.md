@@ -6,7 +6,7 @@
 <br />
 **多端协同个人智能伴侣与跨设备自主执行系统**
 
-[![Release](https://img.shields.io/badge/release-v4.0.22%20(Build%20110)-0A84FF?style=flat-square)](#)
+[![Release](https://img.shields.io/badge/release-v4.0.43%20(Build%20131)-0A84FF?style=flat-square)](https://github.com/uiwcvb/pulse-agent/releases/latest)
 [![Architecture](https://img.shields.io/badge/engine-FastAPI%20%2B%20Node%20DSH%20Sidecar-10B981?style=flat-square)](#-系统架构-architecture)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Linux%20Cloud%20OS%20%7C%20Desktop-6366F1?style=flat-square)](#-核心能力-features)
 [![License](https://img.shields.io/badge/license-MIT-slate?style=flat-square)](LICENSE)
@@ -80,7 +80,29 @@ pulse-agent/
 
 ## 🚀 快速开始 (Quick Start)
 
-### 1. 环境准备
+### 方式一：零门槛起步（只需手机 + API Key + 空白 VPS）
+1. 安装 Android 客户端后选择 **「只有 API Key · AI 帮我搭」**，填入任意大模型 Key 即可直接和本地引导 AI 对话。
+2. 点击 **「填 VPS SSH 一键搭建」**，在安全本地表单中填入一台空白 Ubuntu/Debian VPS 的 SSH（凭据仅手机本地直连 SSH，绝不发送给第三方大模型），App 会自动完成：
+   - 部署并启动中枢大脑网关（默认兼容开源 `BRAIN_ENGINE=legacy`）与 Nginx WebSocket 代理；
+   - 自动部署 **24/7 云端桌面**（Xvfb + Openbox + Chromium + Tmux）并绑定到中枢；
+   - 自动同步你的 API Key 并完成手机配对。
+3. **手机免 Root 控屏**：打开系统「无线调试」启动 **Shizuku**（开启后切 5G 流量也不掉线），回 App 点「一键授权 Shizuku」（或用内置无线 ADB 6 位码配对）。
+4. **电脑端自动接入**：复制手机端生成的电脑接入指令发给电脑上的 AI（Claude Code / Codex / Antigravity / Cursor），或直接读取 [`.agents/skills/pulse-pc-bootstrap/SKILL.md`](.agents/skills/pulse-pc-bootstrap/SKILL.md) / 运行：
+   ```bash
+   # DSH 桌面端插件：
+   node desktop/dsh-plugin/setup.mjs --pair-code "DSCLAW1:<SERVER_URL>|<TOKEN>"
+   # 跨平台轻量代理 (Windows / macOS / Linux)：
+   python desktop/desktop_agent.py --pair-code "DSCLAW1:<SERVER_URL>|<TOKEN>" --save --check
+   ```
+
+### 方式二：让你的 AI Agent 按 Skill 一键全端启动（推荐开发者）
+让你的编码 Agent 直接读取：
+- 全端部署总纲：[`.agents/skills/pulse-quickstart/SKILL.md`](.agents/skills/pulse-quickstart/SKILL.md)
+- 电脑端自动接入：[`.agents/skills/pulse-pc-bootstrap/SKILL.md`](.agents/skills/pulse-pc-bootstrap/SKILL.md)
+
+### 方式三：手工环境准备与启动
+
+#### 1. 环境准备
 - **Python**: `3.11+`
 - **Node.js**: `20+` / `22+`（用于 `server/dsh_brain`）
 - **Android Build**: JDK `17` + Gradle `8.11`（可选，仅构建客户端 APK 时需要）

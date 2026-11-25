@@ -145,7 +145,12 @@ object MarkdownModel {
         return when (n) {
             is Paragraph -> MdBlock.Para(inlines(n, s))
             is org.commonmark.node.Heading -> MdBlock.Heading(n.level, inlines(n, s))
-            is FencedCodeBlock -> MdBlock.Code(n.info.orEmpty().trim(), n.literal.orEmpty().trimEnd('\n'))
+            is FencedCodeBlock -> {
+                val normInfo = n.info.orEmpty().trim().let {
+                    if (it.equals("image/svg+xml", ignoreCase = true) || it.equals("svg+xml", ignoreCase = true)) "svg" else it
+                }
+                MdBlock.Code(normInfo, n.literal.orEmpty().trimEnd('\n'))
+            }
             is IndentedCodeBlock -> MdBlock.Code("", n.literal.orEmpty().trimEnd('\n'))
             is HtmlBlock -> MdBlock.Para(AnnotatedString(n.literal.orEmpty().trimEnd('\n')))
             is BlockQuote -> MdBlock.Quote(blocks(n, depth + 1, s))
@@ -177,7 +182,7 @@ object MarkdownModel {
         background = Color(0x38F59E0B),
         fontWeight = FontWeight.Medium
     )
-    private val eqHighlightRegex = Regex("""==([^\n=]{1,200}?)=""")
+    private val eqHighlightRegex = Regex("""==([^\n=]{1,200}?)==""")
     private val htmlColorAttrRegex = Regex("""(?i)(?:style\s*=\s*["'][^"']*color\s*:\s*([#a-zA-Z0-9]+)|color\s*=\s*["']([#a-zA-Z0-9]+)["'])""")
 
     private fun parseNamedOrHexColor(raw: String): Color? {
@@ -203,7 +208,11 @@ object MarkdownModel {
                                 Color(r, g, b)
                             }
                             6 -> Color(0xFF000000 or hex.toLong(16))
-                            8 -> Color(hex.toLong(16))
+                            8 -> {
+                                val rgba = hex.toLong(16)
+                                val argb = ((rgba and 0xFFL) shl 24) or ((rgba ushr 8) and 0xFFFFFFL)
+                                Color(argb)
+                            }
                             else -> null
                         }
                     } catch (_: Exception) { null }

@@ -128,6 +128,7 @@ class SyncEngine:
     def bots_ver(self, source: str = 'phone') -> str:
         req_src = normalize_node_source(source)
         return _hash_json({
+            'v': 2,
             'bots': resolve_bots_for_source(self.store.state.get('assistants', []), req_src),
             'primary_bot_id': primary_bot_id_for_source(self.store, req_src),
         })
@@ -282,7 +283,7 @@ class SyncEngine:
         ev: dict[str, Any] = {
             'type': 'bots_changed',
             'bot_id': bot_id,
-            'bots': self.store.state.get('assistants', []),
+            'bots': resolve_bots_for_source(self.store.state.get('assistants', []), req_src),
             'bots_ver': b_ver,
             'primary_bot_id': primary_bot_id_for_source(self.store, req_src),
             'state_seq': seq,
@@ -622,19 +623,38 @@ class SyncEngine:
         event: dict,
         client_src: str,
     ) -> dict[str, Any]:
+        from urllib.parse import parse_qsl, unquote
         req_id = str(event.get('id') or '')
         method = str(event.get('method') or 'GET').upper()
-        path = str(event.get('path') or '')
+        raw_path = str(event.get('path') or '')
         if method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE'):
             return {'type': 'rpc_res', 'id': req_id, 'status': 405, 'body': {'detail': f'不支持的 HTTP 方法: {method}'}}
-        if not path.startswith('/api/') or path in ('/api/secure', '/api/transport') or '?' in path or '#' in path or '..' in path or '//' in path:
+        if '#' in raw_path or '\\' in raw_path:
             return {'type': 'rpc_res', 'id': req_id, 'status': 400, 'body': {'detail': '非法 API 路径'}}
+        raw_base, sep, raw_qs = raw_path.partition('?')
+        decoded_base = unquote(raw_base)
+        if (
+            not decoded_base.startswith('/api/')
+            or not raw_base.startswith('/api/')
+            or decoded_base in ('/api/secure', '/api/transport')
+            or '?' in decoded_base
+            or '#' in decoded_base
+            or '..' in decoded_base
+            or '//' in decoded_base
+            or '\\' in decoded_base
+        ):
+            return {'type': 'rpc_res', 'id': req_id, 'status': 400, 'body': {'detail': '非法 API 路径'}}
+        query: dict[str, Any] = {}
+        if sep and raw_qs:
+            for k, v in parse_qsl(raw_qs, keep_blank_values=True):
+                query[k] = v
         raw_query = event.get('query')
-        query = dict(raw_query) if isinstance(raw_query, dict) else {}
+        if isinstance(raw_query, dict):
+            query.update(raw_query)
         query.setdefault('source', client_src)
         body = event.get('body')
         try:
-            response = await app_call(method, path, query, body)
+            response = await app_call(method, raw_base, query, body)
             try:
                 resp_body = response.json()
             except Exception:

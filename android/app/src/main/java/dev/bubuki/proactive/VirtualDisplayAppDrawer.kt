@@ -1,6 +1,8 @@
 package dev.bubuki.proactive
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
@@ -23,7 +25,15 @@ import java.util.concurrent.Executors
 internal typealias VirtualAppEntry = PhoneApp
 
 internal object VirtualDisplayAppDrawer {
-    private val iconCache = LruCache<String, Drawable>(120)
+    private val iconCache = LruCache<String, Bitmap>(120)
+    private fun drawableToBitmap(drawable: Drawable): Bitmap {
+        val size = 96
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(canvas)
+        return bmp
+    }
     private val iconLoader = Executors.newFixedThreadPool(2) { r ->
         Thread(r, "vd-app-icon").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 }
     }
@@ -189,13 +199,17 @@ internal object VirtualDisplayAppDrawer {
             }
         }
 
+        var pendingFilter: Runnable? = null
         searchBox.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                 val next = s?.toString().orEmpty()
                 if (next != filterQuery) {
                     filterQuery = next
-                    renderGrid()
+                    pendingFilter?.let { searchBox.removeCallbacks(it) }
+                    val r = Runnable { renderGrid() }
+                    pendingFilter = r
+                    searchBox.postDelayed(r, 120L)
                 }
             }
             override fun afterTextChanged(s: Editable?) {}
@@ -264,21 +278,27 @@ internal object VirtualDisplayAppDrawer {
             scaleType = ImageView.ScaleType.FIT_CENTER
             val pad = dp(5)
             setPadding(pad, pad, pad, pad)
+            tag = pkg
         }
         iconHolder.addView(iconImg, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
 
         val cached = synchronized(iconCache) { iconCache.get(pkg) }
-        if (cached != null) {
+        if (cached != null && !cached.isRecycled) {
             fallbackTv.visibility = View.GONE
-            iconImg.setImageDrawable(cached)
+            iconImg.setImageBitmap(cached)
         } else {
             iconLoader.execute {
-                val loaded = runCatching { context.packageManager.getApplicationIcon(pkg) }.getOrNull()
+                val loaded = runCatching {
+                    val dr = context.packageManager.getApplicationIcon(pkg)
+                    drawableToBitmap(dr)
+                }.getOrNull()
                 if (loaded != null) {
                     synchronized(iconCache) { iconCache.put(pkg, loaded) }
                     iconImg.post {
-                        fallbackTv.visibility = View.GONE
-                        iconImg.setImageDrawable(loaded)
+                        if (iconImg.tag == pkg && !loaded.isRecycled) {
+                            fallbackTv.visibility = View.GONE
+                            iconImg.setImageBitmap(loaded)
+                        }
                     }
                 }
             }

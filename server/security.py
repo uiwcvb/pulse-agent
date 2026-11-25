@@ -4,6 +4,7 @@ Android pins the server SPKI, wraps an ephemeral AES-256 key with RSA-OAEP,
 and uses distinct GCM nonces for every request, response and WS frame.
 """
 import base64, gzip, hashlib, json, os, time, zlib
+from collections import OrderedDict
 from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -37,7 +38,7 @@ class CryptoBox:
         self.public_der = self.key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         self.fingerprint = hashlib.sha256(self.public_der).hexdigest()
         self.seen = {}  # Reject replayed envelopes during a process lifetime.
-        self._session_keys: dict[str, tuple[bytes, float]] = {}  # Cache unwrapped AES session keys for 30 min
+        self._session_keys: OrderedDict[str, tuple[bytes, float]] = OrderedDict()  # LRU cache (max 256)
 
     def public(self):
         return {
@@ -51,18 +52,25 @@ class CryptoBox:
         now = time.time()
         enc_key_b64 = envelope['key']
         cached = self._session_keys.get(enc_key_b64)
+        from_cache = False
         if cached and now - cached[1] < 1800:
             key = cached[0]
+            from_cache = True
+            self._session_keys.move_to_end(enc_key_b64)
         else:
             key = self.key.decrypt(unb64(enc_key_b64), padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
-            if len(self._session_keys) > 256:
-                self._session_keys = {k: v for k, v in self._session_keys.items() if now - v[1] < 1800}
-            self._session_keys[enc_key_b64] = (key, now)
         nonce = unb64(envelope['nonce'])
         raw = _decompress_if_needed(AESGCM(key).decrypt(nonce, unb64(envelope['data']), None), envelope)
         data = json.loads(raw)
         stamp = data.get('timestamp', 0)
         if abs(now - stamp) > 300: raise ValueError('设备时钟偏差超过 5 分钟')
+        if not from_cache:
+            expired = [k for k, (_, ts) in self._session_keys.items() if now - ts >= 1800]
+            for k in expired:
+                self._session_keys.pop(k, None)
+            while len(self._session_keys) >= 256:
+                self._session_keys.popitem(last=False)
+            self._session_keys[enc_key_b64] = (key, now)
         replay = enc_key_b64[-32:] + ':' + envelope['nonce']
         if len(self.seen) > 2000:
             self.seen = {k:v for k,v in self.seen.items() if v > now - 300}

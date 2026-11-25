@@ -25,6 +25,7 @@ import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.*
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.*
 import androidx.compose.ui.unit.*
 import androidx.compose.ui.window.*
@@ -51,45 +52,64 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
     val c = LocalPulsePalette.current
     val focus = LocalFocusManager.current
     val haptics = LocalHapticFeedback.current
+    val reduceMotion = rememberReducedMotion()
     val requester = remember { FocusRequester() }
     val executing = s.workingBot == bot.id || s.busyBot == bot.id || s.streamBotId == bot.id
     val hasDraft = !s.uploading && (s.draft.isNotBlank() || s.attachments.isNotEmpty())
-    var showComposerTray by remember { mutableStateOf(false) }
-    var showAttachPicker by remember { mutableStateOf(false) }
+    var showPlusHub by remember { mutableStateOf(false) }
     var previewThumb by remember { mutableStateOf<ImageBitmap?>(null) }
     var showStickerDrawer by remember { mutableStateOf(false) }
-
-    val enabledPack = remember(s.stickerPacks) {
-        s.stickerPacks.firstOrNull { it.optBoolean("enabled", true) && (it.optJSONArray("stickers")?.length() ?: 0) > 0 }
+    var selectedPackIdx by rememberSaveable { mutableIntStateOf(0) }
+    var confirmClearRoom by remember { mutableStateOf(false) }
+    var textFieldVal by remember(bot.id) { mutableStateOf(TextFieldValue(s.draft, TextRange(s.draft.length))) }
+    LaunchedEffect(s.draft) {
+        if (textFieldVal.text != s.draft) {
+            textFieldVal = TextFieldValue(s.draft, TextRange(s.draft.length))
+        }
     }
+
+    val enabledPacks = remember(s.stickerPacks) {
+        s.stickerPacks.filter { it.optBoolean("enabled", true) && (it.optJSONArray("stickers")?.length() ?: 0) > 0 }
+    }
+    val safePackIdx = selectedPackIdx.coerceIn(0, (enabledPacks.size - 1).coerceAtLeast(0))
+    val enabledPack = enabledPacks.getOrNull(safePackIdx)
 
     Surface(
         Modifier.fillMaxWidth()
             .onSizeChanged { onHeight(it.height) }
             .pointerInput(bot.id) {
+                val horizThresh = 42.dp.toPx()
+                val vertThresh = 28.dp.toPx()
                 var dx = 0f
                 var dy = 0f
                 awaitEachGesture {
                     awaitFirstDown(requireUnconsumed = false)
                     dx = 0f
                     dy = 0f
+                    var childConsumed = false
                     do {
                         val event = awaitPointerEvent()
                         val change = event.changes.firstOrNull() ?: break
+                        if (change.isConsumed) {
+                            childConsumed = true
+                            break
+                        }
                         dx += change.position.x - change.previousPosition.x
                         dy += change.position.y - change.previousPosition.y
                     } while (event.changes.any { it.pressed })
-                    if (abs(dx) > abs(dy) && abs(dx) > 80f) {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        if (dx < 0) model.switchAdjacentBot(1) else model.switchAdjacentBot(-1)
-                    } else if (abs(dy) > abs(dx) && abs(dy) > 52f) {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        if (dy < 0) {
-                            showComposerTray = true
-                        } else {
-                            showComposerTray = false
-                            showStickerDrawer = false
-                            focus.clearFocus()
+                    if (!childConsumed) {
+                        if (abs(dx) > abs(dy) && abs(dx) > horizThresh) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            if (dx < 0) model.switchAdjacentBot(1) else model.switchAdjacentBot(-1)
+                        } else if (abs(dy) > abs(dx) && abs(dy) > vertThresh) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            if (dy < 0) {
+                                showPlusHub = true
+                            } else {
+                                showPlusHub = false
+                                showStickerDrawer = false
+                                focus.clearFocus()
+                            }
                         }
                     }
                 }
@@ -101,72 +121,142 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
             HorizontalDivider(color = c.line.copy(alpha = 0.65f), thickness = 0.5.dp)
 
             Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp)) {
-                // 1. Spring-Animated Pull-Up Tool Tray
+                // 1. Unified Apple-HIG Attach & Workspace Hub (Single `+` Drawer)
                 AnimatedVisibility(
-                    visible = showComposerTray,
-                    enter = expandVertically(spring(dampingRatio = 0.78f, stiffness = 400f)) + fadeIn(tween(150)),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 450f)) + fadeOut(tween(120))
+                    visible = showPlusHub,
+                    enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                    exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
                 ) {
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .padding(bottom = 8.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(c.fill.copy(alpha = 0.75f))
-                            .horizontalScroll(rememberScrollState())
-                            .padding(6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        listOf(
-                            Triple("虚拟屏", c.ink) { showComposerTray = false; model.launchFloatingVirtualDisplay() },
-                            Triple("云桌面", c.ink) { showComposerTray = false; model.openCloudDesktop() },
-                            Triple("压缩上下文", c.accent) { showComposerTray = false; model.compactBotContext(bot.id) },
-                            Triple("个人主页", c.ink) { showComposerTray = false; model.openBotEditor(bot.id) }
-                        ).forEach { (label, col, act) ->
-                            Text(
-                                label,
-                                Modifier.widthIn(min = 78.dp)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(c.surface)
-                                    .iosPressScale(0.95f) {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        act()
-                                    }
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                                color = col,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                textAlign = TextAlign.Center
-                            )
-                        }
-                    }
-                }
-
-                // 2. Spring-Animated Optional Sticker Plugin Drawer (Shirakami Fubuki Pack)
-                AnimatedVisibility(
-                    visible = showStickerDrawer && enabledPack != null,
-                    enter = expandVertically(spring(dampingRatio = 0.78f, stiffness = 400f)) + fadeIn(tween(160)),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 450f)) + fadeOut(tween(120))
-                ) {
-                    val packId = enabledPack?.optString("id", "fubuki") ?: "fubuki"
-                    val packName = enabledPack?.optString("name", "表情贴纸") ?: "表情贴纸"
-                    val stickersArr = enabledPack?.optJSONArray("stickers") ?: JSONArray()
-                    val stickers = remember(stickersArr) { (0 until stickersArr.length()).map { stickersArr.getJSONObject(it) } }
                     Column(
                         Modifier.fillMaxWidth()
                             .padding(bottom = 8.dp)
                             .clip(RoundedCornerShape(16.dp))
                             .background(c.fill.copy(alpha = 0.72f))
-                            .padding(10.dp),
+                            .padding(7.dp),
+                        verticalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            ModernAttachSourceButton(
+                                icon = "image",
+                                title = "快速拍照",
+                                subtitle = "秒拍直传 AI",
+                                tint = Color(0xFF34C759),
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    showPlusHub = false
+                                    model.captureQuickPhoto()
+                                }
+                            )
+                            ModernAttachSourceButton(
+                                icon = "image",
+                                title = "相册照片",
+                                subtitle = "多图直传",
+                                tint = c.accent,
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    showPlusHub = false
+                                    model.chooseMediaGallery()
+                                }
+                            )
+                            ModernAttachSourceButton(
+                                icon = "file",
+                                title = "浏览文件",
+                                subtitle = "PDF / 文档",
+                                tint = Color(0xFF5E5CE6),
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    showPlusHub = false
+                                    model.chooseDocuments()
+                                }
+                            )
+                        }
+                        Row(
+                            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(
+                                Triple("虚拟屏", c.ink) { showPlusHub = false; model.launchFloatingVirtualDisplay() },
+                                Triple("云桌面", c.ink) { showPlusHub = false; model.openCloudDesktop() },
+                                Triple("压缩上下文", c.accent) { showPlusHub = false; model.compactBotContext(bot.id) },
+                                Triple("个人主页", c.ink) { showPlusHub = false; model.openBotEditor(bot.id) },
+                                Triple("全部工作台…", c.muted) { showPlusHub = false; model.actionsMenu() }
+                            ).forEach { (label, col, act) ->
+                                Text(
+                                    label,
+                                    Modifier.heightIn(min = 36.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(c.surface)
+                                        .iosPressScale(0.95f) {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            act()
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    color = col,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // 2. Spring-Animated Optional Sticker Plugin Drawer (Multi-Pack Tabs + Direct Send)
+                AnimatedVisibility(
+                    visible = showStickerDrawer && enabledPack != null,
+                    enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                    exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
+                ) {
+                    val packId = enabledPack?.optString("id", "fubuki") ?: "fubuki"
+                    val packName = enabledPack?.optString("name", "表情贴纸") ?: "表情贴纸"
+                    val stickersArr = enabledPack?.optJSONArray("stickers") ?: JSONArray()
+                    val stickers = remember(stickersArr) { (0 until stickersArr.length()).mapNotNull { runCatching { stickersArr.getJSONObject(it) }.getOrNull() } }
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(c.fill.copy(alpha = 0.72f))
+                            .padding(8.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text("$packName (点按让 ${bot.name} 互动)", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
-                            Text("收起", Modifier.clickable { showStickerDrawer = false }, color = c.accent, fontSize = 12.sp)
+                            Text("$packName (点按发送表情)", color = c.muted, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f).padding(start = 2.dp))
+                            Box(
+                                Modifier.heightIn(min = 40.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .iosPressScale(0.94f) { showStickerDrawer = false }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("收起", color = c.accent, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                        if (enabledPacks.size > 1) {
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                items(enabledPacks.size, key = { idx -> enabledPacks[idx].optString("id", "pack_$idx") }) { idx ->
+                                    val p = enabledPacks[idx]
+                                    val isSel = idx == safePackIdx
+                                    Text(
+                                        p.optString("name", p.optString("id", "贴纸包")),
+                                        Modifier.clip(RoundedCornerShape(10.dp))
+                                            .background(if (isSel) c.accent else c.surface)
+                                            .iosPressScale(0.95f) { selectedPackIdx = idx }
+                                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                                        color = if (isSel) Color.White else c.ink,
+                                        fontSize = 11.5.sp,
+                                        fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium
+                                    )
+                                }
+                            }
                         }
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            items(stickers) { st ->
+                            items(stickers, key = { st -> "${packId}_${st.optString("code").ifBlank { st.optString("file") }}" }) { st ->
                                 val fname = st.optString("file")
+                                val scode = st.optString("code").ifBlank { fname.substringBeforeLast('.') }
                                 val slabel = st.optString("label", fname)
                                 val url = st.optString("url", "/stickers/$packId/$fname")
                                 Column(
@@ -174,7 +264,7 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                                         .background(c.surface)
                                         .iosPressScale(0.93f) {
                                             showStickerDrawer = false
-                                            model.sendQuickPrompt("[表情: $slabel]")
+                                            model.sendSticker(scode, url)
                                         }
                                         .padding(6.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -188,13 +278,18 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                 }
 
                 // 4. Stop Pill when typing while Bot is busy
-                AnimatedVisibility(visible = executing && hasDraft) {
+                AnimatedVisibility(
+                    visible = executing && hasDraft,
+                    enter = fadeIn(tween(110)),
+                    exit = fadeOut(tween(90))
+                ) {
                     Row(Modifier.fillMaxWidth().padding(bottom = 6.dp), horizontalArrangement = Arrangement.End) {
                         Row(
-                            Modifier.clip(CircleShape)
+                            Modifier.heightIn(min = 38.dp)
+                                .clip(CircleShape)
                                 .background(c.warn.copy(alpha = 0.14f))
-                                .clickable { model.stop() }
-                                .padding(horizontal = 12.dp, vertical = 4.5.dp),
+                                .iosPressScale(0.94f) { model.stop() }
+                                .padding(horizontal = 13.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Box(Modifier.size(7.dp).clip(RoundedCornerShape(2.dp)).background(c.warn))
@@ -206,8 +301,8 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                 // 5. Modern Attachment Carousel (Thumbnails, File Badges, Per-Item Progress & Single Remove)
                 AnimatedVisibility(
                     visible = s.attachments.isNotEmpty() || s.pendingUploads.isNotEmpty(),
-                    enter = expandVertically(spring(dampingRatio = 0.80f, stiffness = 420f)) + fadeIn(),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 460f)) + fadeOut()
+                    enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                    exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
                 ) {
                     ModernAttachmentStrip(
                         attachments = s.attachments,
@@ -221,46 +316,11 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                     )
                 }
 
-                // 5b. Inline Modern Attachment Source Picker (Photos vs Documents)
-                AnimatedVisibility(
-                    visible = showAttachPicker,
-                    enter = expandVertically(spring(dampingRatio = 0.78f, stiffness = 430f)) + fadeIn(),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 460f)) + fadeOut()
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        ModernAttachSourceButton(
-                            icon = "image",
-                            title = "相册照片",
-                            subtitle = "多图直传 · 原图预览",
-                            tint = Color(0xFF0A84FF),
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                showAttachPicker = false
-                                model.chooseMediaGallery()
-                            }
-                        )
-                        ModernAttachSourceButton(
-                            icon = "file",
-                            title = "浏览文件",
-                            subtitle = "PDF / 文档 / 代码多选",
-                            tint = Color(0xFF5E5CE6),
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                showAttachPicker = false
-                                model.chooseDocuments()
-                            }
-                        )
-                    }
-                }
-
                 // 6. Telegram-Style Edit Message Bar (Spring Animated)
                 AnimatedVisibility(
                     visible = s.editingMessage != null,
-                    enter = expandVertically(spring(dampingRatio = 0.78f, stiffness = 420f)) + fadeIn(),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 460f)) + fadeOut()
+                    enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                    exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
                 ) {
                     val editing = s.editingMessage
                     if (editing != null) {
@@ -298,8 +358,8 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                 // 7. Telegram-Style Quote Reply Bar (Spring Animated)
                 AnimatedVisibility(
                     visible = s.reply != null,
-                    enter = expandVertically(spring(dampingRatio = 0.78f, stiffness = 420f)) + fadeIn(),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 460f)) + fadeOut()
+                    enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                    exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
                 ) {
                     val quote = s.reply
                     if (quote != null) {
@@ -343,7 +403,7 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                 // 7.5. OpenCode / Grok Bot Style `/` Slash Command Autocomplete Popup
                 val slashQuery = remember(s.draft) {
                     val trimmed = s.draft.trimStart()
-                    if (trimmed.startsWith("/") && !trimmed.contains('\n') && !trimmed.contains(' ')) {
+                    if (trimmed.startsWith("/") && !trimmed.contains('\n') && trimmed.length <= 28) {
                         trimmed.lowercase()
                     } else null
                 }
@@ -352,16 +412,22 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                     else listOf(
                         Triple("/goal ", "深度目标闭环…", "开启长程死磕模式：自动拆解并持续执行直至目标 100% 完成"),
                         Triple("/compact", "压缩上下文", "归档较早对话至记忆库与 FTS5，释放 Token 窗口"),
+                        Triple("/memory reorganize", "深度整理记忆", "瞬发 8 阶段全自动整理子任务，可点进二级页看进度"),
+                        Triple("/memory rollback", "回滚记忆整理", "一键还原到最近一次整理前快照"),
+                        Triple("/memory gardener", "记忆园丁维护", "清理过期临时事实、合并重复并滚卷时间金字塔"),
+                        Triple("/subtasks", "查看子任务状态", "列出当前并发运行与近期的子任务及报错"),
                         Triple("/mcp", "MCP 与工具矩阵", "查看已挂载的 MCP 扩展工具、技能包与跨端工具"),
-                        Triple("/memory", "记忆库概览", "查看 Zettelkasten 记忆库索引与个人印象档案"),
-                        Triple("/models", "查看或切换模型", "列出可用大模型，或用 /model <ID> 切换模型"),
+                        Triple("/memory", "记忆库概览", "查看长期记忆库索引与个人印象档案"),
+                        Triple("/models", "查看可用模型", "列出当前配置的所有可用大模型"),
+                        Triple("/model ", "切换指定模型…", "填入 /model 前缀以输入目标模型 ID"),
                         Triple("/sessions", "多端会话与工作区", "查看四端 Bot 房间及 Windows DSH 工作区会话"),
                         Triple("/undo", "撤销上一轮对话", "撤回当前房间最后一轮问答（可用 /redo 恢复）"),
                         Triple("/redo", "重做已撤销对话", "恢复最近一次通过 /undo 撤回的问答"),
                         Triple("/status", "上下文与缓存状态", "查看 Token 预算、Prefix KV 缓存命中率与在线状态"),
                         Triple("/doctor", "Harness 通道自检", "诊断多模态视觉、图片通道、记忆库与跨端桥接"),
-                        Triple("/pins", "查看置顶记忆", "查看全部 📌 置顶记忆（或用 /pin <内容> 新增）"),
+                        Triple("/pins", "查看置顶记忆", "查看全部置顶记忆（或用 /pin <内容> 新增）"),
                         Triple("/pin ", "新增置顶记忆…", "填入 /pin 前缀以输入要永久钉住的规则"),
+                        Triple("/unpin ", "移除置顶记忆…", "填入 /unpin 前缀以指定关键词或 ID 移除"),
                         Triple("/clear", "归档并清空当前屏", "将当前房间历史归档至 FTS5 并开启新上下文"),
                         Triple("/share", "导出当前对话", "将当前房间对话导出为工作区 Markdown 文件"),
                         Triple("/help", "斜杠指令帮助", "显示所有支持的 Harness / 快捷指令大全")
@@ -373,8 +439,8 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                 }
                 AnimatedVisibility(
                     visible = slashSuggestions.isNotEmpty(),
-                    enter = expandVertically(spring(dampingRatio = 0.80f, stiffness = 420f)) + fadeIn(tween(140)),
-                    exit = shrinkVertically(spring(dampingRatio = 0.85f, stiffness = 460f)) + fadeOut(tween(110))
+                    enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(140)),
+                    exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
                 ) {
                     Column(
                         Modifier.fillMaxWidth()
@@ -394,8 +460,12 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                                     .clickable {
                                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                         if (cmd.endsWith(" ")) {
+                                            textFieldVal = TextFieldValue(cmd, TextRange(cmd.length))
                                             model.setDraft(cmd)
+                                        } else if (cmd == "/clear") {
+                                            confirmClearRoom = true
                                         } else {
+                                            textFieldVal = TextFieldValue("", TextRange(0))
                                             model.setDraft("")
                                             model.sendQuickPrompt(cmd)
                                         }
@@ -432,47 +502,37 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                     }
                 }
 
-                // 8. Main Telegram iOS Composer Row: [📎 Attach] + [Input Capsule with Sticker Button] + [Morphing Send/Stop Circle]
+                // 8. Clean Apple-HIG Composer Row: [Unified + Trigger] + [Input Capsule with Sticker Button] + [Morphing Send/Stop Circle]
                 Row(
                     Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.Bottom,
                     horizontalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
-                    // Left 1: Modern Attach Toggle Pill (Opens Photo / File Split Tray)
+                    val plusActive = showPlusHub || s.menu != null
+                    val plusRot by animateFloatAsState(
+                        targetValue = if (showPlusHub) 45f else 0f,
+                        animationSpec = iosInteractiveSpring(reduceMotion),
+                        label = "plus_rot"
+                    )
                     Box(
-                        Modifier.padding(bottom = 2.dp)
-                            .size(35.dp)
+                        Modifier.padding(bottom = 1.dp)
+                            .size(40.dp)
                             .clip(CircleShape)
-                            .background(if (showAttachPicker) c.accent.copy(alpha = 0.16f) else c.fill.copy(alpha = 0.82f))
+                            .background(if (plusActive) c.accent.copy(alpha = 0.16f) else c.fill.copy(alpha = 0.82f))
                             .iosPressScale(0.92f) {
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 focus.clearFocus()
-                                showComposerTray = false
                                 showStickerDrawer = false
-                                showAttachPicker = !showAttachPicker
+                                showPlusHub = !showPlusHub
                             }
-                            .semantics { contentDescription = "发送图片或附件" },
+                            .semantics { contentDescription = "附件与工作台工具" },
                         contentAlignment = Alignment.Center
                     ) {
-                        PulseIcon("attach", if (showAttachPicker) c.accent else c.muted, Modifier.size(18.5.dp))
-                    }
-
-                    // Left 2: Workspace / Action Sheet Button
-                    Box(
-                        Modifier.padding(bottom = 2.dp)
-                            .size(35.dp)
-                            .clip(CircleShape)
-                            .background(if (showComposerTray) c.accent.copy(alpha = 0.16f) else c.fill.copy(alpha = 0.82f))
-                            .iosPressScale(0.92f) {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                focus.clearFocus()
-                                showAttachPicker = false
-                                model.actionsMenu()
-                            }
-                            .semantics { contentDescription = "工作台与工具" },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        PulseIcon("plus", if (showComposerTray) c.accent else c.muted, Modifier.size(19.dp))
+                        PulseIcon(
+                            "plus",
+                            if (plusActive) c.accent else c.muted,
+                            Modifier.size(19.dp).graphicsLayer { rotationZ = plusRot }
+                        )
                     }
 
                     // Center: Telegram Rounded Input Capsule + Embedded Sticker Icon
@@ -481,15 +541,20 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                             .clip(RoundedCornerShape(20.dp))
                             .background(c.fill.copy(alpha = 0.88f))
                             .border(0.5.dp, c.line.copy(alpha = 0.55f), RoundedCornerShape(20.dp))
-                            .padding(start = 13.dp, end = 6.dp, top = 5.dp, bottom = 5.dp),
+                            .padding(start = 13.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
                         verticalAlignment = Alignment.Bottom
                     ) {
                         BasicTextField(
-                            s.draft,
-                            { if (it.length <= 12000) model.setDraft(it) },
+                            value = textFieldVal,
+                            onValueChange = { next ->
+                                if (next.text.length <= 12000) {
+                                    textFieldVal = next
+                                    model.setDraft(next.text)
+                                }
+                            },
                             Modifier.weight(1f)
                                 .heightIn(min = 28.dp, max = 128.dp)
-                                .padding(vertical = 3.dp, horizontal = 2.dp)
+                                .padding(vertical = 4.dp, horizontal = 2.dp)
                                 .focusRequester(requester)
                                 .semantics { contentDescription = "聊天消息" },
                             textStyle = TextStyle(color = c.ink, fontSize = 16.sp, lineHeight = 21.sp),
@@ -505,13 +570,13 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                         )
                         if (enabledPack != null) {
                             Box(
-                                Modifier.padding(bottom = 1.dp, end = 2.dp)
-                                    .size(28.dp)
+                                Modifier.size(34.dp)
                                     .clip(CircleShape)
                                     .iosPressScale(0.90f) {
                                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                         showStickerDrawer = !showStickerDrawer
-                                    },
+                                    }
+                                    .semantics { contentDescription = "表情贴纸面板" },
                                 contentAlignment = Alignment.Center
                             ) {
                                 PulseIcon(
@@ -524,7 +589,6 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                     }
 
                     // Right: Telegram Circular Send / Stop Button with Spring Morph Animation
-                    val reduceMotion = LocalReduceMotion.current
                     val showStopOnly = executing && !hasDraft
                     val buttonEnabled = (!s.uploading && hasDraft) || showStopOnly
                     val btnScale by animateFloatAsState(
@@ -538,12 +602,12 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                             buttonEnabled -> c.accent
                             else -> c.fill
                         },
-                        animationSpec = tween(150),
+                        animationSpec = if (reduceMotion) snap() else tween(150),
                         label = "send_btn_color"
                     )
                     Box(
                         Modifier.padding(bottom = 1.dp)
-                            .size(38.dp)
+                            .size(40.dp)
                             .graphicsLayer {
                                 scaleX = btnScale
                                 scaleY = btnScale
@@ -565,8 +629,8 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                                 if (reduceMotion) {
                                     fadeIn(tween(100)) togetherWith fadeOut(tween(80))
                                 } else {
-                                    (scaleIn(initialScale = 0.82f, animationSpec = spring(0.75f, 520f)) + fadeIn(tween(120))) togetherWith
-                                        (scaleOut(targetScale = 0.82f) + fadeOut(tween(90)))
+                                    (scaleIn(initialScale = 0.90f, animationSpec = iosInteractiveSpring()) + fadeIn(tween(120))) togetherWith
+                                        (scaleOut(targetScale = 0.90f) + fadeOut(tween(90)))
                                 }
                             },
                             label = "send_stop_glyph"
@@ -587,6 +651,32 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
         }
     }
 
+    if (confirmClearRoom) {
+        AlertDialog(
+            onDismissRequest = { confirmClearRoom = false },
+            containerColor = c.surface,
+            titleContentColor = c.ink,
+            textContentColor = c.muted,
+            title = { Text("归档并清空当前屏？", fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold) },
+            text = { Text("当前房间历史将被归档至记忆库 FTS5 并开启空白上下文，确定执行吗？", fontSize = 13.5.sp) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmClearRoom = false
+                    textFieldVal = TextFieldValue("", TextRange(0))
+                    model.setDraft("")
+                    model.sendQuickPrompt("/clear")
+                }) {
+                    Text("确定清空", color = c.warn)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClearRoom = false }) {
+                    Text("取消", color = c.accent)
+                }
+            }
+        )
+    }
+
     val activePreview = previewThumb
     if (activePreview != null) {
         Dialog(onDismissRequest = { previewThumb = null }) {
@@ -601,335 +691,26 @@ internal fun NativeComposer(model: NativePulseModel, bot: PulseBot, onHeight: (I
                 Image(
                     bitmap = activePreview,
                     contentDescription = "附件预览",
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp).clip(RoundedCornerShape(12.dp)),
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp).clip(RoundedCornerShape(8.dp)),
                     contentScale = ContentScale.Fit
                 )
                 Box(
                     Modifier.align(Alignment.TopEnd)
-                        .padding(6.dp)
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(Color.Black.copy(alpha = 0.55f))
-                        .clickable { previewThumb = null },
+                        .size(40.dp)
+                        .iosPressScale(0.90f) { previewThumb = null }
+                        .semantics { contentDescription = "关闭附件预览" },
                     contentAlignment = Alignment.Center
                 ) {
-                    PulseIcon("close", Color.White, Modifier.size(14.dp))
-                }
-            }
-        }
-    }
-}
-
-private fun formatCompactBytes(bytes: Long): String {
-    if (bytes <= 0L) return ""
-    return when {
-        bytes < 1024L -> "${bytes} B"
-        bytes < 1024L * 1024L -> "${(bytes / 1024.0).roundToInt()} KB"
-        else -> String.format(java.util.Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
-    }
-}
-
-private fun extBadgeStyle(name: String): Pair<String, Color> {
-    val ext = name.substringAfterLast('.', "").uppercase(java.util.Locale.ROOT).take(4)
-    val label = ext.ifBlank { "FILE" }
-    val color = when (ext) {
-        "PDF" -> Color(0xFFFF453A)
-        "ZIP", "RAR", "7Z", "GZ", "TAR" -> Color(0xFFFF9F0A)
-        "PY", "KT", "JS", "TS", "MJS", "JAVA", "JSON", "YML", "YAML", "MD" -> Color(0xFF5E5CE6)
-        "XLS", "XLSX", "CSV" -> Color(0xFF30D158)
-        "DOC", "DOCX", "TXT", "RTF" -> Color(0xFF0A84FF)
-        else -> Color(0xFF8E8E93)
-    }
-    return label to color
-}
-
-@Composable
-private fun ModernAttachSourceButton(
-    icon: String,
-    title: String,
-    subtitle: String,
-    tint: Color,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    val c = LocalPulsePalette.current
-    Row(
-        modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(c.fill.copy(alpha = 0.88f))
-            .border(0.6.dp, c.line.copy(alpha = 0.65f), RoundedCornerShape(14.dp))
-            .iosPressScale(0.96f, onClick = onClick)
-            .padding(horizontal = 11.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(9.dp)
-    ) {
-        Box(
-            Modifier.size(32.dp)
-                .clip(RoundedCornerShape(9.dp))
-                .background(tint.copy(alpha = 0.14f)),
-            contentAlignment = Alignment.Center
-        ) {
-            PulseIcon(icon, tint, Modifier.size(17.dp))
-        }
-        Column(Modifier.weight(1f)) {
-            Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.ink, maxLines = 1)
-            Text(subtitle, fontSize = 10.5.sp, color = c.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-    }
-}
-
-@Composable
-private fun ModernAttachmentStrip(
-    attachments: List<PulseAttachment>,
-    pendingUploads: List<PulsePendingUpload>,
-    attachmentThumbs: Map<String, ImageBitmap>,
-    onPreviewThumb: (ImageBitmap) -> Unit,
-    onRemoveAttachment: (PulseAttachment) -> Unit,
-    onRetryPending: (String) -> Unit,
-    onDismissPending: (String) -> Unit,
-    onClearAll: () -> Unit
-) {
-    val c = LocalPulsePalette.current
-    val totalCount = attachments.size + pendingUploads.size
-    Column(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-        LazyRow(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            items(pendingUploads, key = { "p_${it.id}" }) { item ->
-                if (item.isImage) {
-                    AttachmentImageTile(
-                        name = item.name,
-                        thumb = item.thumb,
-                        uploading = item.error.isEmpty(),
-                        progress = item.progress,
-                        error = item.error,
-                        onClick = {
-                            if (item.error.isNotEmpty()) onRetryPending(item.id)
-                            else item.thumb?.let(onPreviewThumb)
-                        },
-                        onRemove = { onDismissPending(item.id) }
-                    )
-                } else {
-                    AttachmentFileTile(
-                        name = item.name,
-                        bytes = item.bytes,
-                        uploading = item.error.isEmpty(),
-                        progress = item.progress,
-                        error = item.error,
-                        onClick = { if (item.error.isNotEmpty()) onRetryPending(item.id) },
-                        onRemove = { onDismissPending(item.id) }
-                    )
-                }
-            }
-            items(attachments, key = { "a_${it.source}_${it.path}" }) { att ->
-                val isImg = CloudFiles.isImageFilename(att.name) || attachmentThumbs.containsKey(att.path)
-                val thumb = attachmentThumbs[att.path]
-                if (isImg) {
-                    AttachmentImageTile(
-                        name = att.name,
-                        thumb = thumb,
-                        uploading = false,
-                        progress = 1f,
-                        error = "",
-                        onClick = { thumb?.let(onPreviewThumb) },
-                        onRemove = { onRemoveAttachment(att) }
-                    )
-                } else {
-                    AttachmentFileTile(
-                        name = att.name,
-                        bytes = att.bytes,
-                        uploading = false,
-                        progress = 1f,
-                        error = "",
-                        onClick = {},
-                        onRemove = { onRemoveAttachment(att) }
-                    )
-                }
-            }
-            if (totalCount >= 2 && pendingUploads.none { it.error.isEmpty() }) {
-                item(key = "clear_all_chip") {
-                    Column(
-                        Modifier.height(64.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(c.fill.copy(alpha = 0.70f))
-                            .border(0.6.dp, c.line.copy(alpha = 0.6f), RoundedCornerShape(14.dp))
-                            .iosPressScale(0.95f, onClick = onClearAll)
-                            .padding(horizontal = 12.dp),
-                        verticalArrangement = Arrangement.Center,
-                        horizontalAlignment = Alignment.CenterHorizontally
+                    Box(
+                        Modifier.size(28.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.55f)),
+                        contentAlignment = Alignment.Center
                     ) {
-                        PulseIcon("broom", c.muted, Modifier.size(16.dp))
-                        Text("全清", Modifier.padding(top = 3.dp), fontSize = 11.sp, color = c.muted, fontWeight = FontWeight.Medium)
+                        PulseIcon("close", Color.White, Modifier.size(14.dp))
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun AttachmentImageTile(
-    name: String,
-    thumb: ImageBitmap?,
-    uploading: Boolean,
-    progress: Float,
-    error: String,
-    onClick: () -> Unit,
-    onRemove: () -> Unit
-) {
-    val c = LocalPulsePalette.current
-    val smoothProgress by animateFloatAsState(
-        targetValue = progress.coerceIn(0f, 1f),
-        animationSpec = tween(160),
-        label = "img_upload_progress"
-    )
-    val borderColor = if (error.isNotEmpty()) c.warn.copy(alpha = 0.85f) else c.line.copy(alpha = 0.75f)
-    Box(
-        Modifier.size(64.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(c.fill)
-            .border(0.8.dp, borderColor, RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick)
-    ) {
-        if (thumb != null) {
-            Image(
-                bitmap = thumb,
-                contentDescription = name,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop
-            )
-        } else {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                PulseIcon("image", c.accent, Modifier.size(22.dp))
-            }
-        }
-        if (uploading) {
-            Box(
-                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)),
-                contentAlignment = Alignment.Center
-            ) {
-                CircularProgressIndicator(
-                    progress = { smoothProgress },
-                    modifier = Modifier.size(26.dp),
-                    color = Color.White,
-                    trackColor = Color.White.copy(alpha = 0.25f),
-                    strokeWidth = 2.4.dp
-                )
-                Text(
-                    "${(smoothProgress * 100).roundToInt()}%",
-                    color = Color.White,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        } else if (error.isNotEmpty()) {
-            Box(
-                Modifier.fillMaxSize().background(c.warn.copy(alpha = 0.35f)),
-                contentAlignment = Alignment.Center
-            ) {
-                PulseIcon("refresh", Color.White, Modifier.size(20.dp))
-            }
-        }
-        Box(
-            Modifier.align(Alignment.TopEnd)
-                .padding(3.dp)
-                .size(18.dp)
-                .clip(CircleShape)
-                .background(Color.Black.copy(alpha = 0.62f))
-                .clickable(onClick = onRemove),
-            contentAlignment = Alignment.Center
-        ) {
-            PulseIcon("close", Color.White, Modifier.size(10.dp))
-        }
-    }
-}
-
-@Composable
-private fun AttachmentFileTile(
-    name: String,
-    bytes: Long,
-    uploading: Boolean,
-    progress: Float,
-    error: String,
-    onClick: () -> Unit,
-    onRemove: () -> Unit
-) {
-    val c = LocalPulsePalette.current
-    val (extLabel, extColor) = remember(name) { extBadgeStyle(name) }
-    val smoothProgress by animateFloatAsState(
-        targetValue = progress.coerceIn(0f, 1f),
-        animationSpec = tween(160),
-        label = "file_upload_progress"
-    )
-    val sizeTxt = remember(bytes) { formatCompactBytes(bytes) }
-    val subTxt = when {
-        error.isNotEmpty() -> "上传失败 · 点击重试"
-        uploading -> if (sizeTxt.isNotEmpty()) "${(smoothProgress * 100).roundToInt()}% · $sizeTxt" else "正在上传 ${(smoothProgress * 100).roundToInt()}%"
-        sizeTxt.isNotEmpty() -> "$sizeTxt · 已就绪"
-        else -> "已就绪"
-    }
-    Box(
-        Modifier.widthIn(min = 152.dp, max = 204.dp)
-            .height(64.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(if (error.isNotEmpty()) c.warn.copy(alpha = 0.08f) else c.fill.copy(alpha = 0.92f))
-            .border(0.8.dp, if (error.isNotEmpty()) c.warn.copy(alpha = 0.65f) else c.line.copy(alpha = 0.72f), RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick)
-    ) {
-        Row(
-            Modifier.fillMaxSize().padding(start = 9.dp, end = 24.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(9.dp)
-        ) {
-            Box(
-                Modifier.size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(extColor.copy(alpha = 0.16f)),
-                contentAlignment = Alignment.Center
-            ) {
-                if (error.isNotEmpty()) {
-                    PulseIcon("refresh", c.warn, Modifier.size(16.dp))
-                } else {
-                    Text(extLabel, color = extColor, fontSize = 10.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-                }
-            }
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
-                Text(name, color = c.ink, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(
-                    subTxt,
-                    color = if (error.isNotEmpty()) c.warn else c.muted,
-                    fontSize = 10.5.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
-        if (uploading) {
-            Box(
-                Modifier.align(Alignment.BottomStart)
-                    .fillMaxWidth()
-                    .height(2.5.dp)
-                    .background(c.line.copy(alpha = 0.35f))
-            ) {
-                Box(
-                    Modifier.fillMaxHeight()
-                        .fillMaxWidth(smoothProgress)
-                        .background(c.accent)
-                )
-            }
-        }
-        Box(
-            Modifier.align(Alignment.TopEnd)
-                .padding(4.dp)
-                .size(18.dp)
-                .clip(CircleShape)
-                .background(c.ink.copy(alpha = 0.12f))
-                .clickable(onClick = onRemove),
-            contentAlignment = Alignment.Center
-        ) {
-            PulseIcon("close", c.muted, Modifier.size(10.dp))
         }
     }
 }

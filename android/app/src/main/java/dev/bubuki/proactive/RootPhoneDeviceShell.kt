@@ -52,23 +52,20 @@ internal fun RootPhoneHarness.buildDeviceInfo(base: Context): JSONObject {
     runCatching {
         val cm = base.getSystemService(android.net.ConnectivityManager::class.java)
         val activeCaps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
-        val allCaps = runCatching {
-            cm?.allNetworks?.mapNotNull { cm.getNetworkCapabilities(it) }.orEmpty()
-        }.getOrDefault(emptyList())
-        val hasWifi = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true ||
-            allCaps.any { it.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) && it.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) }
-        val hasCellular = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true ||
-            allCaps.any { it.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) && it.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) }
-        val hasVpn = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true ||
-            allCaps.any { it.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) }
+        val hasWifi = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+        val hasCellular = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true
+        val hasVpn = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+        val connected = activeCaps != null && (
+            activeCaps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) || hasWifi || hasCellular
+            )
         val netType = when {
-            activeCaps == null && allCaps.isEmpty() -> "none"
+            activeCaps == null -> "none"
             hasWifi -> "wifi"
             hasCellular -> "cellular"
             else -> "other"
         }
         out.put("network", JSONObject()
-            .put("connected", activeCaps != null || allCaps.isNotEmpty())
+            .put("connected", connected)
             .put("type", netType)
             .put("vpn", hasVpn)
         )
@@ -98,43 +95,257 @@ internal fun RootPhoneHarness.buildDeviceInfo(base: Context): JSONObject {
     return out
 }
 
-private fun sandboxShellCommandToDisplay(rawCmd: String, displayId: Int): String {
+internal fun splitShellSegments(rawCmd: String): List<Pair<String, String>> {
+    val out = ArrayList<Pair<String, String>>()
+    var start = 0
+    var i = 0
+    var inSingle = false
+    var inDouble = false
+    var escaped = false
+    val len = rawCmd.length
+    while (i < len) {
+        val ch = rawCmd[i]
+        if (inSingle) {
+            if (ch == '\'') inSingle = false
+            i++
+            continue
+        }
+        if (escaped) {
+            escaped = false
+            i++
+            continue
+        }
+        if (ch == '\\') {
+            escaped = true
+            i++
+            continue
+        }
+        if (ch == '"') {
+            inDouble = !inDouble
+            i++
+            continue
+        }
+        if (!inDouble && ch == '\'') {
+            inSingle = true
+            i++
+            continue
+        }
+        if (!inDouble) {
+            if (rawCmd.startsWith("&&", i) || rawCmd.startsWith("||", i)) {
+                out.add(rawCmd.substring(start, i) to rawCmd.substring(i, i + 2))
+                i += 2
+                start = i
+                continue
+            }
+            if (ch == ';' || ch == '|' || ch == '\n') {
+                out.add(rawCmd.substring(start, i) to ch.toString())
+                i += 1
+                start = i
+                continue
+            }
+        }
+        i++
+    }
+    if (start <= len) {
+        out.add(rawCmd.substring(start) to "")
+    }
+    return out
+}
+
+internal fun stripQuotedStrings(segment: String): String {
+    val sb = StringBuilder(segment.length)
+    var i = 0
+    var inSingle = false
+    var inDouble = false
+    var escaped = false
+    while (i < segment.length) {
+        val ch = segment[i]
+        if (inSingle) {
+            if (ch == '\'') {
+                inSingle = false
+                sb.append('\'')
+            }
+            i++
+            continue
+        }
+        if (escaped) {
+            escaped = false
+            sb.append(' ')
+            i++
+            continue
+        }
+        if (ch == '\\') {
+            escaped = true
+            i++
+            continue
+        }
+        if (ch == '"') {
+            inDouble = !inDouble
+            sb.append('"')
+            i++
+            continue
+        }
+        if (inDouble) {
+            i++
+            continue
+        }
+        if (ch == '\'') {
+            inSingle = true
+            sb.append('\'')
+            i++
+            continue
+        }
+        sb.append(ch)
+        i++
+    }
+    return sb.toString()
+}
+
+private fun findShellCommandStart(segment: String): Int {
+    var i = 0
+    val len = segment.length
+    while (i < len) {
+        while (i < len && segment[i].isWhitespace()) i++
+        if (i >= len) break
+        val tokStart = i
+        var seenEq = false
+        var validVarPrefix = true
+        var inSingle = false
+        var inDouble = false
+        var escaped = false
+        while (i < len) {
+            val ch = segment[i]
+            if (inSingle) {
+                if (ch == '\'') inSingle = false
+                i++
+                continue
+            }
+            if (escaped) {
+                escaped = false
+                i++
+                continue
+            }
+            if (ch == '\\') {
+                escaped = true
+                i++
+                continue
+            }
+            if (ch == '"') {
+                inDouble = !inDouble
+                if (!seenEq) validVarPrefix = false
+                i++
+                continue
+            }
+            if (!inDouble && ch == '\'') {
+                inSingle = true
+                if (!seenEq) validVarPrefix = false
+                i++
+                continue
+            }
+            if (!inDouble && ch.isWhitespace()) break
+            if (!seenEq) {
+                if (ch == '=') {
+                    val namePart = segment.substring(tokStart, i)
+                    validVarPrefix = namePart.isNotEmpty() &&
+                        (namePart[0].isLetter() || namePart[0] == '_') &&
+                        namePart.all { it.isLetterOrDigit() || it == '_' }
+                    seenEq = true
+                } else if (!(ch.isLetterOrDigit() || ch == '_')) {
+                    validVarPrefix = false
+                }
+            }
+            i++
+        }
+        if (seenEq && validVarPrefix) continue
+        return tokStart
+    }
+    return len
+}
+
+private val RE_GLOBAL_SETTINGS_MUTATION = Regex(
+    """\bcmd\s+uimode\b|\bservice\s+call\s+uimode\b|\bsettings\b(?:\s+--user\s+\S+)?\s+put\s+(?:system|secure|global)\s+(?:ui_night_mode|screen_brightness|screen_off_timeout|font_scale|user_rotation|accelerometer_rotation|default_input_method|enabled_input_methods)\b""",
+    RegexOption.IGNORE_CASE
+)
+private val RE_MONKEY_CMD = Regex("""(?:^|\s)(?:/[^\s/]+/)?monkey(?=\s|$)""", RegexOption.IGNORE_CASE)
+private val RE_DISPLAY_ZERO_FLAG = Regex(
+    """(?:^|\s)(?:--display(?:=|\s+)|--display-id(?:=|\s+)|-d\s*)0(?=\s|$)""",
+    RegexOption.IGNORE_CASE
+)
+private val RE_WM_MUTATION = Regex("""\bwm\s+(?:size|density|overscan|user-rotation)\b""", RegexOption.IGNORE_CASE)
+private val RE_HAS_MINUS_D = Regex("""(?:^|\s)-d\s*\d+(?=\s|$)""")
+private val RE_HAS_DISPLAY_FLAG = Regex("""(?:^|\s)(?:--display(?:=|\s+)|--display-id(?:=|\s+))\d+(?=\s|$)""", RegexOption.IGNORE_CASE)
+private val RE_HEAD_INPUT = Regex("""^((?:/[^\s/]+/)?input\s+)""")
+private val RE_HEAD_AM_START = Regex("""^((?:/[^\s/]+/)?am\s+start(?:-activity)?\s+)""")
+private val RE_HEAD_CMD_START = Regex("""^((?:/[^\s/]+/)?cmd\s+activity\s+start(?:-activity)?\s+)""")
+private val RE_HEAD_SCREENCAP = Regex("""^((?:/[^\s/]+/)?screencap)(?=\s|$)""")
+
+internal fun validateShellCommandSandbox(cmdStr: String, waitingForeground: Boolean, currentDisp: Int) {
+    for ((seg, _) in splitShellSegments(cmdStr)) {
+        val unquoted = stripQuotedStrings(seg)
+        if (RE_GLOBAL_SETTINGS_MUTATION.containsMatchIn(unquoted)) {
+            throw Exception("安全沙箱已拦截全局系统设置修改指令（严禁修改主屏深浅色 Night mode、亮度、字体缩放或输入法等系统全局设置）")
+        }
+        if (!waitingForeground) {
+            if (RE_MONKEY_CMD.containsMatchIn(unquoted)) {
+                throw Exception("安全沙箱已拦截 monkey 指令（monkey 会直接操作主屏幕 Display 0），请改用 phone_workspace(op=\"open\") 或 am start")
+            }
+            if (RE_DISPLAY_ZERO_FLAG.containsMatchIn(unquoted)) {
+                throw Exception("安全沙箱已拦截指向主屏幕 (Display 0) 的指令，严禁在未接管状态下操作或启动应用到 Display 0")
+            }
+            if (currentDisp > 0 && RE_WM_MUTATION.containsMatchIn(unquoted) &&
+                !Regex("""(?:^|\s)-d\s*${currentDisp}(?=\s|$)""").containsMatchIn(unquoted)
+            ) {
+                throw Exception("安全沙箱已拦截未绑定虚拟屏 (-d $currentDisp) 的 wm 显示参数修改指令，禁止修改主屏幕分辨率/DPI")
+            }
+        }
+    }
+}
+
+internal fun sandboxShellCommandToDisplay(rawCmd: String, displayId: Int): String {
     if (displayId <= 0) return rawCmd
-    var s = rawCmd
-    if (Regex("""\binput\b""").containsMatchIn(s) && !Regex("""\binput\b[^;|&\n]*?\s-d\s+\d+""").containsMatchIn(s)) {
-        s = Regex("""\binput\s+""").replace(s, "input -d $displayId ")
+    val sb = StringBuilder(rawCmd.length + 32)
+    for ((seg, delim) in splitShellSegments(rawCmd)) {
+        val cmdStart = findShellCommandStart(seg)
+        val prefix = seg.substring(0, cmdStart)
+        var rest = seg.substring(cmdStart)
+        val unquotedRest = stripQuotedStrings(rest)
+        when {
+            RE_HEAD_INPUT.containsMatchIn(unquotedRest) && !RE_HAS_MINUS_D.containsMatchIn(unquotedRest) -> {
+                val m = RE_HEAD_INPUT.find(rest)
+                if (m != null) rest = "${m.groupValues[1]}-d $displayId ${rest.substring(m.range.last + 1)}"
+            }
+            RE_HEAD_AM_START.containsMatchIn(unquotedRest) && !RE_HAS_DISPLAY_FLAG.containsMatchIn(unquotedRest) -> {
+                val m = RE_HEAD_AM_START.find(rest)
+                if (m != null) rest = "${m.groupValues[1]}--display $displayId ${rest.substring(m.range.last + 1)}"
+            }
+            RE_HEAD_CMD_START.containsMatchIn(unquotedRest) && !RE_HAS_DISPLAY_FLAG.containsMatchIn(unquotedRest) -> {
+                val m = RE_HEAD_CMD_START.find(rest)
+                if (m != null) rest = "${m.groupValues[1]}--display $displayId ${rest.substring(m.range.last + 1)}"
+            }
+            RE_HEAD_SCREENCAP.containsMatchIn(unquotedRest) && !RE_HAS_MINUS_D.containsMatchIn(unquotedRest) -> {
+                val m = RE_HEAD_SCREENCAP.find(rest)
+                if (m != null) rest = "${m.groupValues[1]} -d $displayId${rest.substring(m.range.last + 1)}"
+            }
+        }
+        sb.append(prefix).append(rest).append(delim)
     }
-    if (Regex("""\bam\s+start\b""").containsMatchIn(s) && !Regex("""\bam\s+start\b[^;|&\n]*?\s--display\s+\d+""").containsMatchIn(s)) {
-        s = Regex("""\bam\s+start\s+""").replace(s, "am start --display $displayId ")
-    }
-    if (Regex("""\bcmd\s+activity\s+start\b""").containsMatchIn(s) && !Regex("""\bcmd\s+activity\s+start\b[^;|&\n]*?\s--display\s+\d+""").containsMatchIn(s)) {
-        s = Regex("""\bcmd\s+activity\s+start\s+""").replace(s, "cmd activity start --display $displayId ")
-    }
-    if (Regex("""\bscreencap\b""").containsMatchIn(s) && !Regex("""\bscreencap\b[^;|&\n]*?\s-d\s+\d+""").containsMatchIn(s)) {
-        s = Regex("""\bscreencap\s+""").replace(s, "screencap -d $displayId ")
-    }
-    return s
+    return sb.toString()
 }
 
 internal fun RootPhoneHarness.executeShellAction(base: Context, input: JSONObject): JSONObject {
     var cmdStr = input.optString("command", input.optString("cmd", input.optString("text", ""))).trim()
     if (cmdStr.isEmpty()) throw Exception("请提供要执行的 shell command")
     val waitingForeground = state.value.phase == "waiting_user"
-    if (Regex("""\bcmd\s+uimode\b|\bservice\s+call\s+uimode\b|\bsettings\s+put\s+(?:system|secure|global)\s+(?:ui_night_mode|screen_brightness|screen_off_timeout|font_scale|user_rotation|accelerometer_rotation|default_input_method|enabled_input_methods)\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr)) {
-        throw Exception("安全沙箱已拦截全局系统设置修改指令（严禁修改主屏深浅色 Night mode、亮度、字体缩放或输入法等系统全局设置）")
-    }
-    if (!waitingForeground && Regex("""\bmonkey\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr)) {
-        throw Exception("安全沙箱已拦截 monkey 指令（monkey 会直接操作主屏幕 Display 0），请改用 phone_workspace(op=\"open\") 或 am start")
-    }
-    if (!waitingForeground && Regex("""(?:--display|-d)\s+0\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr)) {
-        throw Exception("安全沙箱已拦截指向主屏幕 (Display 0) 的指令，严禁在未接管状态下操作或启动应用到 Display 0")
-    }
+    validateShellCommandSandbox(cmdStr, waitingForeground, currentDisp = -1)
     var dispObj = runCatching { JSONObject(state.value.display) }.getOrNull()
     var currentDisp = if (dispObj?.optBoolean("created", false) == true) dispObj.optInt("displayId", -1) else -1
-    val touchesDisplayUi = Regex(
-        """\b(input|screencap|uiautomator)\b|\bam\s+(start|display)\b|\bcmd\s+activity\s+start|\bwm\s+(size|density|overscan|user-rotation)\b""",
-        RegexOption.IGNORE_CASE
-    ).containsMatchIn(cmdStr)
+    val touchesDisplayUi = splitShellSegments(cmdStr).any { (seg, _) ->
+        val unquoted = stripQuotedStrings(seg)
+        Regex(
+            """\b(input|screencap|uiautomator)\b|\bam\s+(start|start-activity|display)\b|\bcmd\s+activity\s+(start|start-activity)|\bwm\s+(size|density|overscan|user-rotation)\b""",
+            RegexOption.IGNORE_CASE
+        ).containsMatchIn(unquoted)
+    }
     if (!waitingForeground && touchesDisplayUi && currentDisp <= 0) {
         runCatching {
             val woke = command(base, JSONObject().put("op", "create").put("skip_home", false))
@@ -160,11 +371,7 @@ internal fun RootPhoneHarness.executeShellAction(base: Context, input: JSONObjec
             .put("cwd", shellCwd)
     }
     if (!waitingForeground && currentDisp > 0) {
-        if (Regex("""\bwm\s+(size|density|overscan|user-rotation)\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr) &&
-            !Regex("""-d\s+$currentDisp\b""").containsMatchIn(cmdStr)
-        ) {
-            throw Exception("安全沙箱已拦截未绑定虚拟屏 (-d $currentDisp) 的 wm 显示参数修改指令，禁止修改主屏幕分辨率/DPI")
-        }
+        validateShellCommandSandbox(cmdStr, waitingForeground, currentDisp)
         cmdStr = sandboxShellCommandToDisplay(cmdStr, currentDisp)
     }
     val hasPriv = privilege!!.isPrivilegedReady() || runCatching {
@@ -172,25 +379,42 @@ internal fun RootPhoneHarness.executeShellAction(base: Context, input: JSONObjec
         p.optBoolean("privileged", p.optBoolean("root"))
     }.getOrDefault(false)
     if (!hasPriv) {
-        throw Exception("尚未取得 Root 或无线 ADB 特权授权，无法执行特权 shell")
+        throw Exception("尚未取得 Root、Shizuku 或无线 ADB 特权授权，无法执行特权 shell")
     }
     val safeCwd = "'" + shellCwd.replace("'", "'\\''") + "'"
     val wrappedCmd = "cd $safeCwd 2>/dev/null || cd /sdcard; $cmdStr; __pulse_ec=\$?; echo ''; echo '__PULSE_CWD__:'\$(pwd); exit \$__pulse_ec"
     val rawRes = try {
         privilege!!.execute(JSONObject().put("op", "shell").put("command", wrappedCmd))
     } catch (rpcErr: Throwable) {
-        if (privilege?.getPrivilegeMode() == "wireless_adb") throw rpcErr
+        val timedOutRpc = rpcErr.message?.contains("超时") == true ||
+            rpcErr.message?.contains("timeout", ignoreCase = true) == true
+        if (privilege?.getPrivilegeMode() != "root" || timedOutRpc) throw rpcErr
         val proc = ProcessBuilder("su", "-c", wrappedCmd).redirectErrorStream(true).start()
+        val outBuf = StringBuilder()
+        val readerThread = Thread {
+            runCatching {
+                proc.inputStream.bufferedReader().use { br ->
+                    val buf = CharArray(4096)
+                    while (true) {
+                        val n = br.read(buf)
+                        if (n <= 0) break
+                        if (outBuf.length < 32768) {
+                            outBuf.append(buf, 0, n.coerceAtMost(32768 - outBuf.length))
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; name = "pulse-su-drain"; start() }
         val finished = proc.waitFor(20, java.util.concurrent.TimeUnit.SECONDS)
         if (!finished) proc.destroyForcibly()
-        val outTxt = runCatching { proc.inputStream.bufferedReader().readText() }.getOrDefault("")
+        runCatching { readerThread.join(1000L) }
         val ec = if (finished) proc.exitValue() else 124
         JSONObject()
             .put("uid", 0)
             .put("ok", finished && ec == 0)
             .put("exit_code", ec)
             .put("timeout", !finished)
-            .put("output", outTxt)
+            .put("output", outBuf.toString())
             .put("direct_su_fallback", true)
     }
     var rawOut = rawRes.optString("output", "")
@@ -219,134 +443,292 @@ internal fun RootPhoneHarness.executeShellAction(base: Context, input: JSONObjec
     return outJson
 }
 
+private fun cleanDumpsysExtraValue(rawVal: String): String {
+    var s = rawVal.trim()
+    if (s.isEmpty() || s == "null") return ""
+    // Strip Android 10-15 dumpsys type wrappers:
+    //   String (微信)
+    //   String [length=4] (微信)
+    //   SpannableString (验证码 123456)
+    //   SpannableString [length=12] (验证码 123456)
+    //   CharSequence (...)
+    val parenMatch = Regex("""^[A-Za-z0-9_.$]+(?:\s*\[[^\]]*\])?\s*\((.*)\)$""").find(s)
+    if (parenMatch != null) {
+        s = parenMatch.groupValues[1].trim()
+    } else {
+        s = s.removePrefix("String (").removeSuffix(")").trim()
+    }
+    if (s == "null" || s == "REDACTED") return ""
+    return s
+}
+
 internal fun RootPhoneHarness.executeNotificationsAction(base: Context, input: JSONObject): JSONObject {
-    val filterQ = input.optString("app", input.optString("query", input.optString("package", ""))).trim()
+    val filterQ = input.optString(
+        "filter_app",
+        input.optString("filter_package", input.optString("app", input.optString("query", input.optString("package", ""))))
+    ).trim()
     val limit = input.optInt("limit", 25).coerceIn(1, 80)
-    fun hasPrivilegedShell(): Boolean = privilege!!.isPrivilegedReady() || runCatching {
-        val p = privilege!!.probe()
-        p.optBoolean("privileged", p.optBoolean("root"))
+    fun hasPrivilegedShell(): Boolean = privilege?.isPrivilegedReady() == true || runCatching {
+        val p = privilege?.probe()
+        p?.optBoolean("privileged", p.optBoolean("root")) == true
     }.getOrDefault(false)
-    if (!AgentNotificationListener.isConnected()) {
+
+    val privReady = hasPrivilegedShell()
+    if (!AgentNotificationListener.isConnected() && privReady) {
         runCatching {
-            if (hasPrivilegedShell()) {
-                privilege!!.execute(
-                    JSONObject()
-                        .put("op", "shell")
-                        .put("command", "cmd notification allow_listener ${base.packageName}/${base.packageName}.AgentNotificationListener")
-                )
-                Thread.sleep(180)
+            val comp = "${base.packageName}/${base.packageName}.AgentNotificationListener"
+            privilege!!.execute(
+                JSONObject()
+                    .put("op", "shell")
+                    .put("command", "cmd notification allow_listener $comp >/dev/null 2>&1")
+            )
+            if (Build.VERSION.SDK_INT >= 24) {
+                runCatching {
+                    android.service.notification.NotificationListenerService.requestRebind(
+                        android.content.ComponentName(base, AgentNotificationListener::class.java)
+                    )
+                }
+            }
+            for (step in 0 until 9) {
+                if (AgentNotificationListener.isConnected()) break
+                Thread.sleep(100)
             }
         }
     }
+
     var items = AgentNotificationListener.getRecentNotifications(base, filterQ, limit)
-    if (items.length() == 0) {
+    var sourceTag = if (AgentNotificationListener.isConnected()) "listener" else "none"
+    var dumpsysErr = ""
+
+    if (items.length() == 0 && privReady) {
         runCatching {
-            if (hasPrivilegedShell()) {
-                val dumpRes = privilege!!.execute(
+            // Focus on active Notification List section (avoid head -n 300 truncating before active records!)
+            val dumpRes = privilege!!.execute(
+                JSONObject()
+                    .put("op", "shell")
+                    .put(
+                        "command",
+                        "dumpsys notification --noredact 2>&1 | awk '/Notification List:/,/Notification History:|Zen Mode:|Snoozed notifications:/' | grep -E 'NotificationRecord\\(|pkg=|tickerText=|android\\.title=|android\\.text=|android\\.bigText=|android\\.subText=|postTime=|when=' | head -n 900"
+                    )
+            )
+            var rawOut = dumpRes.optString("output", dumpRes.optString("stdout", ""))
+            if (!rawOut.contains("NotificationRecord(")) {
+                val fallbackRes = privilege!!.execute(
                     JSONObject()
                         .put("op", "shell")
-                        .put("command", "dumpsys notification --noredact | grep -E 'NotificationRecord\\(|pkg=|android\\.title=|android\\.text=|android\\.bigText=|postTime=' | head -n 300")
+                        .put(
+                            "command",
+                            "dumpsys notification --noredact 2>&1 | grep -E 'NotificationRecord\\(|pkg=|tickerText=|android\\.title=|android\\.text=|android\\.bigText=|android\\.subText=|postTime=' | tail -n 600"
+                        )
                 )
-                val rawOut = dumpRes.optString("output", dumpRes.optString("stdout", ""))
-                val parsed = JSONArray()
-                var curPkg = ""
-                var curTitle = ""
-                var curText = ""
-                var curTs = 0L
-                fun flushRecord() {
-                    if (curPkg.isNotBlank() && curPkg != base.packageName && curPkg != "android" && curPkg != "com.android.systemui" && (curTitle.isNotBlank() || curText.isNotBlank())) {
-                        val appLabel = AgentNotificationListener.resolveAppName(base, curPkg)
-                        val hay = "$appLabel $curPkg $curTitle $curText".lowercase()
-                        if (filterQ.isBlank() || hay.contains(filterQ.lowercase())) {
-                            parsed.put(
-                                JSONObject()
-                                    .put("package", curPkg)
-                                    .put("app", appLabel)
-                                    .put("title", curTitle)
-                                    .put("text", curText)
-                                    .put("timestamp_ms", curTs)
-                                    .put("active", true)
-                            )
-                        }
-                    }
-                    curTitle = ""
-                    curText = ""
-                    curTs = 0L
-                }
-                for (line in rawOut.lineSequence()) {
-                    val s = line.trim()
-                    if (s.contains("NotificationRecord(")) {
-                        flushRecord()
-                        val m = Regex("pkg=([^\\s:]+)").find(s)
-                        curPkg = m?.groupValues?.get(1) ?: ""
-                    } else if (s.startsWith("postTime=") || s.contains("postTime=")) {
-                        val pm = Regex("postTime=(\\d+)").find(s)
-                        curTs = pm?.groupValues?.get(1)?.toLongOrNull() ?: curTs
-                    } else if (s.startsWith("android.title=")) {
-                        curTitle = s.substringAfter("android.title=").removePrefix("String (").removeSuffix(")").trim()
-                    } else if (s.startsWith("android.bigText=") && s != "android.bigText=null") {
-                        val bt = s.substringAfter("android.bigText=").removePrefix("String (").removeSuffix(")").trim()
-                        if (bt.isNotBlank() && bt != "null") curText = bt
-                    } else if (s.startsWith("android.text=") && curText.isBlank()) {
-                        val tx = s.substringAfter("android.text=").removePrefix("String (").removeSuffix(")").trim()
-                        if (tx != "null") curText = tx
-                    }
-                    if (parsed.length() >= limit) break
-                }
-                flushRecord()
-                if (parsed.length() > 0) items = parsed
+                rawOut = fallbackRes.optString("output", fallbackRes.optString("stdout", ""))
             }
+            val parsed = JSONArray()
+            var curPkg = ""
+            var curTitle = ""
+            var curText = ""
+            var curTs = 0L
+            val seenKeys = HashSet<String>()
+            fun flushRecord() {
+                if (curPkg.isNotBlank() && curPkg != base.packageName && curPkg != "android" && curPkg != "com.android.systemui" && (curTitle.isNotBlank() || curText.isNotBlank())) {
+                    val appLabel = AgentNotificationListener.resolveAppName(base, curPkg)
+                    val hay = "$appLabel $curPkg $curTitle $curText".lowercase()
+                    val dedup = "$curPkg|$curTitle|$curText"
+                    if ((filterQ.isBlank() || hay.contains(filterQ.lowercase())) && seenKeys.add(dedup)) {
+                        parsed.put(
+                            JSONObject()
+                                .put("package", curPkg)
+                                .put("app", appLabel)
+                                .put("title", curTitle)
+                                .put("text", curText)
+                                .put("timestamp_ms", if (curTs > 0L) curTs else System.currentTimeMillis())
+                                .put("active", true)
+                        )
+                    }
+                }
+                curTitle = ""
+                curText = ""
+                curTs = 0L
+            }
+            for (line in rawOut.lineSequence()) {
+                val s = line.trim()
+                when {
+                    s.contains("NotificationRecord(") -> {
+                        flushRecord()
+                        val m = Regex("""pkg=([^\s:}]+)""").find(s)
+                        curPkg = m?.groupValues?.get(1)?.trim() ?: ""
+                    }
+                    s.contains("postTime=") -> {
+                        val pm = Regex("""postTime=(\d+)""").find(s)
+                        curTs = pm?.groupValues?.get(1)?.toLongOrNull() ?: curTs
+                    }
+                    s.startsWith("android.title=") -> {
+                        curTitle = cleanDumpsysExtraValue(s.substringAfter("android.title="))
+                    }
+                    s.startsWith("android.bigText=") -> {
+                        val bt = cleanDumpsysExtraValue(s.substringAfter("android.bigText="))
+                        if (bt.isNotBlank()) curText = bt
+                    }
+                    s.startsWith("android.text=") && curText.isBlank() -> {
+                        val tx = cleanDumpsysExtraValue(s.substringAfter("android.text="))
+                        if (tx.isNotBlank()) curText = tx
+                    }
+                    s.startsWith("android.subText=") && curText.isBlank() -> {
+                        val st = cleanDumpsysExtraValue(s.substringAfter("android.subText="))
+                        if (st.isNotBlank()) curText = st
+                    }
+                    s.startsWith("tickerText=") && curText.isBlank() -> {
+                        val tk = cleanDumpsysExtraValue(s.substringAfter("tickerText="))
+                        if (tk.isNotBlank()) curText = tk
+                    }
+                }
+                if (parsed.length() >= limit) break
+            }
+            flushRecord()
+            if (parsed.length() > 0) {
+                items = parsed
+                sourceTag = "dumpsys"
+            }
+        }.onFailure { err ->
+            dumpsysErr = err.message ?: err.javaClass.simpleName
         }
     }
+
+    val listenerConnected = AgentNotificationListener.isConnected()
+    if (!listenerConnected && items.length() == 0 && !privReady) {
+        return JSONObject()
+            .put("ok", false)
+            .put("op", "notifications")
+            .put("listener_connected", false)
+            .put("count", 0)
+            .put("notifications", items)
+            .put("error", "通知监听服务未开启且未连接 Shizuku/Root 特权：请在手机系统设置 → 通知使用权 中开启「DSB 通知状态监听」")
+    }
+
     return JSONObject()
         .put("ok", true)
-        .put("listener_connected", AgentNotificationListener.isConnected())
+        .put("op", "notifications")
+        .put("source", sourceTag)
+        .put("listener_connected", listenerConnected)
+        .put("privileged", privReady)
         .put("count", items.length())
         .put("notifications", items)
+        .apply { if (dumpsysErr.isNotBlank()) put("dumpsys_warning", dumpsysErr) }
 }
 
 internal fun RootPhoneHarness.executeReadOtpAction(base: Context, input: JSONObject): JSONObject {
     val filterQ = input.optString("query", input.optString("app", "")).trim()
     val limit = input.optInt("limit", 15).coerceIn(1, 40)
     val merged = mutableListOf<JSONObject>()
-    val notifRes = executeNotificationsAction(base, JSONObject().put("query", filterQ).put("limit", 30))
+    val notifRes = executeNotificationsAction(base, JSONObject().put("query", filterQ).put("limit", 50))
     val notifArr = notifRes.optJSONArray("notifications") ?: JSONArray()
+    val noiseRe = Regex("""nekobox|matsuri|v2ray|clash|flclash|sing-?box|shadowsocks|vpn|proxy|网速|已连接|正在运行""", RegexOption.IGNORE_CASE)
     for (i in 0 until notifArr.length()) {
         val it = notifArr.optJSONObject(i) ?: continue
+        val hay = "${it.optString("package")} ${it.optString("app")} ${it.optString("title")} ${it.optString("text")}"
+        if (filterQ.isBlank() && noiseRe.containsMatchIn(hay) && !hay.contains("验证码") && !hay.contains("code", ignoreCase = true)) {
+            continue
+        }
         merged += JSONObject(it.toString()).put("channel", "notification")
     }
     val privReady = privilege?.isPrivilegedReady() == true || runCatching {
         val p = privilege?.probe()
         p?.optBoolean("privileged", p.optBoolean("root")) == true
     }.getOrDefault(false)
-    if (privReady) {
+
+    var smsGranted = base.checkSelfPermission(android.Manifest.permission.READ_SMS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    if (!smsGranted && privReady) {
+        runCatching {
+            val pkg = base.packageName
+            privilege!!.execute(
+                JSONObject()
+                    .put("op", "shell")
+                    .put("command", "pm grant $pkg android.permission.READ_SMS >/dev/null 2>&1; appops set $pkg READ_SMS allow >/dev/null 2>&1")
+            )
+            smsGranted = base.checkSelfPermission(android.Manifest.permission.READ_SMS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    var smsCount = 0
+    var smsError = ""
+    var smsSource = "none"
+
+    // 1. Primary path: Native ContentResolver (supports multi-line bodies, works with Shizuku/ADB pm grant + Root + manual grant)
+    if (smsGranted) {
+        runCatching {
+            val uri = android.provider.Telephony.Sms.Inbox.CONTENT_URI
+            val proj = arrayOf(
+                android.provider.Telephony.Sms.ADDRESS,
+                android.provider.Telephony.Sms.BODY,
+                android.provider.Telephony.Sms.DATE
+            )
+            base.contentResolver.query(uri, proj, null, null, "${android.provider.Telephony.Sms.DATE} DESC")?.use { cursor ->
+                val idxAddr = cursor.getColumnIndex(android.provider.Telephony.Sms.ADDRESS)
+                val idxBody = cursor.getColumnIndex(android.provider.Telephony.Sms.BODY)
+                val idxDate = cursor.getColumnIndex(android.provider.Telephony.Sms.DATE)
+                var scanned = 0
+                while (cursor.moveToNext() && scanned < 40) {
+                    scanned++
+                    val addr = if (idxAddr >= 0) cursor.getString(idxAddr).orEmpty().trim() else ""
+                    val body = if (idxBody >= 0) cursor.getString(idxBody).orEmpty().trim() else ""
+                    val dateVal = if (idxDate >= 0) cursor.getLong(idxDate) else 0L
+                    if (body.isBlank()) continue
+                    if (filterQ.isBlank() || "$addr $body".lowercase().contains(filterQ.lowercase())) {
+                        merged += JSONObject()
+                            .put("channel", "sms")
+                            .put("sender", addr)
+                            .put("title", addr)
+                            .put("text", body)
+                            .put("timestamp_ms", dateVal)
+                        smsCount++
+                    }
+                }
+                smsSource = "content_resolver"
+            }
+        }.onFailure { err ->
+            smsError = err.message ?: err.javaClass.simpleName
+        }
+    }
+
+    // 2. Fallback path: Privileged shell `content query` with multi-line Row chunk parsing (fixes newline/comma truncation)
+    if (smsCount == 0 && privReady) {
         runCatching {
             val smsRes = privilege!!.execute(
                 JSONObject()
                     .put("op", "shell")
-                    .put("command", "content query --uri content://sms/inbox --projection address:body:date --sort \"date DESC\" 2>/dev/null | head -n 30")
+                    .put("command", "content query --uri content://sms/inbox --projection address:body:date --sort \"date DESC\" 2>&1 | head -n 120")
             )
-            val smsOut = smsRes.optString("output", "")
-            for (line in smsOut.lineSequence()) {
-                val trimmed = line.trim()
-                if (!trimmed.startsWith("Row:")) continue
-                val dateVal = Regex(",\\s*date=(\\d+)").find(trimmed)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                val addr = Regex("address=([^,]*),\\s*body=").find(trimmed)?.groupValues?.get(1)?.trim().orEmpty()
-                val body = Regex(",\\s*body=(.*),\\s*date=\\d+").find(trimmed)?.groupValues?.get(1)?.trim().orEmpty()
-                if (body.isBlank()) continue
-                if (filterQ.isBlank() || "$addr $body".lowercase().contains(filterQ.lowercase())) {
-                    merged += JSONObject()
-                        .put("channel", "sms")
-                        .put("sender", addr)
-                        .put("title", addr)
-                        .put("text", body)
-                        .put("timestamp_ms", dateVal)
+            val smsOut = smsRes.optString("output", smsRes.optString("stdout", ""))
+            if (smsOut.contains("Permission Denial", ignoreCase = true) || smsOut.contains("Error while accessing provider", ignoreCase = true)) {
+                if (smsError.isBlank()) smsError = smsOut.lineSequence().firstOrNull { it.isNotBlank() }?.take(140) ?: "Shell 无权访问短信数据库"
+            } else {
+                val chunks = smsOut.split(Regex("""(?m)^Row:\s*\d+\s+""")).drop(1)
+                for (chunk in chunks) {
+                    val c = chunk.trim()
+                    if (c.isEmpty()) continue
+                    val dateVal = Regex("""(?:^|,\s*)date=(\d+)""").find(c)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val addr = Regex("""address=([^,]*),\s*body=""").find(c)?.groupValues?.get(1)?.trim().orEmpty()
+                    val body = Regex("""body=([\s\S]*?),\s*date=\d+""").find(c)?.groupValues?.get(1)?.trim().orEmpty()
+                    if (body.isBlank()) continue
+                    if (filterQ.isBlank() || "$addr $body".lowercase().contains(filterQ.lowercase())) {
+                        merged += JSONObject()
+                            .put("channel", "sms")
+                            .put("sender", addr)
+                            .put("title", addr)
+                            .put("text", body)
+                            .put("timestamp_ms", dateVal)
+                        smsCount++
+                    }
                 }
+                if (smsCount > 0) smsSource = "shell_content_query"
             }
+        }.onFailure { err ->
+            if (smsError.isBlank()) smsError = err.message ?: err.javaClass.simpleName
         }
     }
+
     merged.sortByDescending { it.optLong("timestamp_ms", 0L) }
-    val keywordRe = Regex("""(?:验证码|校验码|动态码|确认码|提取码|code|otp|verification|passcode|pin)[^A-Za-z0-9\n]{0,18}([0-9]{4,8}|[A-Za-z0-9]{4,8})""", RegexOption.IGNORE_CASE)
+    val keywordRe = Regex("""(?:验证码|校验码|动态码|确认码|提取码|安全码|code|otp|verification|passcode|pin)[^A-Za-z0-9\n]{0,18}([0-9]{4,8}|[A-Za-z0-9]{4,8})""", RegexOption.IGNORE_CASE)
     val revRe = Regex("""\b([0-9]{4,8})\b[^.\n]{0,16}(?:为你的|是你的|验证码|校验码|动态码|code|otp|verification)""", RegexOption.IGNORE_CASE)
     val candidates = JSONArray()
     val topItems = JSONArray()
@@ -368,13 +750,26 @@ internal fun RootPhoneHarness.executeReadOtpAction(base: Context, input: JSONObj
             )
         }
     }
+
+    val bothBlocked = !smsGranted && !notifRes.optBoolean("listener_connected", false) && topItems.length() == 0
     return JSONObject()
-        .put("ok", true)
+        .put("ok", !bothBlocked)
         .put("op", "read_otp")
         .put("found", bestCode.isNotBlank())
         .put("code", bestCode)
+        .put("sms_permission_granted", smsGranted)
+        .put("sms_source", smsSource)
+        .put("sms_count", smsCount)
+        .put("notification_count", notifArr.length())
+        .put("listener_connected", notifRes.optBoolean("listener_connected", false))
         .put("candidates", candidates)
         .put("items", topItems)
+        .apply {
+            if (smsError.isNotBlank()) put("sms_error", smsError)
+            if (bothBlocked) {
+                put("error", "未获得短信权限(READ_SMS)且通知监听未连接：请授权短信权限或连接 Shizuku/Root 后重试")
+            }
+        }
 }
 
 internal fun RootPhoneHarness.queryLauncherApps(base: Context, forceRefresh: Boolean = false): List<PhoneApp> {

@@ -101,7 +101,7 @@ def next_cron_timestamp(cron_expr: str, now: float) -> float:
 
 
 def parse_due_timestamp(args: dict, now: float) -> tuple[float, dict]:
-    """Parse optional timer/alarm scheduling fields (`when`, `delay_seconds`, `delay_minutes`, `at_time`, `daily_time`, `interval_hours`, `cron_expr`)."""
+    """Parse optional timer/alarm scheduling fields (`when`, `run_at`, `delay_seconds`, `delay_minutes`, `at_time`, `daily_time`, `interval_hours`, `cron_expr`)."""
     sched_meta: dict[str, Any] = {}
     cron_raw = str(args.get('cron_expr') or '').strip()
     if cron_raw:
@@ -109,9 +109,12 @@ def parse_due_timestamp(args: dict, now: float) -> tuple[float, dict]:
         sched_meta['kind'] = 'routine'
         sched_meta['cron_expr'] = cron_raw
         return due_cron, sched_meta
-    when_raw = str(args.get('when') or '').strip()
+
+    when_field = next((k for k in ('when', 'run_at', 'at') if args.get(k) not in (None, '')), None)
+    when_raw = str(args.get(when_field) or '').strip() if when_field else ''
     eff_args = dict(args)
-    if when_raw and not any(args.get(k) for k in ('delay_seconds', 'delay_minutes', 'at_time', 'daily_time', 'interval_hours')):
+    has_other_sched = any(args.get(k) not in (None, '', 0) for k in ('delay_seconds', 'delay_minutes', 'at_time', 'daily_time', 'interval_hours'))
+    if when_raw and not has_other_sched:
         wl = when_raw.lower().strip()
         m_rel = re.fullmatch(
             r'(?:in\s+)?(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|秒|m|min|mins|minute|minutes|分|分钟|h|hr|hrs|hour|hours|小时)(?:后)?',
@@ -131,17 +134,35 @@ def parse_due_timestamp(args: dict, now: float) -> tuple[float, dict]:
         elif re.fullmatch(r'\d{1,2}:\d{2}', wl):
             eff_args['at_time'] = wl
         else:
+            s_iso = when_raw.replace('/', '-')
+            if re.match(r'^\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}', s_iso):
+                s_iso = re.sub(r'\s+', 'T', s_iso, count=1)
+            if s_iso.endswith('Z'):
+                s_iso = s_iso[:-1] + '+00:00'
             try:
-                s_iso = when_raw.replace(' ', 'T') if re.match(r'^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}', when_raw) else when_raw
                 dt_parsed = dt.datetime.fromisoformat(s_iso)
-                if dt_parsed.tzinfo is None:
-                    dt_parsed = dt_parsed.replace(tzinfo=TZ)
-                if dt_parsed.timestamp() > now:
-                    sched_meta['kind'] = 'alarm'
-                    sched_meta['when'] = when_raw
-                    return dt_parsed.timestamp(), sched_meta
-            except Exception:
-                pass
+            except Exception as exc:
+                raise ValueError(
+                    f"无法解析定时时间 {when_field}={when_raw!r}（支持 ISO8601、'YYYY-MM-DD HH:MM'、'HH:MM'、'30m' 或 delay_minutes）: {exc}"
+                ) from exc
+            if dt_parsed.tzinfo is None:
+                dt_parsed = dt_parsed.replace(tzinfo=TZ)
+            ts = dt_parsed.timestamp()
+            if ts <= now:
+                raise ValueError(f"定时时间 {when_field}={when_raw!r} 早于或等于当前时间，请提供未来时间")
+            sched_meta['kind'] = 'alarm'
+            sched_meta['when'] = when_raw
+            return ts, sched_meta
+
+    for num_k in ('delay_seconds', 'delay_minutes', 'interval_hours'):
+        raw_num = eff_args.get(num_k)
+        if raw_num not in (None, ''):
+            try:
+                val_f = float(raw_num)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"定时参数 {num_k}={raw_num!r} 必须为正数") from exc
+            if val_f < 0:
+                raise ValueError(f"定时参数 {num_k}={raw_num!r} 不能为负数")
 
     delay_sec = float(eff_args.get('delay_seconds') or 0)
     delay_min = float(eff_args.get('delay_minutes') or 0)
@@ -154,11 +175,16 @@ def parse_due_timestamp(args: dict, now: float) -> tuple[float, dict]:
         sched_meta['kind'] = 'timer'
         return now + max(0.01, delay_sec + delay_min * 60.0), sched_meta
 
+    clock_field = 'daily_time' if daily_time else ('at_time' if at_time else '')
     clock_str = daily_time or at_time
-    if clock_str and re.match(r'^\d{1,2}:\d{2}$', clock_str):
-        hh, mm = [int(x) for x in clock_str.split(':')]
-        hh, mm = max(0, min(23, hh)), max(0, min(59, mm))
-        cand = dt.datetime.fromtimestamp(now, TZ).replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if clock_str:
+        m_hm = re.match(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?$', clock_str)
+        if not m_hm:
+            raise ValueError(f"无法解析时间格式 {clock_field}={clock_str!r}（需要 'HH:MM'）")
+        hh, mm, ss = int(m_hm.group(1)), int(m_hm.group(2)), int(m_hm.group(3) or 0)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+            raise ValueError(f"时间超出范围 {clock_field}={clock_str!r}")
+        cand = dt.datetime.fromtimestamp(now, TZ).replace(hour=hh, minute=mm, second=ss, microsecond=0)
         if cand.timestamp() <= now + 1.0:
             cand += dt.timedelta(days=1)
         if weekdays:
@@ -178,6 +204,9 @@ def parse_due_timestamp(args: dict, now: float) -> tuple[float, dict]:
         sched_meta['kind'] = 'routine'
         sched_meta['interval_hours'] = interval_h
         return now + interval_h * 3600.0, sched_meta
+
+    if any(eff_args.get(k) not in (None, '') for k in ('delay_seconds', 'delay_minutes', 'interval_hours')):
+        raise ValueError("定时延迟参数必须大于 0")
 
     return 0.0, sched_meta
 
@@ -219,7 +248,14 @@ def extract_mentions(args: dict, text: str) -> list[str]:
     return normed
 
 
-def resolve_targets(store: Any, mentions: list[str], author_bot_id: str, author_src: str) -> list[tuple[str, str, str]]:
+def resolve_targets(
+    store: Any,
+    mentions: list[str],
+    author_bot_id: str,
+    author_src: str,
+    *,
+    allow_self_explicit: bool = False,
+) -> list[tuple[str, str, str]]:
     """Resolve `@mention` tokens into `[(bot_id, bot_name, target_source)]`."""
     assistants = [b for b in store.state.get('assistants', []) if isinstance(b, dict) and b.get('id')]
     targets: list[tuple[str, str, str]] = []
@@ -276,7 +312,7 @@ def resolve_targets(store: Any, mentions: list[str], author_bot_id: str, author_
         elif matched is None and exp_src == 'phone':
             matched = next((b for b in assistants if str(b.get('home_node') or 'phone') == 'phone'), None)
         if matched is not None:
-            _add_bot(matched, exp_src, allow_self=False)
+            _add_bot(matched, exp_src, allow_self=allow_self_explicit)
     return targets
 
 
@@ -316,11 +352,13 @@ async def fire_due_post(engine: Any, post: dict, matched_watch_evidence: str, no
     mentions = post.get('mentions') or ['@self']
     author_id = str(post.get('author_bot_id') or 'companion')
     author_src = normalize_node_source(post.get('author_node') or 'phone')
-    targets = resolve_targets(engine.store, mentions, author_id, author_src)
+    targets = resolve_targets(engine.store, mentions, author_id, author_src, allow_self_explicit=True)
+    if not targets:
+        targets = resolve_targets(engine.store, ['@self'], author_id, author_src, allow_self_explicit=True)
     post['unread_by'] = [t[0] for t in targets]
     cw = getattr(engine.brain, 'clock_wheel', None)
     if cw is not None:
         await cw.deliver_blackboard_fire(engine, post, targets, matched_watch_evidence, now)
     else:
         label = '黑板监视命中' if matched_watch_evidence else '黑板闹钟到期'
-        engine._schedule_wakeup(post, targets, reason_label=label)
+        engine._schedule_wakeup(post, targets, reason_label=label, bypass_hop_limit=True)

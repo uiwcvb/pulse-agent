@@ -1,8 +1,15 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { errorChain } from '@deepseek-ai/dsh-llm';
 import { createDshSidecarKernel } from './kernel.mjs';
+
+function safeEqualSecret(got, expected) {
+  const a = createHash('sha256').update(String(got || ''), 'utf8').digest();
+  const b = createHash('sha256').update(String(expected || ''), 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
 
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -58,7 +65,7 @@ export async function startDshSidecarServer(opts = {}) {
     const url = new URL(req.url || '/', `http://${host}:${port}`);
     if (secret) {
       const got = req.headers['x-dsh-secret'] || req.headers['x-internal-secret'] || '';
-      if (got !== secret) {
+      if (!safeEqualSecret(got, secret)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
         return;
@@ -75,7 +82,22 @@ export async function startDshSidecarServer(opts = {}) {
       try {
         const body = await readJsonBody(req);
         const key = String(body.session_key || `${body.source || 'phone'}__${body.bot_id || 'companion'}`);
-        const out = kernel.cancelTurn(key);
+        const turnId = body.turn_id ? String(body.turn_id) : undefined;
+        const out = kernel.cancelTurn(key, turnId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/session/keepalive') {
+      try {
+        const body = await readJsonBody(req);
+        const key = String(body.session_key || `${body.source || 'phone'}__${body.bot_id || 'companion'}`);
+        const out = await kernel.keepaliveSession(key);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out));
       } catch (err) {
@@ -89,7 +111,11 @@ export async function startDshSidecarServer(opts = {}) {
       try {
         const body = await readJsonBody(req);
         const key = String(body.session_key || `${body.source || 'phone'}__${body.bot_id || 'companion'}`);
-        const out = await kernel.resetSession(key);
+        const prev = turnChains.get(key) || Promise.resolve();
+        const resetChain = prev.catch(() => {}).then(() => kernel.resetSession(key));
+        turnChains.set(key, resetChain);
+        const out = await resetChain;
+        if (turnChains.get(key) === resetChain) turnChains.delete(key);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out));
       } catch (err) {
@@ -110,6 +136,7 @@ export async function startDshSidecarServer(opts = {}) {
       }
 
       const sessionKey = String(body.session_key || `${body.source || 'phone'}__${body.bot_id || 'companion'}`);
+      const turnId = body.turn_id ? String(body.turn_id) : undefined;
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
         'Cache-Control': 'no-cache',
@@ -127,13 +154,14 @@ export async function startDshSidecarServer(opts = {}) {
 
       const onClientClose = () => {
         if (!res.writableEnded) {
-          kernel.cancelTurn(sessionKey);
+          kernel.cancelTurn(sessionKey, turnId);
         }
       };
-      req.on('close', onClientClose);
+      res.on('close', onClientClose);
 
       const prev = turnChains.get(sessionKey) || Promise.resolve();
       const next = prev.catch(() => {}).then(async () => {
+        if (res.writableEnded || res.destroyed) return;
         try {
           const result = await kernel.runTurn(body, (evt) => writeLine(evt));
           writeLine(result);
@@ -144,7 +172,7 @@ export async function startDshSidecarServer(opts = {}) {
             error: errorChain(err) || (err instanceof Error ? err.message : String(err)),
           });
         } finally {
-          req.off('close', onClientClose);
+          res.off('close', onClientClose);
           if (!res.writableEnded) res.end();
         }
       });

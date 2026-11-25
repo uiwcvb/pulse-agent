@@ -271,49 +271,18 @@ class LLMClient:
         return f'{header}\n{snippet}' if snippet else header
 
     async def fetch_available_models(self, raise_on_auth_error: bool = False) -> list[str]:
-        base_url = self.store.config.effective_base_url()
-        api_key = self.store.config.effective_api_key(big=True) or self.store.config.effective_api_key(big=False)
-        fb_url, fb_key, fb_model = (
-            self.store.config.effective_fallback(big=True)
-            if hasattr(self.store.config, 'effective_fallback')
-            else ('', '', '')
-        )
-        cache_key = f"{(base_url or '').rstrip('/')}|{(api_key or '')[-8:]}|{fb_url}|{fb_model}"
+        cfg = self.store.config
+        ch_sig = ','.join(f'{c.id}:{int(c.enabled)}:{int(c.priority)}:{c.base_url[-16:]}' for c in (getattr(cfg, 'channels', None) or []))
+        base_url = cfg.effective_base_url()
+        api_key = cfg.effective_api_key(big=True) or cfg.effective_api_key(big=False)
+        fb_url, _, fb_model = cfg.effective_fallback(big=True) if hasattr(cfg, 'effective_fallback') else ('', '', '')
+        cache_key = f"{(base_url or '').rstrip('/')}|{(api_key or '')[-8:]}|{fb_url}|{fb_model}|{ch_sig}"
         now = time.time()
         if not raise_on_auth_error and self._models_cache and self._models_cache[1] == cache_key and (now - self._models_cache[0]) < 300:
             return list(self._models_cache[2])
-        collected: list[str] = []
-        auth_err: str | None = None
-        for idx_u, (u, k) in enumerate([(base_url, api_key), (fb_url, fb_key)]):
-            if not u or not k:
-                continue
-            try:
-                client = self._get_http_client()
-                get_kw: dict = {'headers': {'Authorization': 'Bearer ' + k}}
-                if getattr(type(client), '__module__', '').startswith('httpx'):
-                    get_kw['timeout'] = 12.0
-                r = await client.get(u.rstrip('/') + '/models', **get_kw)
-                if r.status_code in (401, 403):
-                    detail = self._clean_error_detail(getattr(r, 'text', ''), limit=160)
-                    msg = f'HTTP {r.status_code}: {detail or "API Key 无效或无权限"}'
-                    if idx_u == 0:
-                        auth_err = msg
-                    if raise_on_auth_error and not collected:
-                        continue
-                elif r.status_code < 400:
-                    body = r.json()
-                    raw_list = body.get('data') if isinstance(body, dict) else (body if isinstance(body, list) else [])
-                    for item in (raw_list or []):
-                        mid = str(item['id']) if isinstance(item, dict) and item.get('id') else str(item or '')
-                        if mid and mid not in collected:
-                            collected.append(mid)
-            except Exception:
-                pass
-        if raise_on_auth_error and auth_err and not collected:
-            raise ValueError(auth_err)
-        for builtin_m in [fb_model, 'commandcode/deepseek/deepseek-v4.1-flash', 'commandcode/deepseek/deepseek-v4-flash', 'commandcode/deepseek/deepseek-v4-pro', 'deepseek-v4.1-flash-eco']:
-            if builtin_m and builtin_m not in collected:
-                collected.append(builtin_m)
+        from core.channel_router import fetch_aggregated_models
+        agg = await fetch_aggregated_models(self.store, persist_channel_models=True, raise_on_auth_error=raise_on_auth_error)
+        collected = list(agg.get('models') or [])
         if collected:
             self._models_cache = (now, cache_key, collected)
         return collected
@@ -335,14 +304,18 @@ class LLMClient:
 
     def _resolve_endpoint_candidates(self, bot_id: str = '', bot_model: str = '', big: bool = False, source: str = 'phone') -> list[tuple[str, str, str]]:
         resolved_bot_model = self._resolve_bot_model(bot_id, bot_model, source=source)
-        base_url = self.store.config.effective_base_url().rstrip('/')
-        api_key = self.store.config.effective_api_key(big=big) or self.store.config.effective_api_key(big=not big)
-        model = self.store.config.effective_model(bot_model=resolved_bot_model, big=big) or self.store.config.effective_model(bot_model=resolved_bot_model, big=not big)
+        cfg = self.store.config
+        if hasattr(cfg, 'effective_fallback_chain'):
+            chain = cfg.effective_fallback_chain(bot_model=resolved_bot_model, big=big)
+            return [(u, k, m) for (u, k, m, _cid) in chain]
+        base_url = cfg.effective_base_url().rstrip('/')
+        api_key = cfg.effective_api_key(big=big) or cfg.effective_api_key(big=not big)
+        model = cfg.effective_model(bot_model=resolved_bot_model, big=big) or cfg.effective_model(bot_model=resolved_bot_model, big=not big)
         candidates: list[tuple[str, str, str]] = []
         if base_url and api_key and model:
             candidates.append((base_url, api_key, model))
-        if hasattr(self.store.config, 'effective_fallback'):
-            fb_url, fb_key, fb_model = self.store.config.effective_fallback(big=big)
+        if hasattr(cfg, 'effective_fallback'):
+            fb_url, fb_key, fb_model = cfg.effective_fallback(big=big)
             if fb_url and fb_key and fb_model:
                 fb_tuple = (fb_url.rstrip('/'), fb_key, fb_model)
                 if not candidates or (fb_tuple[0], fb_tuple[2]) != (candidates[0][0], candidates[0][2]):

@@ -95,26 +95,27 @@ class PhoneControllerMixin:
         req_id = 'ph-' + secrets.token_hex(6)
         fut = asyncio.get_running_loop().create_future()
         self.phone_pending[req_id] = fut
-        await self.publish({
-            'type': 'phone_workspace_command',
-            'request_id': req_id,
-            'bot_id': bot_id,
-            'source': cur_src,
-            'op': op,
-            'args': args,
-            'timestamp': time.time(),
-        })
         try:
+            await self.publish({
+                'type': 'phone_workspace_command',
+                'request_id': req_id,
+                'bot_id': bot_id,
+                'source': cur_src,
+                'op': op,
+                'args': args,
+                'timestamp': time.time(),
+            })
             res = await asyncio.wait_for(fut, timeout=timeout)
             return res if isinstance(res, dict) else {'ok': False, 'op': op, 'error': '手机端返回无效响应格式'}
         except asyncio.TimeoutError:
-            self.phone_pending.pop(req_id, None)
             return {
                 'ok': False,
                 'timed_out': True,
                 'op': op,
                 'error': '手机端在超时时间内未返回执行结果或界面内容（操作未确认完成，严禁假设成功；请重试或确认手机端 App 在线）',
             }
+        finally:
+            self.phone_pending.pop(req_id, None)
 
     @staticmethod
     def _annotate_tap_crosshair(img_bytes: bytes, tap_x: int, tap_y: int, width: int, height: int) -> bytes:
@@ -259,15 +260,46 @@ class PhoneControllerMixin:
             return {**ime_res, 'ok': True, 'op': 'ime_policy', 'policy': policy}
 
         notif_ops = ('notifications', 'get_notifications', 'recent_notifications', 'notifs', 'notification', 'add_filter', 'remove_filter', 'list_filters', 'clear_inbox')
-        otp_ops = ('read_otp', 'otp', 'sms_code')
+        otp_ops = ('read_otp', 'otp', 'sms_code', 'sms', 'read_sms', 'get_sms')
+        if op == 'state':
+            op = 'status'
         non_gui_ops = ('status', 'device_info', 'phone_info', 'battery', 'shell', 'bash', 'cmd', 'exec', 'pull_file', 'push_file', 'list_files', 'files', 'apps', 'connect', 'delay', 'wait', 'sleep', 'release', 'auto_release', 'promote', 'pull_back', 'ime_policy', *otp_ops, *notif_ops)
         if self.activity == 'curiosity' and op not in notif_ops:
             return {'ok': False, 'error': '后台主动关心期间仅允许操作通知栏摘要与过滤 (op=notifications)，禁止操控虚拟屏界面'}
         if op not in non_gui_ops:
             node_st.used_in_turn = True
 
+        if op == 'status':
+            from vault_manager import now_iso as _now_iso
+            st_r, sh_r = await asyncio.gather(
+                self._raw_phone_rpc('status', {'op': 'status', **rpc_src}, timeout=12.0),
+                self._raw_phone_rpc('shell', {'op': 'shell', 'command': 'id -u', **rpc_src}, timeout=4.0),
+            )
+            if not isinstance(st_r, dict):
+                return {'ok': False, 'op': 'status', 'error': '手机端 status 返回无效响应'}
+            reconciled = reconcile_device_root_status(st_r, sh_r if isinstance(sh_r, dict) else None, _now_iso())
+            reconciled['op'] = 'status'
+            reconciled['root_live'] = bool(reconciled.get('root_functional'))
+            reconciled['privilege_live'] = bool(reconciled.get('privileged'))
+            dev_meta = reconciled.get('device_info') or reconciled.get('device')
+            if isinstance(dev_meta, dict):
+                for k_id in ('brand', 'model', 'manufacturer', 'sdk', 'fingerprint'):
+                    if dev_meta.get(k_id) is not None and not reconciled.get(k_id):
+                        reconciled[k_id] = dev_meta.get(k_id)
+            return reconciled
+
         if op in otp_ops:
-            return await self._raw_phone_rpc('read_otp', {'op': 'read_otp', 'limit': max(1, min(30, int(args.get('limit') or 10))), **rpc_src}, timeout=15.0)
+            otp_q = str(args.get('query') or args.get('app') or args.get('target') or args.get('text') or '').strip()
+            return await self._raw_phone_rpc(
+                'read_otp',
+                {
+                    'op': 'read_otp',
+                    'query': otp_q,
+                    'limit': max(1, min(40, int(args.get('limit') or 15))),
+                    **rpc_src,
+                },
+                timeout=15.0,
+            )
 
         if op in ('shell', 'bash', 'cmd', 'exec'):
             return await exec_phone_shell(args, node_st, self._raw_phone_rpc)
@@ -309,19 +341,32 @@ class PhoneControllerMixin:
                 return {'ok': True, 'action': 'list_filters', 'filters': self.notification_hub.get_filters()}
             if action == 'clear_inbox':
                 return self.notification_hub.clear_inbox(str(args.get('app') or args.get('target') or ''))
-            app_q = str(args.get('app') or args.get('package') or args.get('target') or args.get('text') or '').strip()
+            app_q = str(
+                args.get('filter_app')
+                or args.get('filter_package')
+                or args.get('app')
+                or args.get('package')
+                or args.get('target')
+                or args.get('text')
+                or ''
+            ).strip()
             lim = int(args.get('limit') or 30)
-            poll_info = await self._poll_and_converge_notifications(app_filter='', limit=max(40, lim), timeout=8.0, source=node_st.source if rpc_src else None)
+            poll_info = await self._poll_and_converge_notifications(app_filter=app_q, limit=max(40, lim), timeout=8.0, source=node_st.source if rpc_src else None)
             inbox_res = self.notification_hub.query_inbox(app_query=app_q, limit=lim, mark_seen=True)
             if not poll_info.get('ok'):
+                cached_list = inbox_res.get('notifications', []) if isinstance(inbox_res, dict) else []
                 return {
                     'ok': False,
                     'op': 'notifications',
                     'live_polled': False,
+                    'is_stale_cache': True,
+                    'cache_warning': '本次实时拉取手机通知超时/失败，cached_notifications 仅为历史缓存，不可作为当前实时证据。',
                     'error': str(poll_info.get('error') or '手机端未在线或通知拉取失败'),
-                    **inbox_res,
+                    'cached_notifications': cached_list,
+                    'inbox_total': int(inbox_res.get('total') or inbox_res.get('inbox_total') or len(cached_list)) if isinstance(inbox_res, dict) else 0,
+                    'unread_count': int(inbox_res.get('unread_count') or 0) if isinstance(inbox_res, dict) else 0,
                 }
-            return {'ok': True, 'op': 'notifications', 'live_polled': True, **inbox_res}
+            return {'ok': True, 'op': 'notifications', 'live_polled': True, 'is_stale_cache': False, **inbox_res}
 
         if op in ('send_screenshot', 'share_image', 'send_qr', 'send_image'):
             box_xyxy, box_err = validate_norm_box_xyxy(args)
@@ -371,7 +416,7 @@ class PhoneControllerMixin:
                 '_multimodal_caption': f'【手机虚拟屏局部放大 ({z_meta.get("norm_box")})】边缘刻度已映射回整屏 0..1000 坐标系，请直接用整屏 nx, ny 坐标调用 phone(op="tap", nx=..., ny=...)。',
             }
 
-        if op in ('run', 'task', 'inspect', 'screenshot', 'capture'):
+        if op in ('run', 'task', 'inspect', 'screenshot', 'capture', 'dump', 'tree', 'nodes', 'read_screen'):
             op = 'ui_tree'
             args = {**args, 'op': 'ui_tree', 'refresh': True}
 
@@ -392,9 +437,24 @@ class PhoneControllerMixin:
                 args = {**args, 'op': 'launch', 'app': u_cand, 'component': comp_cand}
             else:
                 return {'ok': False, 'error': 'phone(op="open") 需要提供 app 名称/包名、component 或 uri 网址'}
-        elif op == 'press':
+        elif op in ('app', 'open_app', 'start_app', 'launch_app', 'start'):
+            op = 'launch'
+            args = {**args, 'op': 'launch', 'app': str(args.get('app') or args.get('package') or args.get('target') or args.get('text') or '').strip()}
+        elif op in ('back', 'go_back', 'navigate_back'):
             op = 'key'
-            args = {**args, 'op': 'key', 'key': str(args.get('key') or args.get('target') or args.get('text') or 'back').strip().lower()}
+            args = {**args, 'op': 'key', 'key': 'back'}
+        elif op in ('home', 'go_home'):
+            op = 'key'
+            args = {**args, 'op': 'key', 'key': 'home'}
+        elif op in ('enter', 'submit_key'):
+            op = 'key'
+            args = {**args, 'op': 'key', 'key': 'enter'}
+        elif op in ('recents', 'recent_apps', 'overview'):
+            op = 'key'
+            args = {**args, 'op': 'key', 'key': 'recents'}
+        elif op in ('press', 'keyevent', 'key_event', 'press_key', 'send_key'):
+            op = 'key'
+            args = {**args, 'op': 'key', 'key': str(args.get('key') or args.get('keycode') or args.get('target') or args.get('text') or 'back').strip().lower()}
         elif op in ('scroll', 'swipe'):
             op, args, scroll_dir, swipe_err = build_phone_swipe_args(args, cur_w, cur_h, op)
             if swipe_err:
@@ -411,6 +471,30 @@ class PhoneControllerMixin:
             if (r_in or t_in or args.get('text') or args.get('view_id') or args.get('id')) and args.get('x') is None and args.get('nx') is None and not args.get('grid'):
                 op = 'tap_node'
                 args = {**args, 'op': 'tap_node', 'ref': r_in, 'target': t_in, 'label': '', 'text': str(args.get('text') or t_in).strip()}
+
+        _SUPPORTED_PHONE_OPS = {
+            'status', 'connect', 'create', 'apps', 'launch', 'open_uri', 'open_url',
+            'ui_tree', 'capture', 'tap', 'tap_node', 'click_node', 'tap_and_type',
+            'text', 'type_node', 'swipe', 'scroll_to', 'long_press', 'key', 'batch',
+            'release', 'auto_release', 'promote', 'pull_back', 'ime_policy',
+            'shell', 'device_info', 'notifications', 'read_otp', 'list_files',
+            'pull_file', 'push_file', 'clipboard', 'clipboard_get', 'clipboard_set',
+            'zoom', 'send_screenshot', 'wait', 'delay', 'sleep', 'keep_awake',
+        }
+        if op not in _SUPPORTED_PHONE_OPS:
+            return {
+                'ok': False,
+                'op': orig_requested_op,
+                'error': f'未知 phone op: "{orig_requested_op}"',
+                'available_ops': [
+                    'status', 'state', 'device_info', 'launch', 'open', 'app', 'open_uri', 'inspect', 'screenshot',
+                    'tap', 'type', 'long_press', 'swipe', 'scroll', 'scroll_to',
+                    'key', 'keyevent', 'back', 'home', 'enter', 'recents', 'wait', 'zoom', 'send_screenshot',
+                    'shell', 'notifications', 'read_otp', 'ime_policy', 'promote',
+                    'pull_back', 'release', 'apps', 'list_files', 'pull_file', 'push_file',
+                    'clipboard', 'batch',
+                ],
+            }
 
         resolved_pt = self._resolve_phone_grid_or_norm(args, cur_w, cur_h)
         if args.get('_coord_error'):

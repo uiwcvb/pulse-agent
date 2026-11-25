@@ -69,10 +69,13 @@ internal data class PulsePalette(
     val warn: Color,
     val userBubble: Color,
     val userInk: Color,
-    val userMeta: Color
+    val userMeta: Color,
+    val codeBg: Color,
+    val codeHeader: Color,
+    val isDark: Boolean
 )
 
-internal val LocalPulsePalette = staticCompositionLocalOf { pulsePalette(true) }
+internal val LocalPulsePalette = compositionLocalOf { pulsePalette(true) }
 
 internal fun pulsePalette(dark: Boolean) = if (dark) PulsePalette(
     bg = Color(0xFF000000),
@@ -92,7 +95,10 @@ internal fun pulsePalette(dark: Boolean) = if (dark) PulsePalette(
     warn = Color(0xFFFF453A),
     userBubble = Color(0xFF0A84FF),
     userInk = Color(0xFFFFFFFF),
-    userMeta = Color(0xCCFFFFFF)
+    userMeta = Color(0xCCFFFFFF),
+    codeBg = Color(0xFF111216),
+    codeHeader = Color(0xFF181A20),
+    isDark = true
 ) else PulsePalette(
     bg = Color(0xFFF5F5F7),
     chatBg = Color(0xFFF3F4F8),
@@ -111,7 +117,10 @@ internal fun pulsePalette(dark: Boolean) = if (dark) PulsePalette(
     warn = Color(0xFFFF3B30),
     userBubble = Color(0xFF007AFF),
     userInk = Color(0xFFFFFFFF),
-    userMeta = Color(0xCCFFFFFF)
+    userMeta = Color(0xCCFFFFFF),
+    codeBg = Color(0xFFF5F6F8),
+    codeHeader = Color(0xFFECEEF2),
+    isDark = false
 )
 
 /**
@@ -166,9 +175,9 @@ internal fun NativeMenuContent(menu: PulseMenu, closing: Boolean, close: () -> U
             .padding(top = 8.dp, bottom = 28.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Box(Modifier.padding(bottom = 12.dp).width(36.dp).height(5.dp).clip(CircleShape).background(c.faint.copy(alpha = 0.38f)))
+        Box(Modifier.padding(bottom = 12.dp).width(36.dp).height(4.5.dp).clip(CircleShape).background(c.faint.copy(alpha = 0.38f)))
         Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(menu.title, Modifier.weight(1f), color = c.ink, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.3).sp)
+            Text(menu.title, Modifier.weight(1f), color = c.ink, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.4).sp)
             PulseRoundButton("close", "关闭面板", close, background = true)
         }
         Column(
@@ -217,7 +226,7 @@ internal fun WorkspaceQuickTile(
     val haptics = LocalHapticFeedback.current
     Row(
         modifier
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(10.dp))
             .background(c.surface)
             .iosPressScale(0.96f) {
                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -227,17 +236,21 @@ internal fun WorkspaceQuickTile(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
-            Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(tint.copy(alpha = 0.14f)),
+            Modifier.size(34.dp).clip(CircleShape).background(tint.copy(alpha = 0.14f)),
             contentAlignment = Alignment.Center
         ) {
             PulseIcon(icon, tint, Modifier.size(18.dp))
         }
         Column(Modifier.padding(start = 10.dp).weight(1f)) {
             Text(title, color = c.ink, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(subtitle, color = c.muted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(subtitle, color = c.muted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, style = TextStyle(fontFeatureSettings = "tnum"))
         }
     }
 }
+
+private val RE_BOT_ROW_WS = Regex("\\s+")
+private val RE_BOT_ROW_QUOTE = Regex("^> [^\\n]+\\n\\n")
+private val RE_BOT_ROW_ATT = Regex("\n\n附件（工作区相对路径[\\s\\S]*")
 
 /**
  * True Telegram iOS Contact Row with Physical Finger-Tracking Swipe Reveal:
@@ -248,12 +261,13 @@ internal fun WorkspaceQuickTile(
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
+internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot, isSelected: Boolean = false) {
     val s = model.ui
     val c = LocalPulsePalette.current
     val haptics = LocalHapticFeedback.current
     val density = LocalDensity.current
     val rowScope = rememberCoroutineScope()
+    val reduceMotion = rememberReducedMotion()
 
     val latest = s.messages.lastOrNull { it.botId == bot.id }
     val unread = s.messages.count { it.botId == bot.id && it.id in s.unread }
@@ -266,8 +280,15 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
     val maxRightPullPx = with(density) { 128.dp.toPx() }
     val offsetX = remember(bot.id) { Animatable(0f) }
     var pinThresholdCrossed by remember(bot.id) { mutableStateOf(false) }
+    val showPinReveal by remember(bot.id) { derivedStateOf { offsetX.value > 0.5f } }
+    val pinThresholdReached by remember(bot.id, pinThresholdPx) { derivedStateOf { offsetX.value >= pinThresholdPx } }
+    val showActionsReveal by remember(bot.id) { derivedStateOf { offsetX.value < -0.5f } }
 
-    val rowBgColor = if (bot.pinned) c.pinnedRowBg else c.surface
+    val rowBgColor = when {
+        isSelected -> lerp(c.surface, c.accent, if (c.isDark) 0.16f else 0.09f)
+        bot.pinned -> c.pinnedRowBg
+        else -> c.surface
+    }
 
     Box(
         Modifier.fillMaxWidth()
@@ -276,11 +297,10 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
             .background(rowBgColor)
     ) {
         // 1. Background Left Reveal (Swipe Right -> Telegram Blue Pin / Unpin)
-        if (offsetX.value > 0.5f) {
-            val progress = (offsetX.value / pinThresholdPx).coerceIn(0f, 1.25f)
+        if (showPinReveal) {
             val iconScale by animateFloatAsState(
-                targetValue = if (offsetX.value >= pinThresholdPx) 1.16f else (0.65f + 0.35f * progress.coerceAtMost(1f)),
-                animationSpec = spring(dampingRatio = 0.62f, stiffness = 520f),
+                targetValue = if (pinThresholdReached) 1.16f else 0.90f,
+                animationSpec = if (reduceMotion) snap() else spring(dampingRatio = 0.72f, stiffness = 500f),
                 label = "pin_scale"
             )
             Box(
@@ -291,8 +311,10 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
             ) {
                 Row(
                     Modifier.graphicsLayer {
-                        scaleX = iconScale
-                        scaleY = iconScale
+                        val dragFrac = (offsetX.value / pinThresholdPx).coerceIn(0f, 1.25f)
+                        val dragScale = if (pinThresholdReached) iconScale else (0.65f + 0.35f * dragFrac.coerceAtMost(1f))
+                        scaleX = dragScale
+                        scaleY = dragScale
                     },
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -309,7 +331,7 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
         }
 
         // 2. Background Right Reveal (Swipe Left -> Full-Height Telegram Colored Action Tiles)
-        if (offsetX.value < -0.5f) {
+        if (showActionsReveal) {
             Row(
                 Modifier.fillMaxHeight()
                     .width(204.dp)
@@ -322,7 +344,7 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
                         .background(c.accent)
                         .clickable {
                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            rowScope.launch { offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
+                            rowScope.launch { if (reduceMotion) offsetX.snapTo(0f) else offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
                             model.openBotEditor(bot.id)
                         },
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -337,7 +359,7 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
                         .background(c.amber)
                         .clickable {
                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            rowScope.launch { offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
+                            rowScope.launch { if (reduceMotion) offsetX.snapTo(0f) else offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
                             model.compactBotContext(bot.id)
                         },
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -352,7 +374,7 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
                         .background(if (isWorkingHere) c.warn else Color(0xFF636366))
                         .clickable {
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                            rowScope.launch { offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
+                            rowScope.launch { if (reduceMotion) offsetX.snapTo(0f) else offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
                             if (isWorkingHere) model.stopBotById(bot.id) else model.botMenu(bot.id)
                         },
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -369,6 +391,18 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
             Modifier.fillMaxWidth()
                 .graphicsLayer { translationX = offsetX.value }
                 .background(rowBgColor)
+                .drawBehind {
+                    if (isSelected) {
+                        val barW = 3.dp.toPx()
+                        val barPad = 12.dp.toPx()
+                        drawRoundRect(
+                            color = c.accent,
+                            topLeft = androidx.compose.ui.geometry.Offset(0f, barPad),
+                            size = androidx.compose.ui.geometry.Size(barW, (size.height - barPad * 2f).coerceAtLeast(16.dp.toPx())),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW, barW)
+                        )
+                    }
+                }
                 .pointerInput(bot.id, bot.pinned) {
                     detectHorizontalDragGestures(
                         onDragStart = { pinThresholdCrossed = false },
@@ -397,28 +431,28 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
                             rowScope.launch {
                                 when {
                                     finalX >= pinThresholdPx -> {
-                                        offsetX.animateTo(0f, spring(dampingRatio = 0.76f, stiffness = 420f))
+                                        if (reduceMotion) offsetX.snapTo(0f) else offsetX.animateTo(0f, spring(dampingRatio = 0.76f, stiffness = 420f))
                                         model.togglePinBot(bot.id)
                                     }
                                     finalX < -drawerWidthPx * 0.34f -> {
                                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        offsetX.animateTo(-drawerWidthPx, spring(dampingRatio = 0.80f, stiffness = 430f))
+                                        if (reduceMotion) offsetX.snapTo(-drawerWidthPx) else offsetX.animateTo(-drawerWidthPx, spring(dampingRatio = 0.80f, stiffness = 430f))
                                     }
                                     else -> {
-                                        offsetX.animateTo(0f, spring(dampingRatio = 0.80f, stiffness = 460f))
+                                        if (reduceMotion) offsetX.snapTo(0f) else offsetX.animateTo(0f, spring(dampingRatio = 0.80f, stiffness = 460f))
                                     }
                                 }
                             }
                         },
                         onDragCancel = {
-                            rowScope.launch { offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 450f)) }
+                            rowScope.launch { if (reduceMotion) offsetX.snapTo(0f) else offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 450f)) }
                         }
                     )
                 }
                 .combinedClickable(
                     onClick = {
                         if (abs(offsetX.value) > 8f) {
-                            rowScope.launch { offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
+                            rowScope.launch { if (reduceMotion) offsetX.snapTo(0f) else offsetX.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 460f)) }
                         } else {
                             model.open(bot.id)
                         }
@@ -507,7 +541,7 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
                                     append("草稿: ")
                                 }
                                 withStyle(SpanStyle(color = c.muted)) {
-                                    append(unsentDraft.replace(Regex("\\s+"), " "))
+                                    append(unsentDraft.replace(RE_BOT_ROW_WS, " "))
                                 }
                             }
                             latest != null -> {
@@ -530,8 +564,8 @@ internal fun NativeBotRow(model: NativePulseModel, bot: PulseBot) {
                                 } else {
                                     val cleanPreview = stripMarkdownForPreview(
                                         latest.text
-                                            .replace(Regex("^> [^\\n]+\\n\\n"), "↩ ")
-                                            .replace(Regex("\n\n附件（工作区相对路径[\\s\\S]*"), " [图片/附件]")
+                                            .replace(RE_BOT_ROW_QUOTE, "↩ ")
+                                            .replace(RE_BOT_ROW_ATT, " [图片/附件]")
                                     )
                                     withStyle(
                                         SpanStyle(
@@ -631,7 +665,8 @@ internal fun SettingsCategoryRow(
                 fontSize = 12.5.sp,
                 modifier = Modifier.padding(horizontal = 6.dp),
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                style = TextStyle(fontFeatureSettings = "tnum")
             )
         }
         PulseIcon("next", c.faint, Modifier.size(15.dp))

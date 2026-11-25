@@ -275,11 +275,17 @@ export async function runLocalPcFsOperation(args = {}) {
         ".bmp": "image/bmp",
       };
       if (imageMimes[ext]) {
+        if (stat.size > 20 * 1024 * 1024) {
+          return { ok: false, error: `图片文件过大 (${stat.size} bytes > 20MB)`, path: targetPath, hostname: HOSTNAME };
+        }
         const buf = fs.readFileSync(targetPath);
         return {
           ok: true, path: targetPath, size_bytes: buf.length,
           _multimodal_b64: buf.toString("base64"), _multimodal_mime: imageMimes[ext], hostname: HOSTNAME,
         };
+      }
+      if (stat.size > 16 * 1024 * 1024) {
+        return { ok: false, error: `文本文件过大 (${stat.size} bytes > 16MB)，请改用命令行分段查看`, path: targetPath, hostname: HOSTNAME };
       }
       const raw = fs.readFileSync(targetPath, "utf8"); const lines = raw.split(/\r?\n/);
       const rawStart = args.start_line !== undefined && args.start_line !== null ? Number(args.start_line) : 1;
@@ -302,33 +308,15 @@ export async function runLocalPcFsOperation(args = {}) {
       const content = lines.slice(start - 1, end).join("\n").slice(0, 24000);
       return { ok: true, path: targetPath, start_line: start, end_line: end, total_lines: lines.length, content, hostname: HOSTNAME };
     }
-    const dedupAdjacentLongLines = (txt) => {
-      const lines = String(txt || "").split("\n"); const out = [];
-      let dedupCount = 0;
-      for (const ln of lines) {
-        const s = ln.trim();
-        if (s.length >= 12 && out.length > 0 && out[out.length - 1].trim() === s) {
-          dedupCount++;
-          continue;
-        }
-        out.push(ln);
-      }
-      return { text: out.join("\n"), dedupCount };
-    };
     if (fsOp === "write_file" || fsOp === "write") {
       const content = String(args.content ?? ""); const append = Boolean(args.append);
       fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-      let dedupCount = 0;
       if (append && fs.existsSync(targetPath)) {
         const existing = fs.readFileSync(targetPath, "utf8");
         const sep = existing && !existing.endsWith("\n") && !content.startsWith("\n") ? "\n" : "";
-        const merged = dedupAdjacentLongLines(existing + sep + content);
-        dedupCount = merged.dedupCount;
-        fs.writeFileSync(targetPath, merged.text, "utf8");
+        fs.writeFileSync(targetPath, existing + sep + content, "utf8");
       } else { fs.writeFileSync(targetPath, content, "utf8"); }
-      const resObj = { ok: true, path: targetPath, append, bytes_written: Buffer.byteLength(content, "utf8"), hostname: HOSTNAME };
-      if (dedupCount > 0) resObj.deduplicated_adjacent_lines = dedupCount;
-      return resObj;
+      return { ok: true, path: targetPath, append, bytes_written: Buffer.byteLength(content, "utf8"), hostname: HOSTNAME };
     }
     if (fsOp === "edit_file" || fsOp === "edit") {
       if (!fs.existsSync(targetPath)) {
@@ -342,11 +330,8 @@ export async function runLocalPcFsOperation(args = {}) {
       }
       const replaceAll = Boolean(args.replace_all);
       const rawUpdated = replaceAll ? raw.split(oldText).join(newText) : raw.replace(oldText, () => newText);
-      const merged = dedupAdjacentLongLines(rawUpdated);
-      fs.writeFileSync(targetPath, merged.text, "utf8");
-      const resObj = { ok: true, path: targetPath, updated: true, hostname: HOSTNAME };
-      if (merged.dedupCount > 0) resObj.deduplicated_adjacent_lines = merged.dedupCount;
-      return resObj;
+      fs.writeFileSync(targetPath, rawUpdated, "utf8");
+      return { ok: true, path: targetPath, updated: true, hostname: HOSTNAME };
     }
     if (fsOp === "list_dir" || fsOp === "ls") {
       if (!fs.existsSync(targetPath)) {
@@ -513,7 +498,7 @@ export function registerAllDshTools(toolsSvc) {
     parameters: {
       type: "object", additionalProperties: false,
       properties: {
-        action: { type: "string", enum: ["list_windows", "list_apps", "get_window_state", "click", "double_click", "right_click", "type_text", "set_value", "press_key", "scroll", "scroll_element", "drag", "perform_secondary_action", "launch_app", "activate_window", "close_window", "wait_for"] },
+        action: { type: "string", enum: ["list_windows", "list_apps", "get_window", "get_window_state", "click", "double_click", "right_click", "type_text", "press_key", "scroll", "drag", "launch_app", "activate_window", "close_window", "reset_engine", "set_active_bot"] },
         bot_name: { type: "string" },
         window_id: { type: "number" },
         window_title: { type: "string" },
@@ -522,6 +507,12 @@ export function registerAllDshTools(toolsSvc) {
         ref: { type: "string" },
         nx: { type: "number" },
         ny: { type: "number" },
+        from_nx: { type: "number" },
+        from_ny: { type: "number" },
+        to_nx: { type: "number" },
+        to_ny: { type: "number" },
+        end_nx: { type: "number" },
+        end_ny: { type: "number" },
         x: { type: "number" },
         y: { type: "number" },
         coord_space: { type: "string" },
@@ -538,6 +529,7 @@ export function registerAllDshTools(toolsSvc) {
         delta_x: { type: "number" },
         delta_y: { type: "number" },
         pages: { type: "number" },
+        amount: { type: "number" },
         from_x: { type: "number" },
         from_y: { type: "number" },
         to_x: { type: "number" },

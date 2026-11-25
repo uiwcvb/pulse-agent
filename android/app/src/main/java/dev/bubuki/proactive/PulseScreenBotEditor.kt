@@ -40,6 +40,7 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
     val s = model.ui
     val c = LocalPulsePalette.current
     val focus = LocalFocusManager.current
+    val reduceMotion = rememberReducedMotion()
     val isNew = s.editingBotId == null
     val targetBotId = s.editingBotId ?: s.botId
     val targetBot = model.bot(targetBotId)
@@ -49,13 +50,13 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
     val rawCtxRatio = (curCtxTok.toFloat() / threshCtxTok.coerceAtLeast(1)).coerceIn(0f, 1f)
     val animatedCtxRatio by animateFloatAsState(
         targetValue = rawCtxRatio.coerceAtLeast(0.03f),
-        animationSpec = spring(dampingRatio = 0.80f, stiffness = 320f),
+        animationSpec = if (reduceMotion) snap() else spring(dampingRatio = 0.80f, stiffness = 320f),
         label = "ctx_bar")
     val ctxPct = (rawCtxRatio * 100).toInt()
     val rawCacheRatio = if (curCtxTok > 0) (cachedCtxTok.toFloat() / curCtxTok.toFloat()).coerceIn(0f, 1f) else 0f
     val animatedCacheRatio by animateFloatAsState(
         targetValue = if (cachedCtxTok > 0) rawCacheRatio.coerceAtLeast(0.04f) else 0f,
-        animationSpec = spring(dampingRatio = 0.80f, stiffness = 320f),
+        animationSpec = if (reduceMotion) snap() else spring(dampingRatio = 0.80f, stiffness = 320f),
         label = "cache_bar")
     Column(modifier.background(c.bg)) {
         // Telegram Contact Info Top Bar
@@ -66,9 +67,9 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(
-                        Modifier.clip(RoundedCornerShape(10.dp))
+                        Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(10.dp))
                             .iosPressScale(0.95f) { focus.clearFocus(); model.closePanel() }
-                            .padding(horizontal = 6.dp, vertical = 6.dp),
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         PulseIcon("back", c.accent, Modifier.size(21.dp))
@@ -81,15 +82,19 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                         fontSize = 17.5.sp,
                         fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center)
-                    Text(
-                        if (s.savingBot) "保存中…" else "保存",
-                        Modifier.clip(RoundedCornerShape(14.dp))
+                    Box(
+                        Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(14.dp))
                             .background(c.accent)
                             .iosPressScale(0.95f, enabled = !s.savingBot) { focus.clearFocus(); model.saveBotEditor() }
                             .padding(horizontal = 15.dp, vertical = 7.dp),
-                        color = Color.White,
-                        fontSize = 13.5.sp,
-                        fontWeight = FontWeight.SemiBold)
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            if (s.savingBot) "保存中…" else "保存",
+                            color = Color.White,
+                            fontSize = 13.5.sp,
+                            fontWeight = FontWeight.SemiBold)
+                    }
                 }
                 HorizontalDivider(color = c.line.copy(alpha = 0.65f), thickness = 0.5.dp)
             }
@@ -342,7 +347,7 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
                                     Text(pname, color = c.ink, fontSize = 14.5.sp, fontWeight = FontWeight.Medium)
-                                    Text("共 $pcnt 枚贴纸 · 开启后聊天可收发表情包", color = c.muted, fontSize = 11.5.sp)
+                                    Text("共 $pcnt 枚贴纸 · 开启后聊天可收发表情包", color = c.muted, fontSize = 11.5.sp, style = TextStyle(fontFeatureSettings = "tnum"))
                                 }
                                 Switch(checked = penabled, onCheckedChange = { model.toggleStickerPack(pid, it) })
                             }
@@ -419,21 +424,18 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                             fontSize = 12.sp)
                     }
                 }
-                if (s.availableModels.isNotEmpty()) {
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        items(s.availableModels.take(50)) { m ->
-                            val selected = m == s.editBotModel
-                            Text(
-                                m,
-                                Modifier.clip(RoundedCornerShape(9.dp))
-                                    .background(if (selected) c.accent else c.fill)
-                                    .iosPressScale(0.95f) { model.updateBotEditField(modelName = m) }
-                                    .padding(horizontal = 10.dp, vertical = 7.dp),
-                                color = if (selected) Color.White else c.ink,
-                                fontSize = 12.sp,
-                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
-                        }
-                    }
+                val botModelEntries = remember(s.modelEntries, s.availableModels, s.channels) {
+                    s.modelEntries.ifEmpty { PulseModelEntry.synthesize(s.availableModels, s.channels) }
+                }
+                if (botModelEntries.isNotEmpty()) {
+                    ChannelAwareModelPicker(
+                        entries = botModelEntries,
+                        channels = s.channels,
+                        selectedValue = s.editBotModel,
+                        accentColor = c.accent,
+                        showSearchBox = botModelEntries.size > 12,
+                        onSelect = { model.updateBotEditField(modelName = it) }
+                    )
                 }
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
@@ -454,8 +456,9 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                 focus.clearFocus()
                 model.saveBotEditor()
             }
-            if (!isNew && s.editingBotId != null) {
-                var showPromptPreview by rememberSaveable(s.editingBotId) { mutableStateOf(false) }
+            val editingId = s.editingBotId
+            if (editingId != null) {
+                var showPromptPreview by rememberSaveable(editingId) { mutableStateOf(false) }
                 Column(
                     Modifier.fillMaxWidth()
                         .clip(RoundedCornerShape(16.dp))
@@ -492,7 +495,11 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                         }
                         Text(if (showPromptPreview) "收起" else "展开", color = c.accent, fontSize = 12.5.sp, fontWeight = FontWeight.Medium)
                     }
-                    AnimatedVisibility(visible = showPromptPreview) {
+                    AnimatedVisibility(
+                        visible = showPromptPreview,
+                        enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(150)),
+                        exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
+                    ) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                 Text(
@@ -529,13 +536,17 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                                         verticalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
                                         Row(
-                                            Modifier.fillMaxWidth().clickable { expandedSeg = !expandedSeg },
+                                            Modifier.fillMaxWidth().heightIn(min = 36.dp).clickable { expandedSeg = !expandedSeg },
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             Text(title, Modifier.weight(1f), color = c.ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                             Text("${content.length}字 · ${if (expandedSeg) "▲" else "▼"}", color = c.muted, fontSize = 11.sp, style = TextStyle(fontFeatureSettings = "tnum"))
                                         }
-                                        if (expandedSeg) {
+                                        AnimatedVisibility(
+                                            visible = expandedSeg,
+                                            enter = if (reduceMotion) fadeIn(tween(110)) else expandVertically(iosFluidSpring()) + fadeIn(tween(140)),
+                                            exit = if (reduceMotion) fadeOut(tween(90)) else shrinkVertically(iosGentleSpring()) + fadeOut(tween(110))
+                                        ) {
                                             SelectionContainer {
                                                 Text(
                                                     content.ifBlank { "（空）" },

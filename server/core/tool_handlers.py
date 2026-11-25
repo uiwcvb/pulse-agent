@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from typing import Any
 
 from core.canonical_tool_handlers import CanonicalToolHandlersMixin, build_custom_plugin_source
 from core.scheduler_engine import SchedulerEngine
+from core.tool_schemas import scrub_subprocess_env
 from storage import normalize_node_source
 
 
@@ -21,9 +23,23 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
     """Domain Controller for Scheduling, Background Tasks, Watchdogs, Memory Search, Skills, Blackboard & Notifications."""
 
     async def _tool_list_models(self, args: dict):
-        models = await self._fetch_available_models()
+        from core.channel_router import fetch_aggregated_models
+        agg = await fetch_aggregated_models(self.store, persist_channel_models=True)
+        models = list(agg.get('models') or [])
+        entries = list(agg.get('model_entries') or [])
         return {
             'models': models[:100],
+            'model_entries': entries[:100],
+            'channel_models': [
+                {
+                    'id': d.get('id'),
+                    'name': d.get('name'),
+                    'ok': d.get('ok'),
+                    'count': d.get('count'),
+                    'latency_ms': d.get('latency_ms'),
+                }
+                for d in (agg.get('channel_models') or [])
+            ],
             'total': len(models),
             'default_model': self.store.config.effective_model(),
             'api_base_url': self.store.config.effective_base_url(),
@@ -170,9 +186,9 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                 out['coalesce_hint'] = hint
             return out
         if action == 'update':
-            tid = str(args.get('task_id') or '').strip()
+            tid = str(args.get('task_id') or args.get('post_id') or args.get('id') or args.get('title') or args.get('name') or args.get('label') or '').strip()
             for r in routines:
-                if r['id'] == tid or (not tid and len(routines) == 1):
+                if r['id'] == tid or (tid and tid.lower() in str(r.get('goal') or '').lower()) or (not tid and len(routines) == 1):
                     if ('goal' in args or 'text' in args) and str(args.get('goal') or args.get('text') or '').strip():
                         r['goal'] = str(args.get('goal') or args.get('text') or '').strip()[:2000]
                     if 'bot_id' in args and str(args['bot_id']).strip():
@@ -221,9 +237,10 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                     self.wake.set()
                     self._notify_sync_schedules('timer', t['id'])
                     return {'updated': True, 'timer': t}
-            return {'error': f'未找到定时任务 "{tid}"'}
+            avail_ids = [f"{r['id']}:{str(r.get('goal') or '')[:30]}" for r in routines[:10]] + [f"{t['id']}:{str(t.get('goal') or '')[:30]}" for t in timers[:10]]
+            return {'ok': False, 'error': f'未找到定时任务 "{tid}"（支持传 task_id / post_id / title 关键词）', 'available_tasks': avail_ids}
         if action == 'remove':
-            tid = str(args.get('task_id') or '').strip()
+            tid = str(args.get('task_id') or args.get('post_id') or args.get('id') or args.get('title') or args.get('name') or args.get('label') or '').strip()
             before_n = len(timers) + len(routines)
             self.store.state['timers'] = [t for t in timers if t['id'] != tid]
             self.store.state['routines'] = [r for r in routines if r['id'] != tid]
@@ -231,7 +248,8 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
             if existed:
                 self.store.save()
                 self._notify_sync_schedules('all', tid)
-            return {'ok': existed, 'removed': existed, 'existed': existed, 'task_id': tid, **({'error': f'未找到定时任务 "{tid}"'} if not existed else {})}
+            avail_ids = [f"{r['id']}:{str(r.get('goal') or '')[:30]}" for r in self.store.state['routines'][:10]]
+            return {'ok': existed, 'removed': existed, 'existed': existed, 'task_id': tid, **({'error': f'未找到定时任务 "{tid}"', 'available_tasks': avail_ids} if not existed else {})}
         return {'error': f'未知 schedule_task action: {action}'}
 
     async def _tool_bg_task(self, args: dict):
@@ -275,6 +293,30 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                 return {'sent_stdin': True, 'task_id': tid, 'bytes': len(line_bytes)}
             except Exception as e:
                 return {'error': f'写入 stdin 失败: {e}'}
+        if action == 'wait':
+            tid = str(args.get('task_id') or '').strip()
+            info = self.bg_tasks.get(tid)
+            if not info:
+                return {'ok': False, 'error': f'未找到后台任务 {tid}'}
+            wait_sec = max(1, min(180, int(args.get('timeout') or 60)))
+            proc = info.get('proc')
+            timed_out = False
+            if info.get('status') == 'running' and proc is not None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=wait_sec)
+                    await asyncio.sleep(0.05)
+                except asyncio.TimeoutError:
+                    timed_out = True
+            log_path = Path(info['log_file'])
+            tail = log_path.read_text('utf-8', errors='replace')[-8000:] if log_path.exists() else ''
+            return {
+                'ok': True,
+                'task_id': tid,
+                'status': info.get('status'),
+                'exit_code': info.get('exit_code'),
+                'timed_out': timed_out,
+                'output': tail,
+            }
         if action == 'kill':
             tid = str(args.get('task_id') or '').strip()
             info = self.bg_tasks.get(tid)
@@ -286,12 +328,15 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
             if not proc:
                 return {'ok': False, 'killed': False, 'task_id': tid, 'error': f'后台任务 {tid} 缺少可控进程句柄'}
             try:
-                if sys.platform == 'linux':
-                    os.killpg(proc.pid, signal.SIGKILL)
-                else:
-                    proc.kill()
+                if getattr(proc, 'returncode', None) is None:
+                    if sys.platform == 'linux':
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(proc.wait(), timeout=3.0)
             except Exception as e:
-                return {'ok': False, 'killed': False, 'task_id': tid, 'error': f'终止后台任务失败: {e}'}
+                return {'ok': False, 'killed': False, 'error': f'终止后台任务失败: {e}'}
             info['status'] = 'killed'
             return {'ok': True, 'killed': True, 'task_id': tid}
         if action == 'start':
@@ -310,11 +355,12 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
             owner_bot = self.bot_context.get()
             owner_source = normalize_node_source(self.source_context.get() or 'phone')
             notify_exit = bool(args.get('notify_on_exit', True))
-            env = os.environ.copy()
-            env['TZ'] = 'Asia/Shanghai'
-            env['API_BASE_URL'] = self.store.config.effective_base_url()
-            env['API_KEY'] = self.store.config.effective_api_key(big=True) or self.store.config.effective_api_key(big=False)
-            env['DEFAULT_MODEL'] = self.store.config.effective_model()
+            env = scrub_subprocess_env(extra={
+                'HOME': str(self.harness.root),
+                'TZ': 'Asia/Shanghai',
+                'API_BASE_URL': self.store.config.effective_base_url(),
+                'DEFAULT_MODEL': self.store.config.effective_model(),
+            })
             out_f = log_file.open('w', encoding='utf-8')
             try:
                 proc = await asyncio.create_subprocess_shell(
@@ -334,6 +380,7 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                 'proc': proc,
             }
             self.bg_tasks[tid] = info
+            self._prune_bg_tasks()
 
             async def watch():
                 try:
@@ -343,13 +390,14 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                     info['finished_at'] = time.time()
                 finally:
                     out_f.close()
+                    self._prune_bg_tasks()
                 if notify_exit:
                     full_tail = log_file.read_text('utf-8', errors='replace')[-12000:] if log_file.exists() else ''
                     short_tail = full_tail[-500:]
                     ctx_id = self.context_search.store_tool_context(
                         'bg_task', {'task_id': tid, 'cmd': cmd[:120]}, full_tail or '(空输出)', bot_id=owner_bot
                     ) if full_tail else ''
-                    ctx_hint = f'\n完整日志已归档 (ctx_id="{ctx_id}")，需要细节可用 `ctx_search` 检索。' if ctx_id else ''
+                    ctx_hint = f'\n完整日志已归档 (ctx_id="{ctx_id}")，需要细节可用 `memory(op="ctx", ctx_id="{ctx_id}")` 检索。' if ctx_id else ''
                     msg_text = f'⚙️ [后台任务 `{tid}` 已结束 (exit={info.get("exit_code")})]\n命令：`{cmd[:120]}`\n尾部摘要：\n```\n{short_tail}\n```{ctx_hint}'
                     m = self.store.message(
                         'assistant',
@@ -364,13 +412,13 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                     )
                     oseq = int(m.get('order_seq') or m.get('seq') or 0)
                     self.stream_seq = max(self.stream_seq + 1, oseq)
-                    m['seq'] = max(oseq, self.stream_seq)
+                    m['seq'] = oseq
                     self.store.sql.upsert_message(m)
                     self.context_search.index_message(m)
                     await self.publish({
                         'type': 'message',
                         'message': m,
-                        'seq': m['seq'],
+                        'seq': self.stream_seq,
                         'order_seq': oseq,
                         'state_seq': getattr(getattr(self, 'sync_engine', None), 'state_seq', oseq),
                     })
@@ -392,6 +440,20 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                             snap = dict(cur_stream)
                             snap['seq'] = self.stream_seq
                             await self.publish({'type': 'stream', 'stream': snap})
+                    elif info.get('status') != 'killed' and hasattr(self, 'run_scheduled'):
+                        wake_goal = (
+                            f'【后台任务 `{tid}` 已结束 (exit={info.get("exit_code")})】\n'
+                            f'命令：`{cmd[:200]}`\n'
+                            f'尾部输出：\n```\n{short_tail or "(空输出)"}\n```{ctx_hint}\n'
+                            '请立即查看并核对此次后台任务结果，必要时继续后续步骤或清晰向用户汇报。'
+                        )
+                        asyncio.create_task(
+                            self.run_scheduled(
+                                wake_goal,
+                                bot_id=owner_bot,
+                                label=f'后台任务完成 ({tid})',
+                            )
+                        )
 
             asyncio.create_task(watch())
             return {'started': True, 'task_id': tid, 'log_file': f'.bg_logs/{tid}.log'}
@@ -484,6 +546,39 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
             }
         return {'error': f'未知 watchdog_task action: {action}'}
 
+    def _prune_bg_tasks(self, keep_finished: int = 40) -> None:
+        finished = [
+            (tid, info.get('finished_at') or info.get('started_at') or 0.0)
+            for tid, info in self.bg_tasks.items()
+            if isinstance(info, dict) and info.get('status') != 'running'
+        ]
+        if len(finished) <= keep_finished:
+            return
+        finished.sort(key=lambda it: it[1])
+        for tid, _ in finished[:len(finished) - keep_finished]:
+            self.bg_tasks.pop(tid, None)
+
+    async def shutdown_background_tasks(self) -> None:
+        for wid, w_info in list(getattr(self, 'watchdogs', {}).items()):
+            w_info['status'] = 'stopped'
+            t = w_info.get('task')
+            if t and not t.done():
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+        for tid, info in list(getattr(self, 'bg_tasks', {}).items()):
+            proc = info.get('proc') if isinstance(info, dict) else None
+            if proc is not None and getattr(proc, 'returncode', None) is None:
+                with contextlib.suppress(Exception):
+                    if sys.platform == 'linux':
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                if isinstance(info, dict):
+                    info['status'] = 'killed'
+
     async def _exec_watchdog_once(self, w_info: dict) -> str:
         script_path = Path(w_info['script_path'])
         cmd = f'{sys.executable} "{script_path}"' if script_path.suffix == '.py' else f'bash "{script_path}"'
@@ -492,11 +587,15 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
             cwd=str(self.harness.root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=scrub_subprocess_env(),
         )
         try:
             raw_out, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
         except asyncio.TimeoutError:
-            proc.kill()
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
             raw_out = b'Timeout after 30s'
         out_str = raw_out.decode('utf-8', errors='replace').strip()
         w_info['runs'] = int(w_info.get('runs') or 0) + 1
@@ -664,8 +763,17 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
             mapped = {'add_routine': 'add_routine', 'update_routine': 'update', 'remove_routine': 'remove', 'list_routines': 'list'}[act]
             eff['action'] = mapped
             return await self._tool_schedule_task(eff)
+        if not eff.get('text') and not eff.get('content'):
+            fallback_txt = str(eff.get('prompt') or eff.get('label') or '').strip()
+            if fallback_txt:
+                eff['text'] = fallback_txt
+        if not eff.get('title') and eff.get('label'):
+            eff['title'] = str(eff['label']).strip()[:140]
         if act == 'alarm':
-            has_when = any(eff.get(k) for k in ('when', 'delay_minutes', 'run_at', 'daily_time', 'cron_expr'))
+            has_when = any(
+                eff.get(k) not in (None, '', 0)
+                for k in ('when', 'run_at', 'at', 'delay_minutes', 'delay_seconds', 'at_time', 'daily_time', 'interval_hours', 'cron_expr')
+            )
             if not has_when:
                 return await self._tool_emergency_alarm({
                     'title': eff.get('title') or eff.get('label') or '紧急呼叫',
@@ -674,9 +782,6 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
                 })
             eff['alarm'] = True
             eff['action'] = 'schedule'
-        elif act == 'schedule':
-            if not eff.get('text') and not eff.get('content') and (eff.get('prompt') or eff.get('label')):
-                eff['text'] = str(eff.get('prompt') or eff.get('label') or '')
         return await self.blackboard_engine.execute(eff)
 
     async def _tool_peek_bots(self, args: dict):
@@ -766,6 +871,8 @@ class ToolHandlersMixin(CanonicalToolHandlersMixin):
             self.harness.extension_registry.tool_plugins.pop(safe_t_name, None)
             return {'ok': existed, 'deleted': existed, 'existed': existed, 'name': t_name, **({'error': f'未找到自定义工具 "{raw_name}"'} if not existed else {})}
         if action == 'create':
+            if hasattr(self, '_is_non_user_execution_context') and self._is_non_user_execution_context():
+                return {'ok': False, 'error': '权限锁定：仅允许用户在直接对话中创建自定义可执行工具插件'}
             raw_name = str(args.get('name') or '').strip()
             t_name = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5]', '_', raw_name).strip('_').lower()
             code = str(args.get('code') or '').strip()

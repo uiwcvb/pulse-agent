@@ -60,6 +60,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 
 internal val LocalPowerSaveMode = compositionLocalOf { false }
 
+@Composable
+internal fun rememberReducedMotion(): Boolean = LocalReduceMotion.current || LocalPowerSaveMode.current
+
 internal object PowerSaveController {
     @JvmStatic
     fun isSystemPowerSave(context: Context): Boolean = runCatching {
@@ -129,6 +132,7 @@ internal fun rememberAnimatedPulsePalette(dark: Boolean, reduceMotion: Boolean):
     val surface by animateColorAsState(target.surface, spec, label = "pal_surface")
     val elevated by animateColorAsState(target.elevated, spec, label = "pal_elevated")
     val pinnedRowBg by animateColorAsState(target.pinnedRowBg, spec, label = "pal_pinned")
+    val userBubble by animateColorAsState(target.userBubble, spec, label = "pal_userBubble")
     val aiBubble by animateColorAsState(target.aiBubble, spec, label = "pal_aiBubble")
     val fill by animateColorAsState(target.fill, spec, label = "pal_fill")
     val line by animateColorAsState(target.line, spec, label = "pal_line")
@@ -136,20 +140,31 @@ internal fun rememberAnimatedPulsePalette(dark: Boolean, reduceMotion: Boolean):
     val muted by animateColorAsState(target.muted, spec, label = "pal_muted")
     val faint by animateColorAsState(target.faint, spec, label = "pal_faint")
     val accent by animateColorAsState(target.accent, spec, label = "pal_accent")
-    return remember(bg, chatBg, surface, elevated, pinnedRowBg, aiBubble, fill, line, ink, muted, faint, accent, target) {
+    val green by animateColorAsState(target.green, spec, label = "pal_green")
+    val amber by animateColorAsState(target.amber, spec, label = "pal_amber")
+    val warn by animateColorAsState(target.warn, spec, label = "pal_warn")
+    val codeBg by animateColorAsState(target.codeBg, spec, label = "pal_codeBg")
+    val codeHeader by animateColorAsState(target.codeHeader, spec, label = "pal_codeHeader")
+    return remember(bg, chatBg, surface, elevated, pinnedRowBg, userBubble, aiBubble, fill, line, ink, muted, faint, accent, green, amber, warn, codeBg, codeHeader, target) {
         target.copy(
             bg = bg,
             chatBg = chatBg,
             surface = surface,
             elevated = elevated,
             pinnedRowBg = pinnedRowBg,
+            userBubble = userBubble,
             aiBubble = aiBubble,
             fill = fill,
             line = line,
             ink = ink,
             muted = muted,
             faint = faint,
-            accent = accent
+            accent = accent,
+            green = green,
+            amber = amber,
+            warn = warn,
+            codeBg = codeBg,
+            codeHeader = codeHeader
         )
     }
 }
@@ -171,7 +186,8 @@ internal fun appSubPageTransitionSpec(goingDeeper: Boolean, reduceMotion: Boolea
 internal fun SettingsAppearanceSubPage(model: NativePulseModel) {
     val s = model.ui
     val c = LocalPulsePalette.current
-    val sysPowerSave = PowerSaveController.isSystemPowerSave(LocalContext.current)
+    val powerSaveActive = LocalPowerSaveMode.current
+    val sysPowerSave = PowerSaveController.isSystemPowerSave(LocalContext.current) || (powerSaveActive && !s.powerSave)
     Column(
         Modifier
             .fillMaxWidth()
@@ -195,7 +211,7 @@ internal fun SettingsAppearanceSubPage(model: NativePulseModel) {
                     label,
                     Modifier
                         .weight(1f)
-                        .clip(RoundedCornerShape(9.dp))
+                        .clip(RoundedCornerShape(8.dp))
                         .background(if (active) c.surface else Color.Transparent)
                         .iosPressScale(0.96f) { model.updateSettingsField(appearance = key) }
                         .padding(vertical = 9.dp),

@@ -88,7 +88,9 @@ internal fun RootPhoneHarness.executePullFile(base: Context, input: JSONObject):
                 throw Exception("手机端 /sdcard/Download 与截图目录中未找到可拉取的最新文件")
             }
             val baseName = resolvedPhonePath.substringAfterLast('/').ifBlank { "pulled_file" }.replace(Regex("[^A-Za-z0-9._-]"), "_")
-            val tmp = java.io.File.createTempFile("pull_", "_$baseName", base.cacheDir)
+            val stageDir = if (privilege?.getGrantedUid() == 0) base.cacheDir else (base.externalCacheDir ?: base.cacheDir)
+            if (!stageDir.exists()) stageDir.mkdirs()
+            val tmp = java.io.File.createTempFile("pull_", "_$baseName", stageDir)
             if (tmp.exists()) tmp.delete()
             stagedCopy = tmp
             val safeSrc = "'" + resolvedPhonePath.replace("'", "'\\''") + "'"

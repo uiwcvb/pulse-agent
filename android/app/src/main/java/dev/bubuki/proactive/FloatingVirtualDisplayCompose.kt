@@ -3,6 +3,8 @@ package dev.bubuki.proactive
 import android.graphics.BitmapFactory
 import android.util.Base64
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.snap
@@ -10,6 +12,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
 import androidx.compose.foundation.Canvas as ComposeCanvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -36,6 +39,8 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker as ComposeVelocity
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -63,7 +68,7 @@ internal fun InAppFloatingVirtualDisplay() {
     val disp = remember(state.display) { runCatching { JSONObject(state.display) }.getOrDefault(JSONObject()) }
     val created = disp.optBoolean("created")
     val visible = created && !userDismissed && state.phase != "stopping" && state.phase != "stopped" && !systemOverlayShowing
-    if (!visible) return
+    val reduceMotion = rememberReducedMotion() || animationsOff(context)
     var expanded by remember { mutableStateOf(false) }
     var pickingApp by remember { mutableStateOf(false) }
     var inputBarOpen by remember { mutableStateOf(false) }
@@ -83,21 +88,18 @@ internal fun InAppFloatingVirtualDisplay() {
             hiddenToPill = false
         }
     }
-    val bitmap by produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, state.image) {
-        value = withContext(Dispatchers.Default) {
-            if (state.image.isBlank()) null
-            else {
-                FloatingVirtualDisplay.cachedBitmap()?.asImageBitmap() ?: runCatching {
-                    val bytes = Base64.decode(state.image, Base64.DEFAULT)
-                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-                }.getOrNull()
-            }
+    val bitmap by produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, visible, state.image) {
+        value = if (!visible || state.image.isBlank()) null else withContext(Dispatchers.Default) {
+            FloatingVirtualDisplay.cachedBitmap()?.asImageBitmap() ?: runCatching {
+                val bytes = Base64.decode(state.image, Base64.DEFAULT)
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+            }.getOrNull()
         }
     }
     AnimatedVisibility(
         visible = visible,
-        enter = fadeIn(tween(220)),
-        exit = fadeOut(tween(180))
+        enter = if (reduceMotion) EnterTransition.None else scaleIn(iosInteractiveSpring(), initialScale = 0.94f) + fadeIn(tween(160)),
+        exit = if (reduceMotion) ExitTransition.None else fadeOut(tween(110))
     ) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val density = LocalDensity.current
@@ -107,6 +109,7 @@ internal fun InAppFloatingVirtualDisplay() {
                 expanded = false
                 pickingApp = false
                 inputBarOpen = false
+                FloatingVirtualDisplay.markUserDismissedFor(60_000L)
                 AgentForegroundService.onUserForceClosedVirtualDisplay(context)
                 FloatingVirtualDisplay.hide()
                 scope.launch(Dispatchers.IO) {
@@ -155,7 +158,6 @@ internal fun InAppFloatingVirtualDisplay() {
             val baseInnerW = shortSideDp * frac
             val innerW = minOf(baseInnerW, availWDp, availHDp / aspect).coerceAtLeast(68.dp)
             val innerH = (innerW * aspect).coerceAtLeast(68.dp)
-            val reduceMotion = LocalReduceMotion.current || animationsOff(context)
             val sizeSpec: AnimationSpec<Dp> = if (reduceMotion) snap() else spring(dampingRatio = 0.84f, stiffness = 390f)
             val w by animateDpAsState(innerW + padDp * 2, sizeSpec, label = "pipW")
             val h by animateDpAsState(innerH + padDp * 2, sizeSpec, label = "pipH")
@@ -172,6 +174,16 @@ internal fun InAppFloatingVirtualDisplay() {
             var springJob by remember { mutableStateOf<Job?>(null) }
             val outerShape = RoundedCornerShape(if (expanded) 22.dp else 17.dp)
             val innerShape = RoundedCornerShape(if (expanded) 17.5.dp else 13.5.dp)
+            val curExpanded by rememberUpdatedState(expanded)
+            val curMaxW by rememberUpdatedState(maxW)
+            val curMaxH by rememberUpdatedState(maxH)
+            val curWPx by rememberUpdatedState(wPx)
+            val curHPx by rememberUpdatedState(hPx)
+            val curAnchorX by rememberUpdatedState(anchorX)
+            val curAnchorY by rememberUpdatedState(anchorY)
+            val curPhase by rememberUpdatedState(state.phase)
+            val curDispW by rememberUpdatedState(dispW)
+            val curDispH by rememberUpdatedState(dispH)
             Box(
                 Modifier
                     .offset {
@@ -187,11 +199,11 @@ internal fun InAppFloatingVirtualDisplay() {
                     .clip(outerShape)
                     .background(Color(PEARL_WHITE_FILL_INT), outerShape)
                     .border(0.9.dp, Color(pearlOuterStrokeColorInt(state.phase)), outerShape)
-                    .pointerInput(expanded, maxW, maxH, wPx, hPx) {
+                    .pointerInput(Unit) {
                         val velocityTracker = ComposeVelocityTracker()
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
-                            if (expanded && down.position.y > topGrabZonePx) return@awaitEachGesture
+                            if (curExpanded && down.position.y > topGrabZonePx) return@awaitEachGesture
                             springJob?.cancel()
                             velocityTracker.resetTracking()
                             velocityTracker.addPosition(down.uptimeMillis, down.position)
@@ -214,12 +226,16 @@ internal fun InAppFloatingVirtualDisplay() {
                             }
                             if (dragged) {
                                 val v = velocityTracker.calculateVelocity()
-                                val curX = anchorX + dragOffset.x
-                                val curY = anchorY + dragOffset.y
+                                val mW = curMaxW
+                                val mH = curMaxH
+                                val boxW = curWPx
+                                val boxH = curHPx
+                                val curX = curAnchorX + dragOffset.x
+                                val curY = curAnchorY + dragOffset.y
                                 val edgeSide = PipSpringPhysics.edgeDockSideOnDragUp(
                                     curX.roundToInt(),
-                                    wPx,
-                                    maxW,
+                                    boxW,
+                                    mW,
                                     v.x,
                                     marginPx * 3
                                 )
@@ -235,30 +251,34 @@ internal fun InAppFloatingVirtualDisplay() {
                                 val targetCorner = PipSpringPhysics.nearestCorner(
                                     curX + PipSpringPhysics.project(v.x),
                                     curY + PipSpringPhysics.project(v.y),
-                                    maxW, maxH, wPx, hPx, marginPx, topSafePx, bottomSafePx
+                                    mW, mH, boxW, boxH, marginPx, topSafePx, bottomSafePx
                                 )
-                                val (newAnchorX, newAnchorY) = PipSpringPhysics.cornerPosition(targetCorner, maxW, maxH, wPx, hPx, marginPx, topSafePx, bottomSafePx)
+                                val (newAnchorX, newAnchorY) = PipSpringPhysics.cornerPosition(targetCorner, mW, mH, boxW, boxH, marginPx, topSafePx, bottomSafePx)
                                 val startDx = curX - newAnchorX
                                 val startDy = curY - newAnchorY
                                 corner = targetCorner
-                                dragOffset = Offset(startDx, startDy)
-                                springJob = scope.launch {
-                                    val startNanos = withFrameNanos { it }
-                                    while (isActive) {
-                                        val nowNanos = withFrameNanos { it }
-                                        val tSec = (nowNanos - startNanos) / 1_000_000_000f
-                                        if (tSec >= 0.42f) {
-                                            dragOffset = Offset.Zero
-                                            break
+                                if (reduceMotion) {
+                                    dragOffset = Offset.Zero
+                                } else {
+                                    dragOffset = Offset(startDx, startDy)
+                                    springJob = scope.launch {
+                                        val startNanos = withFrameNanos { it }
+                                        while (isActive) {
+                                            val nowNanos = withFrameNanos { it }
+                                            val tSec = (nowNanos - startNanos) / 1_000_000_000f
+                                            if (tSec >= 0.42f) {
+                                                dragOffset = Offset.Zero
+                                                break
+                                            }
+                                            val nx = PipSpringPhysics.stepCriticalSpring(startDx, 0f, v.x, tSec)
+                                            val ny = PipSpringPhysics.stepCriticalSpring(startDy, 0f, v.y, tSec)
+                                            dragOffset = Offset(nx, ny)
                                         }
-                                        val nx = PipSpringPhysics.stepCriticalSpring(startDx, 0f, v.x, tSec)
-                                        val ny = PipSpringPhysics.stepCriticalSpring(startDy, 0f, v.y, tSec)
-                                        dragOffset = Offset(nx, ny)
                                     }
                                 }
-                            } else if (!expanded) {
+                            } else if (!curExpanded) {
                                 expanded = true
-                                if (state.phase == "waiting_user" && tierState == FloatingVirtualDisplay.SizeTier.COMPACT) {
+                                if (curPhase == "waiting_user" && tierState == FloatingVirtualDisplay.SizeTier.COMPACT) {
                                     tierState = FloatingVirtualDisplay.SizeTier.MEDIUM
                                 }
                             }
@@ -279,39 +299,53 @@ internal fun InAppFloatingVirtualDisplay() {
                             "虚拟屏实时画面",
                             Modifier
                                 .fillMaxSize()
-                                .pointerInput(expanded, state.phase, state.imageInfo) {
-                                    if (!expanded) return@pointerInput
+                                .pointerInput(Unit) {
                                     awaitEachGesture {
+                                        if (!curExpanded) return@awaitEachGesture
                                         val down = awaitFirstDown(requireUnconsumed = false)
-                                        fun mx(v: Float) = (v / size.width.coerceAtLeast(1) * dispW).toInt().coerceIn(0, dispW - 1)
-                                        fun my(v: Float) = (v / size.height.coerceAtLeast(1) * dispH).toInt().coerceIn(0, dispH - 1)
-                                        RootPhoneHarness.sendLiveTouch(context, "down", mx(down.position.x), my(down.position.y))
-                                        var end = down.position
+                                        val dw = curDispW
+                                        val dh = curDispH
+                                        fun mx(v: Float) = (v / size.width.coerceAtLeast(1) * dw).toInt().coerceIn(0, dw - 1)
+                                        fun my(v: Float) = (v / size.height.coerceAtLeast(1) * dh).toInt().coerceIn(0, dh - 1)
                                         var lastMoveAt = android.os.SystemClock.uptimeMillis()
                                         var lastX = mx(down.position.x)
                                         var lastY = my(down.position.y)
-                                        do {
-                                            val ev = awaitPointerEvent()
-                                            val ptr = ev.changes.firstOrNull { it.id == down.id } ?: break
-                                            end = ptr.position
-                                            ptr.consume()
-                                            if (ptr.pressed) {
-                                                val now = android.os.SystemClock.uptimeMillis()
-                                                val tx = mx(end.x)
-                                                val ty = my(end.y)
-                                                if (now - lastMoveAt >= 10L || abs(tx - lastX) + abs(ty - lastY) >= 2) {
-                                                    lastMoveAt = now
-                                                    lastX = tx
-                                                    lastY = ty
-                                                    RootPhoneHarness.sendLiveTouch(context, "move", tx, ty)
+                                        var sentDown = false
+                                        var sentEnd = false
+                                        try {
+                                            RootPhoneHarness.sendLiveTouch(context, "down", lastX, lastY)
+                                            sentDown = true
+                                            do {
+                                                val ev = awaitPointerEvent()
+                                                val ptr = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                                val pos = ptr.position
+                                                ptr.consume()
+                                                if (ptr.pressed) {
+                                                    val now = android.os.SystemClock.uptimeMillis()
+                                                    val tx = mx(pos.x)
+                                                    val ty = my(pos.y)
+                                                    if (now - lastMoveAt >= 10L || abs(tx - lastX) + abs(ty - lastY) >= 2) {
+                                                        lastMoveAt = now
+                                                        lastX = tx
+                                                        lastY = ty
+                                                        RootPhoneHarness.sendLiveTouch(context, "move", tx, ty)
+                                                    }
+                                                } else {
+                                                    lastX = mx(pos.x)
+                                                    lastY = my(pos.y)
+                                                    RootPhoneHarness.sendLiveTouch(context, "up", lastX, lastY)
+                                                    sentEnd = true
+                                                    break
                                                 }
+                                            } while (true)
+                                        } finally {
+                                            if (sentDown && !sentEnd) {
+                                                RootPhoneHarness.sendLiveTouch(context, "cancel", lastX, lastY)
                                             }
-                                            if (!ptr.pressed) break
-                                        } while (true)
-                                        RootPhoneHarness.sendLiveTouch(context, "up", mx(end.x), my(end.y))
+                                        }
                                     }
                                 },
-                            contentScale = ContentScale.Crop
+                            contentScale = ContentScale.FillBounds
                         )
                     } else {
                         Text(
@@ -342,7 +376,8 @@ internal fun InAppFloatingVirtualDisplay() {
                     }
                     if (!expanded) {
                         ComposePipCircleButton(
-                            modifier = Modifier.align(Alignment.TopStart).padding(4.dp).size(20.dp),
+                            modifier = Modifier.align(Alignment.TopStart),
+                            contentLabel = "收起虚拟屏到边缘悬浮球",
                             onClick = { hiddenToPill = true }
                         ) {
                             val strokeW = 1.4.dp.toPx()
@@ -350,8 +385,9 @@ internal fun InAppFloatingVirtualDisplay() {
                             drawLine(c, Offset(size.width * 0.28f, size.height * 0.5f), Offset(size.width * 0.72f, size.height * 0.5f), strokeW, StrokeCap.Round)
                         }
                         ComposePipCircleButton(
-                            modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(20.dp),
+                            modifier = Modifier.align(Alignment.TopEnd),
                             isDanger = true,
+                            contentLabel = "关闭虚拟屏",
                             onClick = { handleUserClose() }
                         ) {
                             val strokeW = 1.4.dp.toPx()
@@ -437,22 +473,33 @@ internal fun InAppFloatingVirtualDisplay() {
 internal fun ComposePipCircleButton(
     modifier: Modifier = Modifier,
     isDanger: Boolean = false,
+    contentLabel: String? = null,
     onClick: () -> Unit,
     drawIcon: androidx.compose.ui.graphics.drawscope.DrawScope.() -> Unit
 ) {
     Box(
         modifier
-            .size(26.dp)
-            .clip(CircleShape)
-            .background(if (isDanger) Color(0xCC3B171B) else Color(0xA6141418))
-            .border(
-                0.8.dp,
-                if (isDanger) Color(0x66FF6961) else Color(0x38FFFFFF),
-                CircleShape
-            )
-            .clickable(onClick = onClick),
+            .size(36.dp)
+            .iosPressScale(0.90f, onClick = onClick)
+            .then(
+                if (!contentLabel.isNullOrBlank()) Modifier.semantics { contentDescription = contentLabel }
+                else Modifier
+            ),
         contentAlignment = Alignment.Center
     ) {
-        ComposeCanvas(Modifier.fillMaxSize(), onDraw = drawIcon)
+        Box(
+            Modifier
+                .size(24.dp)
+                .clip(CircleShape)
+                .background(if (isDanger) Color(0xCC3B171B) else Color(0xA6141418))
+                .border(
+                    0.5.dp,
+                    if (isDanger) Color(0x66FF6961) else Color(0x38FFFFFF),
+                    CircleShape
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            ComposeCanvas(Modifier.fillMaxSize(), onDraw = drawIcon)
+        }
     }
 }

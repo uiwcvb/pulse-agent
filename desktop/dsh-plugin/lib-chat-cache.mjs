@@ -22,8 +22,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const HOSTNAME = os.hostname() || "Windows-PC";
 export const PC_DEVICE_ID = `pc-${HOSTNAME.toLowerCase().replace(/[^a-z0-9_-]/g, "-")}`;
@@ -92,6 +93,7 @@ export const runtimeState = {
   sessionDetailById: new Map(),
   localMessagesCache: null,
   messagesEpoch: 1,
+  cloudMessagesEpoch: 0,
   removedMessageIds: new Set(),
   inflightControllersByBot: new Map(),
   abortedEpochByBot: new Map(),
@@ -255,6 +257,34 @@ export function findBotByIdOrName(botIdOrName) {
   return roster.find((b) => b.id.toLowerCase() === q || b.name.toLowerCase() === q) || roster[0];
 }
 
+export function findBotByIdOrNameExact(botIdOrName) {
+  const raw = String(botIdOrName || "").trim();
+  if (!raw) return null;
+  const roster = loadBotsRosterFromDisk();
+  const q = raw.toLowerCase();
+  for (const [localId, cloudId] of runtimeState.cloudBotIdByLocalId.entries()) {
+    if (cloudId.toLowerCase() === q) return roster.find((b) => b.id === localId) || null;
+  }
+  return roster.find((b) => b.id.toLowerCase() === q || b.name.toLowerCase() === q) || null;
+}
+
+function capMessagesPerBot(sortedMsgs, maxPerBot = 120, maxTotal = 400) {
+  if (!Array.isArray(sortedMsgs) || sortedMsgs.length === 0) return [];
+  const counts = new Map();
+  const keptRev = [];
+  for (let i = sortedMsgs.length - 1; i >= 0; i--) {
+    const m = sortedMsgs[i];
+    const bid = String(m?.bot_id || "pc_engineer");
+    const c = counts.get(bid) || 0;
+    if (c < maxPerBot) {
+      keptRev.push(m);
+      counts.set(bid, c + 1);
+    }
+  }
+  keptRev.reverse();
+  return keptRev.length > maxTotal ? keptRev.slice(-maxTotal) : keptRev;
+}
+
 export function resolveCloudBotId(localBotId) {
   return runtimeState.cloudBotIdByLocalId.get(localBotId) || localBotId || "pc_engineer";
 }
@@ -301,8 +331,9 @@ export function sanitizeMessagesList(rawMessages) {
     if ((!text && !sticker && !attachments.length) || m.source !== "pc") continue;
     const nKind = normMsgKind(m.kind);
     const role = (m.role === "user" && nKind !== "bot_message") ? "user" : "assistant";
-    const botId = findBotByIdOrName(m.bot_id || "pc_engineer")?.id || "pc_engineer";
-    const fromResolvedId = m.from_bot_id ? (findBotByIdOrName(m.from_bot_id)?.id || m.from_bot_id) : "";
+    const rawBotId = String(m.bot_id || "").trim();
+    const botId = (rawBotId ? (findBotByIdOrNameExact(rawBotId)?.id || rawBotId) : "pc_engineer");
+    const fromResolvedId = m.from_bot_id ? (findBotByIdOrNameExact(m.from_bot_id)?.id || m.from_bot_id) : "";
     if (nKind === "bot_message" && m.direction === "outbound") continue;
     if (role === "assistant" && fromResolvedId && fromResolvedId !== botId && nKind !== "bot_message") continue;
     const incomingTrace = nKind === "bot_message"
@@ -348,8 +379,17 @@ export function sanitizeMessagesList(rawMessages) {
       time: fmtTime,
     };
     const prev = out[out.length - 1];
+    const idsCompatible =
+      prev &&
+      (prev.id === norm.id ||
+        prev.id === `reply-${norm.id}` ||
+        `reply-${prev.id}` === norm.id ||
+        String(prev.id || "").startsWith("reply-") ||
+        String(norm.id || "").startsWith("reply-"));
     const sameAssistantReply =
       prev &&
+      idsCompatible &&
+      prev.role === "assistant" &&
       !prev.is_sub_turn &&
       !norm.is_sub_turn &&
       prev.bot_id === norm.bot_id &&
@@ -385,7 +425,7 @@ export function sanitizeMessagesList(rawMessages) {
     }
     out.push(norm);
   }
-  return sortPcMessagesDeterministically(out).slice(-160);
+  return capMessagesPerBot(sortPcMessagesDeterministically(out));
 }
 
 export function mergeCloudPcMessagesIntoCache(cloudMessages) {
@@ -413,8 +453,9 @@ export function mergeCloudPcMessagesIntoCache(cloudMessages) {
     const cmKind = normMsgKind(cm.kind);
     const role = (cm.role === "user" && cmKind !== "bot_message") ? "user" : "assistant";
     const fallbackBotId = runtimeState.activeBotId || "pc_engineer";
-    const botId = findBotByIdOrName(cm.bot_id || fallbackBotId)?.id || fallbackBotId;
-    const fromResolvedId = cm.from_bot_id ? (findBotByIdOrName(cm.from_bot_id)?.id || cm.from_bot_id) : "";
+    const rawBotId = String(cm.bot_id || "").trim();
+    const botId = rawBotId ? (findBotByIdOrNameExact(rawBotId)?.id || rawBotId) : fallbackBotId;
+    const fromResolvedId = cm.from_bot_id ? (findBotByIdOrNameExact(cm.from_bot_id)?.id || cm.from_bot_id) : "";
     if (cmKind === "bot_message" && cm.direction === "outbound") continue;
     if (role === "assistant" && fromResolvedId && fromResolvedId !== botId && cmKind !== "bot_message") continue;
     const cmMetrics = cm.metrics && typeof cm.metrics === "object" ? cm.metrics : {};
@@ -423,10 +464,30 @@ export function mergeCloudPcMessagesIntoCache(cloudMessages) {
     for (let i = cached.length - 1; i >= 0; i--) {
       const x = cached[i];
       if (!x) continue;
-      if (
-        (cid && (x.id === cid || x.id === replyCid || x.id === pcCid || x.client_msg_id === cid || x.id === cm.client_msg_id || (cm.client_msg_id && x.client_msg_id === cm.client_msg_id))) ||
-        (!cm.is_sub_turn && !x.is_sub_turn && x.bot_id === botId && x.role === role && x.text === text && (x.sticker || "") === sticker && (normMsgKind(x.kind) === cmKind || (role === "assistant" && normMsgKind(x.kind) !== "bot_message" && cmKind !== "bot_message")))
-      ) {
+      const xId = String(x.id || "");
+      const idMatched = Boolean(
+        cid && (
+          xId === cid ||
+          xId === replyCid ||
+          xId === pcCid ||
+          x.client_msg_id === cid ||
+          xId === cm.client_msg_id ||
+          (cm.client_msg_id && x.client_msg_id === cm.client_msg_id)
+        )
+      );
+      const isPlaceholderX = xId.startsWith("pc-") || xId.startsWith("reply-");
+      const timeNear = !cmCreatedMs || !x.created || Math.abs(cmCreatedMs - Number(x.created)) <= 15000;
+      const fallbackTextMatch =
+        isPlaceholderX &&
+        timeNear &&
+        !cm.is_sub_turn &&
+        !x.is_sub_turn &&
+        x.bot_id === botId &&
+        x.role === role &&
+        x.text === text &&
+        (x.sticker || "") === sticker &&
+        (normMsgKind(x.kind) === cmKind || (role === "assistant" && normMsgKind(x.kind) !== "bot_message" && cmKind !== "bot_message"));
+      if (idMatched || fallbackTextMatch) {
         existingIdx = i;
         break;
       }

@@ -92,16 +92,12 @@ public class DisplayTestActivity extends Activity {
     private TextView countBadgeText;
     private EditText searchInput;
     private float uiScale = 2.5f;
+    private Object backCallback;
 
     private void initUiScale() {
         try {
-            android.graphics.Point pt = new android.graphics.Point();
-            if (getDisplay() != null) {
-                getDisplay().getRealSize(pt);
-            } else {
-                getWindowManager().getDefaultDisplay().getRealSize(pt);
-            }
-            int shortSide = Math.min(pt.x, pt.y);
+            android.graphics.Rect bounds = getWindowManager().getCurrentWindowMetrics().getBounds();
+            int shortSide = Math.min(bounds.width(), bounds.height());
             if (shortSide >= 320) {
                 // Anchor virtual home layout to 420dp logical width regardless of system/process densityDpi or fontScale
                 uiScale = shortSide / 420f;
@@ -268,6 +264,14 @@ public class DisplayTestActivity extends Activity {
         setContentView(root);
         root.requestFocus();
 
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            android.window.OnBackInvokedCallback cb = this::handleBackPress;
+            backCallback = cb;
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb
+            );
+        }
+
         loadAppsAndRender();
     }
 
@@ -325,6 +329,7 @@ public class DisplayTestActivity extends Activity {
         new Thread(() -> {
             List<HomeAppEntry> loaded = queryInstalledLauncherApps();
             runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
                 allApps.clear();
                 allApps.addAll(loaded);
                 String curQuery = searchInput != null && searchInput.getText() != null
@@ -464,22 +469,44 @@ public class DisplayTestActivity extends Activity {
             hideKeyboard(v);
             final int dispId = getDisplay() != null ? getDisplay().getDisplayId() : -1;
             final Context appCtx = getApplicationContext();
-            new Thread(() -> {
+            try {
+                Intent launchIntent = new Intent(appCtx, RootPhoneService.class)
+                    .setAction(RootPhoneService.ACTION_VIRTUAL_HOME_LAUNCH)
+                    .putExtra(RootPhoneService.EXTRA_COMPONENT, app.component)
+                    .putExtra(RootPhoneService.EXTRA_DISPLAY_ID, dispId);
                 try {
-                    RootPhoneHarness.launchFromVirtualHome(appCtx, dispId, app.component);
-                } catch (Throwable ignored) {}
-            }, "pulse-vd-home-launch").start();
+                    appCtx.startForegroundService(launchIntent);
+                } catch (Throwable fgErr) {
+                    appCtx.startService(launchIntent);
+                }
+            } catch (Throwable ignored) {}
         });
         return cell;
     }
 
-    @Override
-    public void onBackPressed() {
+    private void handleBackPress() {
         if (searchInput != null && searchInput.getText() != null && searchInput.getText().length() > 0) {
             searchInput.setText("");
             hideKeyboard(searchInput);
             return;
         }
         // VirtualDisplay Home Launcher anchor: never finish on BACK so the stack bottom stays clean.
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    public void onBackPressed() {
+        handleBackPress();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 && backCallback != null) {
+            getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(
+                (android.window.OnBackInvokedCallback) backCallback
+            );
+            backCallback = null;
+        }
+        super.onDestroy();
     }
 }

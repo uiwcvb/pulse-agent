@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
@@ -90,7 +90,28 @@ export async function createDshSidecarKernel(options) {
   const sessionStates = new Map();
   /** @type {Map<string, Promise<any>>} */
   const inflightCreates = new Map();
+  /** @type {Map<string, Promise<any>>} */
+  const sessionOpsChains = new Map();
+  let lastToolsHash = '';
   let closingPromise = null;
+
+  function serializeSessionOp(sessionKey, fn) {
+    const prev = sessionOpsChains.get(sessionKey) || Promise.resolve();
+    const next = prev.catch(() => {}).then(fn);
+    sessionOpsChains.set(sessionKey, next);
+    return next.finally(() => {
+      if (sessionOpsChains.get(sessionKey) === next) {
+        sessionOpsChains.delete(sessionKey);
+      }
+    });
+  }
+
+  function clearAttemptStateForSession(sid) {
+    const prefix = `${sid}:`;
+    for (const k of Array.from(attemptState.keys())) {
+      if (k.startsWith(prefix)) attemptState.delete(k);
+    }
+  }
 
   const toolsBridge = PythonToolsPlugin.apply(ctx, {
     getPyPort: () => pyPort,
@@ -203,6 +224,7 @@ export async function createDshSidecarKernel(options) {
       const stateRec = {
         handle: null,
         systemText: initOpts.systemText || DEFAULT_SYSTEM_TEXT,
+        compactionCheckpoint: initOpts.compactionCheckpoint || '',
         agentCtx: null,
         restrictDisposer: null,
         meta: { botId: 'companion', source: 'phone', turnId: '' },
@@ -220,7 +242,11 @@ export async function createDshSidecarKernel(options) {
           order: 100,
           complete: true,
           interpolate: false,
-          text: () => stateRec.systemText || DEFAULT_SYSTEM_TEXT,
+          text: () => {
+            const parts = [stateRec.systemText || DEFAULT_SYSTEM_TEXT];
+            if (stateRec.compactionCheckpoint) parts.push(stateRec.compactionCheckpoint);
+            return parts.join('\n\n');
+          },
         });
       };
 
@@ -293,20 +319,31 @@ export async function createDshSidecarKernel(options) {
 
   /**
    * Dispose agent handle and remove persisted JSONL session for `sessionKey` (including `<workDir>/<sessionId>/session.v4.jsonl`).
+   * Serialized with session operations so resets never race with active turns.
    * @param {string} sessionKey
    */
-  async function resetSession(sessionKey) {
+  async function _resetSessionImpl(sessionKey) {
     const rec = sessionStates.get(sessionKey);
     if (rec) {
       if (rec.handle && !rec.cancelled) {
         rec.cancelled = true;
         try {
-          rec.handle.abort?.();
+          if (rec.handle.agent?.cancel) {
+            rec.handle.agent.cancel({ kind: 'user' });
+          } else {
+            rec.handle.abort?.();
+          }
         } catch {
           // ignore
         }
       }
+      try {
+        rec.settleIdle?.();
+      } catch {
+        // ignore
+      }
       sessionStates.delete(sessionKey);
+      clearAttemptStateForSession(String(SessionId(sessionKey)));
       try {
         rec.restrictDisposer?.();
       } catch {
@@ -318,9 +355,28 @@ export async function createDshSidecarKernel(options) {
         // ignore
       }
     }
+    try {
+      adapter.deleteRoute?.(sessionKey);
+    } catch {
+      // ignore
+    }
     const targetKeys = new Set([sessionKey, encodeURIComponent(sessionKey)]);
     const removedCount = removePersistedSessionArtifacts(sessionsDir, targetKeys, 0);
     return { ok: true, reset: sessionKey, removed: removedCount };
+  }
+
+  async function resetSession(sessionKey) {
+    const sk = String(sessionKey || '');
+    const rec = sessionStates.get(sk);
+    if (rec?.handle && !rec.cancelled) {
+      rec.cancelled = true;
+      try {
+        if (rec.handle.agent?.cancel) rec.handle.agent.cancel({ kind: 'user' });
+      } catch {
+        // ignore
+      }
+    }
+    return serializeSessionOp(sk, () => _resetSessionImpl(sk));
   }
 
   /**
@@ -344,13 +400,21 @@ export async function createDshSidecarKernel(options) {
    */
   async function runTurn(payload, onEvent) {
     const sessionKey = String(payload.session_key || `${payload.source || 'phone'}__${payload.bot_id || 'companion'}`);
+    return serializeSessionOp(sessionKey, () => _runTurnImpl(sessionKey, payload, onEvent));
+  }
+
+  async function _runTurnImpl(sessionKey, payload, onEvent) {
     if (payload.py_port) pyPort = Number(payload.py_port);
     if (payload.py_secret) pySecret = String(payload.py_secret);
     if (Array.isArray(payload.tool_schemas) && payload.tool_schemas.length > 0) {
-      toolsBridge.syncTools(payload.tool_schemas);
+      const schemaHash = createHash('sha1').update(JSON.stringify(payload.tool_schemas)).digest('hex');
+      if (schemaHash !== lastToolsHash) {
+        toolsBridge.syncTools(payload.tool_schemas);
+        lastToolsHash = schemaHash;
+      }
     }
     if (payload.reset_session) {
-      await resetSession(sessionKey);
+      await _resetSessionImpl(sessionKey);
     }
 
     if (payload.llm && typeof payload.llm === 'object') {
@@ -364,8 +428,13 @@ export async function createDshSidecarKernel(options) {
 
     const rec = await ensureSession(sessionKey, {
       systemText: payload.system_prompt,
+      compactionCheckpoint: payload.compaction_checkpoint || '',
       model: payload.llm?.model,
     });
+    if (typeof payload.compaction_checkpoint === 'string') {
+      rec.compactionCheckpoint = payload.compaction_checkpoint;
+    }
+    const turnEphemeralRecall = typeof payload.ephemeral_recall === 'string' ? payload.ephemeral_recall.trim() : '';
     const agent = rec.handle.agent;
 
     if (payload.llm?.model) {
@@ -387,9 +456,7 @@ export async function createDshSidecarKernel(options) {
     if (Array.isArray(payload.allowed_tools) && rec.agentCtx) {
       const known = new Set(ctx.tools.schemas().map((s) => s.name));
       const allowList = payload.allowed_tools.filter((n) => known.has(n));
-      if (allowList.length > 0) {
-        rec.restrictDisposer = rec.agentCtx.tools.restrict({ allow: allowList });
-      }
+      rec.restrictDisposer = rec.agentCtx.tools.restrict({ allow: allowList });
     }
 
     rec.meta = {
@@ -495,39 +562,59 @@ export async function createDshSidecarKernel(options) {
       const lines = keptLines.join('\n');
       textBody = `[近期完整对话与工具链轨迹]\n${lines}\n\n[当前新消息]\n${textBody}`;
     }
+    if (turnEphemeralRecall) {
+      textBody = textBody ? `${textBody}\n\n${turnEphemeralRecall}` : turnEphemeralRecall;
+    }
     if (textBody || content.length === 0) {
       content.push({ type: 'text', text: textBody || ' ' });
     }
 
-    const idlePromise = new Promise((resolve) => {
+    let statusDispose = null;
+    let settleIdleFn = null;
+    const idlePromise = new Promise((resolve, reject) => {
+      let settled = false;
       let sawRunning = agent.status === 'running';
-      const dispose = ctx.on('agent/status', ({ agent: a, status }) => {
+      const settle = (err) => {
+        if (settled) return;
+        settled = true;
+        rec.settleIdle = null;
+        if (statusDispose) {
+          try { statusDispose(); } catch {}
+          statusDispose = null;
+        }
+        if (err) reject(err);
+        else resolve();
+      };
+      settleIdleFn = settle;
+      rec.settleIdle = () => settle();
+      statusDispose = ctx.on('agent/status', ({ agent: a, status }) => {
         if (String(a.id) !== sessionKey) return;
         if (status === 'running') sawRunning = true;
-        if (status === 'idle' && sawRunning) {
-          dispose();
-          resolve();
-        }
-      });
-      // Safety fallback if idle immediately without transition
-      queueMicrotask(() => {
-        if (!sawRunning && agent.status === 'idle') {
-          // Will transition synchronously on agent.followup below unless immediately rejected
-        }
+        if (status === 'idle' && sawRunning) settle();
       });
     });
 
     const turnStartEventIdx = agent.session.snapshotEvents().length;
-
-    agent.followup(
-      createUserMessage({
-        content,
-        source: { kind: 'user' },
-      }),
-    );
-
-    await idlePromise;
-    rec.emitEvent = null;
+    try {
+      agent.followup(
+        createUserMessage({
+          content,
+          source: { kind: 'user' },
+        }),
+      );
+      await idlePromise;
+    } catch (err) {
+      settleIdleFn?.(err);
+      throw err;
+    } finally {
+      rec.settleIdle = null;
+      rec.emitEvent = null;
+      clearAttemptStateForSession(String(SessionId(sessionKey)));
+      if (statusDispose) {
+        try { statusDispose(); } catch {}
+        statusDispose = null;
+      }
+    }
 
     // Extract ALL chronological assistant prose blocks AND interleaved tool items into `timeline`
     const committedSegments = [];
@@ -620,13 +707,44 @@ export async function createDshSidecarKernel(options) {
     };
   }
 
-  /** @param {string} sessionKey */
-  function cancelTurn(sessionKey) {
+  /**
+   * @param {string} sessionKey
+   * @param {string} [turnId]
+   */
+  function cancelTurn(sessionKey, turnId) {
     const rec = sessionStates.get(sessionKey);
     if (!rec) return { ok: true, cancelled: false };
+    if (turnId && rec.meta?.turnId && String(turnId) !== String(rec.meta.turnId)) {
+      return { ok: true, cancelled: false, reason: 'turn_id_mismatch' };
+    }
     rec.cancelled = true;
-    rec.handle.agent.cancel({ kind: 'user' });
+    try {
+      rec.handle.agent.cancel({ kind: 'user' });
+    } catch {
+      try { rec.settleIdle?.(); } catch {}
+    }
     return { ok: true, cancelled: true };
+  }
+
+  async function keepaliveSession(sessionKey) {
+    const sk = String(sessionKey || '');
+    const rec = sessionStates.get(sk);
+    if (!rec || !rec.handle?.agent) {
+      return { ok: true, skipped: true, reason: 'session_not_warm' };
+    }
+    if (rec.handle.agent.status === 'running') {
+      return { ok: true, skipped: true, reason: 'session_busy' };
+    }
+    if (typeof adapter.pingPrefixKeepalive !== 'function') {
+      return { ok: true, skipped: true, reason: 'adapter_unsupported' };
+    }
+    return serializeSessionOp(sk, async () => {
+      const latest = sessionStates.get(sk);
+      if (!latest || !latest.handle?.agent || latest.handle.agent.status === 'running') {
+        return { ok: true, skipped: true, reason: 'session_busy' };
+      }
+      return adapter.pingPrefixKeepalive(sk);
+    });
   }
 
   function statusSummary() {
@@ -647,6 +765,11 @@ export async function createDshSidecarKernel(options) {
     closingPromise = (async () => {
       for (const rec of Array.from(sessionStates.values())) {
         try {
+          rec.settleIdle?.();
+        } catch {
+          // ignore
+        }
+        try {
           rec.restrictDisposer?.();
         } catch {
           // ignore
@@ -658,6 +781,7 @@ export async function createDshSidecarKernel(options) {
         }
       }
       sessionStates.clear();
+      attemptState.clear();
       await ctx.fiber.dispose();
     })();
     return closingPromise;
@@ -669,6 +793,7 @@ export async function createDshSidecarKernel(options) {
     runTurn,
     cancelTurn,
     resetSession,
+    keepaliveSession,
     statusSummary,
     close,
   };

@@ -232,11 +232,16 @@ class CloudStuckDetector:
                     break
             if stag >= 3:
                 self.nudge_counts['visual_stagnation'] = self.nudge_counts.get('visual_stagnation', 0) + 1
-                return StuckVerdict(
-                    'nudge',
-                    'visual_stagnation',
-                    f'连续 {stag} 次在相近坐标或同一动作上操作但画面未变化。建议用 `{zoom_hint}` 放大核实目标坐标、微调坐标/动作类型或更换入口。',
-                )
+                if tool_lbl == 'cloud':
+                    ref_warn = '注意 `@bN` 在动态网页中可能漂移失效，立即停止重复点击同族 ref；' if rec['ref'] else ''
+                    pivot_msg = (
+                        f'连续 {stag} 次在相近目标/坐标操作但云电脑画面未变化。{ref_warn}'
+                        '请勿停手等用户确认，立即按优先级切换定位策略：① `cloud(op="eval_js", script="...")` 直接用 CDP/JS 操作 DOM；'
+                        '② `cloud(op="zoom", box=...)` 放大后改传精确 `nx, ny` 坐标；③ `cloud(op="key", key="Tab")` 键盘切换。'
+                    )
+                else:
+                    pivot_msg = f'连续 {stag} 次在相近坐标或同一动作上操作但画面未变化。建议用 `{zoom_hint}` 放大核实目标坐标、微调坐标/动作类型或更换入口。'
+                return StuckVerdict('nudge', 'visual_stagnation', pivot_msg)
 
         # 4. Ping-pong loop (2-cycle A->B->A->B->A->B or 3-cycle over GUI actions, using neighborhood / round(v/25) buckets)
         gui_steps = [x for x in self.steps if x['is_gui_action']]
@@ -247,11 +252,11 @@ class CloudStuckDetector:
             distinct_ab = not _same_neighborhood(tail6[0], tail6[1], tol=25)
             if pair_a and pair_b and distinct_ab:
                 self.nudge_counts['ping_pong_loop'] = self.nudge_counts.get('ping_pong_loop', 0) + 1
-                return StuckVerdict(
-                    'nudge',
-                    'ping_pong_loop',
-                    f'检测到最近 6 步呈现 A→B→A→B→A→B 来回切换。建议用 `{zoom_hint}` 放大核实页面状态或换一条操作路径。',
-                )
+                if tool_lbl == 'cloud':
+                    pp_msg = '检测到最近 6 步呈现 A→B→A→B→A→B 来回切换。请立即改用 `cloud(op="eval_js", script=...)` 通过 CDP 检查页面状态/DOM，或 `zoom` 放大换路径，不要继续空转也不要因熔断停手等用户。'
+                else:
+                    pp_msg = f'检测到最近 6 步呈现 A→B→A→B→A→B 来回切换。建议用 `{zoom_hint}` 放大核实页面状态或换一条操作路径。'
+                return StuckVerdict('nudge', 'ping_pong_loop', pp_msg)
 
         if len(gui_steps) >= 9:
             tail9 = gui_steps[-9:]

@@ -50,7 +50,10 @@ import kotlin.math.roundToInt
 @Composable
 internal fun NativePulseScreen(model: NativePulseModel) {
     val state = model.ui
-    val colors = rememberAnimatedPulsePalette(state.dark, !state.motion)
+    val context = LocalContext.current
+    val powerSaveActive = rememberPowerSaveActive(state.powerSave)
+    val effectiveReduce = !state.motion || animationsOff(context) || powerSaveActive
+    val colors = rememberAnimatedPulsePalette(state.dark, effectiveReduce)
     val progress = remember { Animatable(if (state.chatOpen) 1f else 0f) }
     val panelProgress = remember { Animatable(if (state.activePanel != null) 1f else 0f) }
     var retainedPanel by remember { mutableStateOf(state.activePanel) }
@@ -58,6 +61,7 @@ internal fun NativePulseScreen(model: NativePulseModel) {
         retainedPanel = state.activePanel
     }
     var panelDragBack by remember { mutableStateOf<Float?>(null) }
+    var panelFrom by remember { mutableStateOf<Float?>(null) }
     val focus = LocalFocusManager.current
     val haptics = LocalHapticFeedback.current
     val modalScope = rememberCoroutineScope()
@@ -70,7 +74,7 @@ internal fun NativePulseScreen(model: NativePulseModel) {
     }
 
     // 1st-level -> Chat iOS Spring Push/Pop transition
-    LaunchedEffect(state.chatOpen, state.motion, model.backSettlement) {
+    LaunchedEffect(state.chatOpen, effectiveReduce, model.backSettlement) {
         model.navigationRunning = true
         try {
             (model.backFrom ?: gestureEnd)?.let {
@@ -79,7 +83,7 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                 model.backFrom = null
             }
             val target = if (state.chatOpen) 1f else 0f
-            if (!state.motion) progress.snapTo(target)
+            if (effectiveReduce) progress.snapTo(target)
             else progress.animateTo(
                 target,
                 spring(dampingRatio = 0.88f, stiffness = 390f)
@@ -90,9 +94,13 @@ internal fun NativePulseScreen(model: NativePulseModel) {
     }
 
     // 2nd-level Panel (`bot_edit`, `settings`, `vault`, `cloud_desktop`, `schedules`) iOS Spring Push/Pop transition
-    LaunchedEffect(state.activePanel, state.motion) {
+    LaunchedEffect(state.activePanel, effectiveReduce) {
+        panelFrom?.let {
+            panelProgress.snapTo(it)
+            panelFrom = null
+        }
         val target = if (state.activePanel != null) 1f else 0f
-        if (!state.motion) {
+        if (effectiveReduce) {
             panelProgress.snapTo(target)
         } else {
             panelProgress.animateTo(
@@ -105,16 +113,20 @@ internal fun NativePulseScreen(model: NativePulseModel) {
         }
     }
 
-    PulseTheme(dark = state.dark, reduceMotion = !state.motion) {
+    PulseTheme(dark = state.dark, reduceMotion = effectiveReduce) {
         val sysHaptics = LocalHapticFeedback.current
         val effectiveHaptics = if (state.haptics) sysHaptics else QuietHaptics
-        val mdColors = if (state.dark) DarkColors else LightColors
+        val mdColors = remember(colors.fill, colors.line, colors.ink, colors.accent, colors.codeBg, colors.codeHeader, state.dark) {
+            PulseColors(colors.fill, colors.line, colors.ink, colors.accent, colors.codeBg, colors.codeHeader, state.dark)
+        }
         CompositionLocalProvider(
             LocalPulsePalette provides colors,
             LocalPulseColors provides mdColors,
             LocalHapticFeedback provides effectiveHaptics,
-            LocalPowerSaveMode provides state.powerSave
+            LocalPowerSaveMode provides powerSaveActive
         ) {
+            val phoneState by RootPhoneHarness.changes.collectAsState()
+            var dualPaneLayout by remember { mutableStateOf(false) }
             Box(
                 Modifier.fillMaxSize()
                     .background(colors.bg)
@@ -126,21 +138,24 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                         .clipToBounds()
                 ) {
                     val isTabletDualPane = maxWidth >= 600.dp
+                    dualPaneLayout = isTabletDualPane
                     val shownPanel = state.activePanel ?: retainedPanel
 
                     if (isTabletDualPane) {
                         val pFraction = panelDragBack?.let { 1f - it } ?: panelProgress.value
+                        val activeBot = model.bot() ?: state.bots.firstOrNull()
                         Row(Modifier.fillMaxSize().background(colors.bg)) {
                             NativeHome(
                                 model,
-                                Modifier.width(330.dp).fillMaxHeight()
+                                Modifier.width(330.dp).fillMaxHeight(),
+                                phoneState,
+                                selectedBotId = activeBot?.id
                             )
                             Box(Modifier.width(0.5.dp).fillMaxHeight().background(colors.line))
                             BoxWithConstraints(
                                 Modifier.weight(1f).fillMaxHeight().background(colors.bg).clipToBounds()
                             ) {
                                 val paneWidth = constraints.maxWidth.toFloat()
-                                val activeBot = model.bot() ?: state.bots.firstOrNull()
                                 if (activeBot != null) {
                                     val roomBaseMod = Modifier.fillMaxSize().graphicsLayer {
                                         if (pFraction > 0.001f && pFraction < 0.999f) {
@@ -152,21 +167,11 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                             if (state.activePanel != null) Modifier.clearAndSetSemantics { } else Modifier
                                         )
                                     ) {
-                                        AnimatedContent(
-                                            targetState = activeBot.id,
-                                            transitionSpec = {
-                                                if (!state.motion) EnterTransition.None togetherWith ExitTransition.None
-                                                else (fadeIn(tween(190)) + slideInVertically(iosInteractiveSpring(false)) { it / 32 }) togetherWith fadeOut(tween(130))
-                                            },
-                                            label = "tablet_room_switch"
-                                        ) { roomId ->
-                                            val roomBot = state.bots.firstOrNull { it.id == roomId } ?: activeBot
-                                            NativeChat(
-                                                model,
-                                                roomBot,
-                                                Modifier.fillMaxSize()
-                                            ) { composerHeight = it }
-                                        }
+                                        NativeChat(
+                                            model,
+                                            activeBot,
+                                            Modifier.fillMaxSize()
+                                        ) { composerHeight = it }
                                         if (pFraction > 0.01f) {
                                             Box(
                                                 Modifier.fillMaxSize()
@@ -192,6 +197,7 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                             "vault" -> NativeVaultPanel(model, Modifier.fillMaxSize())
                                             "cloud_desktop" -> NativeCloudDesktopPanel(model, Modifier.fillMaxSize())
                                             "schedules" -> NativeSchedulesPanel(model, Modifier.fillMaxSize())
+                                            "subtask" -> NativeSubtaskPanel(model, Modifier.fillMaxSize())
                                         }
                                     }
                                 }
@@ -243,12 +249,13 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                                 panelDragBack = null
                                                 if (dx > size.width * 0.26f) {
                                                     focus.clearFocus()
-                                                    modalScope.launch { panelProgress.snapTo(1f - dragged) }
+                                                    panelFrom = 1f - dragged
                                                     model.closePanel()
                                                 } else {
                                                     modalScope.launch {
                                                         panelProgress.snapTo(1f - dragged)
-                                                        panelProgress.animateTo(1f, spring(dampingRatio = 0.85f, stiffness = 420f))
+                                                        if (effectiveReduce) panelProgress.snapTo(1f)
+                                                        else panelProgress.animateTo(1f, spring(dampingRatio = 0.85f, stiffness = 420f))
                                                     }
                                                 }
                                             } else {
@@ -289,7 +296,8 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                         }
                                         NativeHome(
                                             model,
-                                            homeLayerMod.then(if (state.chatOpen || state.activePanel != null) Modifier.clearAndSetSemantics { } else Modifier)
+                                            homeLayerMod.then(if (state.chatOpen || state.activePanel != null) Modifier.clearAndSetSemantics { } else Modifier),
+                                            phoneState
                                         )
                                     }
                                     val bot = model.bot()
@@ -333,6 +341,7 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                                         "vault" -> NativeVaultPanel(model, Modifier.fillMaxSize())
                                         "cloud_desktop" -> NativeCloudDesktopPanel(model, Modifier.fillMaxSize())
                                         "schedules" -> NativeSchedulesPanel(model, Modifier.fillMaxSize())
+                                        "subtask" -> NativeSubtaskPanel(model, Modifier.fillMaxSize())
                                     }
                                 }
                             }
@@ -345,15 +354,33 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                 if (state.healthDialogOpen) {
                     ConnectionHealthDialog(model) { model.closeHealthDialog() }
                 }
-                val toastBottom = if (state.chatOpen && state.activePanel == null) with(LocalDensity.current) { composerHeight.toDp() } + 12.dp else 20.dp
+                val toastBottom = if ((state.chatOpen || dualPaneLayout) && state.activePanel == null && composerHeight > 0) {
+                    with(LocalDensity.current) { composerHeight.toDp() } + 12.dp
+                } else 20.dp
                 SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(start = 20.dp, end = 20.dp, bottom = toastBottom))
             }
             state.menu?.let { menu ->
-                if (!state.motion) {
+                if (effectiveReduce) {
                     Popup(alignment = Alignment.BottomCenter, onDismissRequest = model::dismissMenu, properties = PopupProperties(focusable = true, clippingEnabled = false)) {
-                        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .32f)).clickable { model.dismissMenu() }, contentAlignment = Alignment.BottomCenter) {
+                        Box(
+                            Modifier.fillMaxSize()
+                                .background(Color.Black.copy(alpha = .32f))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                    onClick = model::dismissMenu
+                                ),
+                            contentAlignment = Alignment.BottomCenter
+                        ) {
                             Surface(
-                                Modifier.fillMaxWidth().heightIn(max = (LocalConfiguration.current.screenHeightDp * .85f).dp).windowInsetsPadding(WindowInsets.navigationBars),
+                                Modifier.fillMaxWidth()
+                                    .heightIn(max = (LocalConfiguration.current.screenHeightDp * .85f).dp)
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                        onClick = {}
+                                    )
+                                    .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime)),
                                 shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp), color = colors.surface
                             ) {
                                 NativeMenuContent(menu, false, model::dismissMenu) { item -> model.dismissMenu(); item.run() }
@@ -367,7 +394,7 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                         if (!closing) {
                             closing = true
                             modalScope.launch {
-                                if (state.motion) modalState.hide()
+                                if (!effectiveReduce) modalState.hide()
                                 model.dismissMenu()
                                 next()
                             }
@@ -376,6 +403,7 @@ internal fun NativePulseScreen(model: NativePulseModel) {
                     ModalBottomSheet(
                         onDismissRequest = model::dismissMenu,
                         sheetState = modalState,
+                        dragHandle = null,
                         containerColor = colors.surface,
                         contentColor = colors.ink,
                         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
@@ -391,13 +419,23 @@ internal fun NativePulseScreen(model: NativePulseModel) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun NativeHome(model: NativePulseModel, modifier: Modifier) {
+internal fun NativeHome(
+    model: NativePulseModel,
+    modifier: Modifier,
+    phoneState: RootPhoneState,
+    selectedBotId: String? = null
+) {
     val s = model.ui
     val c = LocalPulsePalette.current
-    val reduceMotion = LocalReduceMotion.current
-    val allRows = model.visibleBots()
+    val reduceMotion = rememberReducedMotion()
+    val homeListState = rememberLazyListState()
+    val homeScrolled by remember {
+        derivedStateOf { homeListState.firstVisibleItemIndex > 0 || homeListState.firstVisibleItemScrollOffset > 8 }
+    }
+    val allRows = remember(s.bots, s.query, s.messages, s.workingBot, s.streamBotId, s.busyBot) {
+        model.visibleBots()
+    }
     val apiReady = s.hasApiKey && s.defaultModel.isNotBlank()
-    val phoneState by RootPhoneHarness.changes.collectAsState()
     val haptics = LocalHapticFeedback.current
     var showQuickDrawer by rememberSaveable { mutableStateOf(false) }
     var activeFilter by rememberSaveable { mutableStateOf("all") } // "all" | "unread" | "pinned" | "working"
@@ -468,27 +506,32 @@ internal fun NativeHome(model: NativePulseModel, modifier: Modifier) {
                                 "pinned" to "置顶",
                                 "working" to "运行中"
                             )
-                            items(filterItems) { (key, label) ->
+                            items(filterItems, key = { it.first }) { (key, label) ->
                                 val selected = activeFilter == key
                                 val bgCol by animateColorAsState(
                                     if (selected) c.accent else c.fill.copy(alpha = 0.72f),
                                     animationSpec = iosInteractiveSpring(reduceMotion),
                                     label = "filter_bg"
                                 )
-                                Text(
-                                    label,
-                                    Modifier.clip(CircleShape)
-                                        .background(bgCol)
+                                Box(
+                                    Modifier.heightIn(min = 40.dp)
                                         .iosPressScale(0.95f) {
                                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                             activeFilter = key
-                                        }
-                                        .padding(horizontal = 12.dp, vertical = 5.dp),
-                                    color = if (selected) Color.White else c.muted,
-                                    fontSize = 12.5.sp,
-                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                                    style = TextStyle(fontFeatureSettings = "tnum")
-                                )
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        label,
+                                        Modifier.clip(CircleShape)
+                                            .background(bgCol)
+                                            .padding(horizontal = 12.dp, vertical = 5.dp),
+                                        color = if (selected) Color.White else c.muted,
+                                        fontSize = 12.5.sp,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                        style = TextStyle(fontFeatureSettings = "tnum")
+                                    )
+                                }
                             }
                         }
                     }
@@ -500,28 +543,32 @@ internal fun NativeHome(model: NativePulseModel, modifier: Modifier) {
                         onDismiss = { showQuickDrawer = false }
                     )
                 }
-                HorizontalDivider(color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
+                val homeDivAlpha by animateFloatAsState(
+                    targetValue = if (homeScrolled || showQuickDrawer) 0.55f else 0f,
+                    animationSpec = if (reduceMotion) snap() else tween(160),
+                    label = "home_hdr_div"
+                )
+                HorizontalDivider(color = c.line.copy(alpha = homeDivAlpha), thickness = 0.5.dp)
             }
         }
 
         // 2. Clean Apple Conversation List
         LazyColumn(
             Modifier.fillMaxSize().background(c.surface),
+            state = homeListState,
             contentPadding = PaddingValues(top = 2.dp, bottom = 36.dp)
         ) {
-            if (phoneState.displayCreated) {
-                item("active_vd_banner") {
-                    AppleLiveActivityPill(
-                        visible = true,
-                        displayId = phoneState.displayId,
-                        onExpand = { model.launchFloatingVirtualDisplay() },
-                        onDestroy = { model.destroyVirtualDisplay() }
-                    )
-                }
+            item(key = "active_vd_banner", contentType = "vd_banner") {
+                AppleLiveActivityPill(
+                    visible = phoneState.displayCreated,
+                    displayId = phoneState.displayId,
+                    onExpand = { model.launchFloatingVirtualDisplay() },
+                    onDestroy = { model.destroyVirtualDisplay() }
+                )
             }
 
             if (!apiReady) {
-                item("api_banner") {
+                item(key = "api_banner", contentType = "api_banner") {
                     Row(
                         Modifier.fillMaxWidth()
                             .padding(horizontal = 14.dp, vertical = 6.dp)
@@ -545,7 +592,7 @@ internal fun NativeHome(model: NativePulseModel, modifier: Modifier) {
             }
 
             if (rows.isEmpty()) {
-                item("empty_rows") {
+                item(key = "empty_rows", contentType = "empty") {
                     Column(
                         Modifier.fillMaxWidth().padding(vertical = 64.dp, horizontal = 24.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -556,7 +603,7 @@ internal fun NativeHome(model: NativePulseModel, modifier: Modifier) {
                     }
                 }
             } else {
-                items(rows.size, key = { idx -> rows[idx].id }) { idx ->
+                items(rows.size, key = { idx -> rows[idx].id }, contentType = { "bot_row" }) { idx ->
                     val bot = rows[idx]
                     Column(
                         Modifier.animateItem(
@@ -572,10 +619,10 @@ internal fun NativeHome(model: NativePulseModel, modifier: Modifier) {
                                 thickness = 0.5.dp
                             )
                         }
-                        NativeBotRow(model, bot)
+                        NativeBotRow(model, bot, isSelected = selectedBotId == bot.id)
                     }
                 }
-                item("bottom_hairline") {
+                item(key = "bottom_hairline", contentType = "divider") {
                     HorizontalDivider(
                         Modifier.padding(start = 82.dp),
                         color = c.line.copy(alpha = 0.42f),
@@ -588,7 +635,11 @@ internal fun NativeHome(model: NativePulseModel, modifier: Modifier) {
 }
 
 @Composable
-internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
+internal fun NativeChatRoomViewport(
+    model: NativePulseModel,
+    bot: PulseBot,
+    onScrolledChanged: (Boolean) -> Unit = {}
+) {
     val s = model.ui
     val c = LocalPulsePalette.current
     val messages = remember(s.messages, bot.id) { s.messages.filter { it.botId == bot.id } }
@@ -596,6 +647,13 @@ internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
     val chatScope = rememberCoroutineScope()
     var initialScrollDoneForBot by remember(bot.id) { mutableStateOf(false) }
     var lastMsgCount by remember(bot.id) { mutableIntStateOf(0) }
+    var unseenNewCount by remember(bot.id) { mutableIntStateOf(0) }
+    val chatScrolled by remember {
+        derivedStateOf { list.firstVisibleItemIndex > 0 || list.firstVisibleItemScrollOffset > 8 }
+    }
+    LaunchedEffect(chatScrolled, bot.id) {
+        onScrolledChanged(chatScrolled && (messages.isNotEmpty() || s.streamBotId == bot.id || s.workingBot == bot.id))
+    }
 
     val lastMsg = messages.lastOrNull()
     val duplicateWithTail = lastMsg != null && lastMsg.role == "assistant" && s.streamText.isNotBlank() &&
@@ -614,28 +672,43 @@ internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
         }
     }
 
+    LaunchedEffect(nearTail) {
+        if (nearTail) unseenNewCount = 0
+    }
+
     val lastChoiceCount = messages.lastOrNull()?.choices?.size ?: 0
-    LaunchedEffect(messages.size, messages.lastOrNull()?.id, bot.id, isLiveHere, s.chatOpen, lastChoiceCount, s.streamChoices.size, s.consumedChoiceIds.size) {
-        if (!s.chatOpen) return@LaunchedEffect
+    LaunchedEffect(messages.size, messages.lastOrNull()?.id, bot.id, isLiveHere, lastChoiceCount, s.streamChoices.size, s.consumedChoiceIds.size) {
         val anchorIdx = (messages.size + (if (isLiveHere) 1 else 0)).coerceAtLeast(0)
-        val userSentNew = messages.lastOrNull()?.role == "user" && messages.size != lastMsgCount
+        val addedCount = (messages.size - lastMsgCount).coerceAtLeast(0)
+        val userSentNew = messages.lastOrNull()?.role == "user" && addedCount > 0
         if (!initialScrollDoneForBot) {
             if (messages.isNotEmpty() || isLiveHere) {
                 runCatching { list.scrollToItem(anchorIdx) }
                 kotlinx.coroutines.yield()
                 runCatching { list.scrollToItem(anchorIdx) }
                 initialScrollDoneForBot = true
+                unseenNewCount = 0
             }
-        } else if (userSentNew || nearTail || isLiveHere) {
+        } else if (userSentNew || (nearTail && !list.isScrollInProgress)) {
             runCatching { list.scrollToItem(anchorIdx) }
+            unseenNewCount = 0
+        } else if (addedCount > 0 && !nearTail) {
+            unseenNewCount = (unseenNewCount + addedCount).coerceAtMost(99)
         }
         lastMsgCount = messages.size
     }
 
-    LaunchedEffect(s.streamText.length / 80, s.activeTypewriterChars / 48, s.streamTrace.size, s.streamTool) {
-        if ((isLiveHere || !s.activeTypewriterMsgId.isNullOrBlank()) && nearTail) {
-            val anchorIdx = (messages.size + (if (isLiveHere) 1 else 0)).coerceAtLeast(0)
-            runCatching { list.scrollToItem(anchorIdx) }
+    LaunchedEffect(s.streamText.length / 80, s.streamTimeline.size, s.streamTrace.size) {
+        if (isLiveHere && nearTail && !list.isScrollInProgress) {
+            val info = list.layoutInfo
+            val lastVis = info.visibleItemsInfo.lastOrNull()
+            val alreadyAtBottom = lastVis != null &&
+                lastVis.index >= info.totalItemsCount - 1 &&
+                (lastVis.offset + lastVis.size) <= info.viewportEndOffset + 12
+            if (!alreadyAtBottom) {
+                val anchorIdx = (messages.size + 1).coerceAtLeast(0)
+                runCatching { list.scrollToItem(anchorIdx) }
+            }
         }
     }
 
@@ -648,7 +721,8 @@ internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
                 verticalArrangement = Arrangement.Center
             ) {
                 Column(
-                    Modifier.fillMaxWidth()
+                    Modifier.widthIn(max = 560.dp)
+                        .fillMaxWidth()
                         .clip(RoundedCornerShape(22.dp))
                         .background(c.surface)
                         .padding(horizontal = 20.dp, vertical = 24.dp),
@@ -671,12 +745,31 @@ internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
                         textAlign = TextAlign.Center,
                         lineHeight = 20.sp
                     )
-                    val starters = listOf(
-                        "打开学习通看一眼有没有未交作业" to "帮我打开学习通看一眼最近有没有未交的作业或通知",
-                        "看看我明天有哪些课和实验要准备" to "结合我的课表看看明天有哪些课和实验，帮我列一下准备事项",
-                        "定个明天早上 7:30 的早起提醒闹钟" to "帮我定一个明天早上 07:30 的闹钟，提醒我看早八课表",
-                        "搜索一下今天最新的 AI / 大模型进展" to "帮我搜索一下今天最新的 AI 与大模型实用进展并总结重点"
-                    )
+                    val starters = remember(bot.id, bot.name, bot.description) {
+                        val hint = "${bot.id} ${bot.name} ${bot.description}".lowercase()
+                        when {
+                            hint.contains("research") || hint.contains("探") || hint.contains("调研") -> listOf(
+                                "系统调研某个技术方案与开源竞品" to "请帮我深度调研下面这个技术方向，对比核心方案的优缺点与选型建议：",
+                                "提炼长文档或网页里的核心观点与数据" to "请帮我精读下面这段内容，提炼出核心结论、关键数据与潜在问题：",
+                                "对比两个设计架构或算法的取舍边界" to "请对比下面两种方案在性能、复杂度与长期维护上的核心差异："
+                            )
+                            hint.contains("review") || hint.contains("审") || hint.contains("校") -> listOf(
+                                "严格审查近期代码改动的边界与并发隐患" to "请对当前实现做一次代码审查，重点排查并发竞争、空值和边界情况。",
+                                "检查系统架构里最容易踩坑的地方" to "请审视这份设计方案，指出最危险的脆弱环节并给出简化建议。",
+                                "定位一次莫名其妙的测试或运行报错" to "请结合上下文帮我按证据链定位下面这个异常的真实根因："
+                            )
+                            hint.contains("companion") || hint.contains("云汐") || hint.contains("whale") -> listOf(
+                                "润色一段表达或整理散落的想法成文稿" to "请帮我把下面这些零碎想法润色成自然、有条理、不拖沓的文字：",
+                                "规划今天接下来轻松可落地的待办节奏" to "结合我现在的进度，帮我把今天剩下的事情排一个轻重缓急的节奏。",
+                                "看看跨端记忆金库里最近记下的长期偏好" to "/pins"
+                            )
+                            else -> listOf(
+                                "查看中枢健康、在线节点与上下文占用" to "/status",
+                                "排查一段报错或问题并给出可直接验证的方案" to "请分析下面这个问题或日志报错，定位真正原因并给出最小修复方案：",
+                                "在手机虚拟屏或云电脑工作区协同操作" to "请在工作区里查看当前屏幕状态，并继续帮我推进手头这项任务："
+                            )
+                        }
+                    }
                     Column(
                         Modifier.fillMaxWidth()
                             .clip(RoundedCornerShape(14.dp))
@@ -705,7 +798,11 @@ internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
                 state = list,
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp)
             ) {
-                items(messages.size, key = { idx -> messages[idx].id }) { idx ->
+                items(
+                    count = messages.size,
+                    key = { idx -> messages[idx].id },
+                    contentType = { idx -> "${messages[idx].role}_${messages[idx].kind}" }
+                ) { idx ->
                     val message = messages[idx]
                     val prev = if (idx > 0) messages[idx - 1] else null
                     val next = if (idx < messages.lastIndex) messages[idx + 1] else null
@@ -732,7 +829,7 @@ internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
                         else -> 11.dp
                     }
 
-                    val chatReduceMotion = LocalReduceMotion.current
+                    val chatReduceMotion = rememberReducedMotion()
                     Column(
                         Modifier.fillMaxWidth()
                             .then(
@@ -766,49 +863,78 @@ internal fun NativeChatRoomViewport(model: NativePulseModel, bot: PulseBot) {
                                 }
                             }
                         }
-                        NativeMessage(
-                            model = model,
-                            bot = bot,
-                            message = message,
-                            groupedWithPrev = sameSenderAsPrev,
-                            groupedWithNext = sameSenderAsNext,
-                            isLatestMessage = (idx == messages.lastIndex && !isLiveHere)
-                        )
-                    }
-                }
-                if (isLiveHere) {
-                    item("live_stream") {
-                        Box(Modifier.padding(top = 10.dp)) {
-                            NativeLiveStreamBubble(model, bot)
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                            Box(Modifier.widthIn(max = 760.dp).fillMaxWidth()) {
+                                NativeMessage(
+                                    model = model,
+                                    bot = bot,
+                                    message = message,
+                                    groupedWithPrev = sameSenderAsPrev,
+                                    groupedWithNext = sameSenderAsNext,
+                                    isLatestMessage = (idx == messages.lastIndex && !isLiveHere)
+                                )
+                            }
                         }
                     }
                 }
-                item("bottom_anchor") {
+                if (isLiveHere) {
+                    item(key = "live_stream", contentType = "live_stream") {
+                        Box(Modifier.fillMaxWidth().padding(top = 10.dp), contentAlignment = Alignment.TopCenter) {
+                            Box(Modifier.widthIn(max = 760.dp).fillMaxWidth()) {
+                                NativeLiveStreamBubble(model, bot)
+                            }
+                        }
+                    }
+                }
+                item(key = "bottom_anchor", contentType = "anchor") {
                     Spacer(Modifier.height(2.dp).fillMaxWidth())
                 }
             }
 
-            // Telegram Circular Scroll-to-Bottom Button (Animated Scale + Fade)
+            // Telegram Circular Scroll-to-Bottom Button (Animated Scale + Fade, 48dp touch target + Unread badge)
+            val fabReduce = rememberReducedMotion()
             AnimatedVisibility(
-                visible = !nearTail && messages.size > 3,
+                visible = !nearTail && (messages.size > 3 || unseenNewCount > 0),
                 modifier = Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 14.dp),
-                enter = scaleIn(spring(dampingRatio = 0.72f, stiffness = 460f)) + fadeIn(tween(150)),
-                exit = scaleOut(spring(dampingRatio = 0.85f, stiffness = 500f)) + fadeOut(tween(120))
+                enter = if (fabReduce) fadeIn(tween(110)) else scaleIn(iosInteractiveSpring(), initialScale = 0.92f) + fadeIn(tween(150)),
+                exit = if (fabReduce) fadeOut(tween(90)) else scaleOut(iosGentleSpring(), targetScale = 0.92f) + fadeOut(tween(110))
             ) {
-                Box(
-                    Modifier.size(40.dp)
-                        .clip(CircleShape)
-                        .background(c.surface.copy(alpha = 0.95f))
-                        .border(0.5.dp, c.line.copy(alpha = 0.7f), CircleShape)
-                        .iosPressScale(0.92f) {
-                            chatScope.launch {
-                                val anchorIdx = (messages.size + (if (isLiveHere) 1 else 0)).coerceAtLeast(0)
-                                runCatching { list.animateScrollToItem(anchorIdx) }
+                Box(contentAlignment = Alignment.TopCenter) {
+                    Box(
+                        Modifier.padding(top = if (unseenNewCount > 0) 8.dp else 0.dp)
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(c.surface.copy(alpha = 0.96f))
+                            .border(0.6.dp, c.line.copy(alpha = 0.75f), CircleShape)
+                            .iosPressScale(0.92f) {
+                                unseenNewCount = 0
+                                chatScope.launch {
+                                    val anchorIdx = (messages.size + (if (isLiveHere) 1 else 0)).coerceAtLeast(0)
+                                    runCatching { list.animateScrollToItem(anchorIdx) }
+                                }
                             }
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    PulseIcon("chevron_down", c.accent, Modifier.size(20.dp))
+                            .semantics { contentDescription = "回到底部" },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        PulseIcon("chevron_down", c.accent, Modifier.size(22.dp))
+                    }
+                    if (unseenNewCount > 0) {
+                        Box(
+                            Modifier.defaultMinSize(minWidth = 20.dp, minHeight = 18.dp)
+                                .clip(CircleShape)
+                                .background(c.accent)
+                                .padding(horizontal = 6.dp, vertical = 1.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                unseenNewCount.toString(),
+                                color = Color.White,
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                style = TextStyle(fontFeatureSettings = "tnum")
+                            )
+                        }
+                    }
                 }
             }
         }

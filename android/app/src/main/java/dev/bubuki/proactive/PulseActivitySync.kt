@@ -36,6 +36,8 @@ internal fun NativePulseModel.requestThrottledCloudFrame() {
     scope.launch { refreshCloudDesktopFrame(forceFull = false) }
 }
 
+private val avatarFailedVersions = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+
 private fun NativePulseModel.mergeHandoffMessage(event: JSONObject): Boolean {
     val msgObj = event.optJSONObject("final_message") ?: event.optJSONObject("message") ?: return false
     if (msgObj.optString("id").isBlank()) return false
@@ -59,6 +61,9 @@ internal fun NativePulseModel.resume() {
         if (previousScope != scopeOf(settings)) {
             val cached = homeCache(settings); avatarVersions.clear()
             remoteMessages = cached.third
+            confirmedSyncSeq = remoteMessages
+                .filter { !it.optimistic && !isEphemeralMsgId(it.id) }
+                .maxOfOrNull { it.orderSeq } ?: 0L
             ui = ui.copy(bots = cached.first, primary = cached.second, botId = cached.second, messages = combinedMessages(), chatOpen = false, avatars = emptyMap())
         }
         val savedApp = settings.optString("appearance", "dark").let { if (it == "light") "light" else "dark" }
@@ -67,8 +72,10 @@ internal fun NativePulseModel.resume() {
         val smallM = config.optJSONObject("small_brain")?.optString("model") ?: ""
         val bigM = config.optJSONObject("big_brain")?.optString("model") ?: ""
         val defM = config.optString("default_model").ifBlank { bigM.ifBlank { smallM } }
+        val savedServerUrl = settings.optString("serverUrl", SecureTransport.DEFAULT_SERVER).trim()
+        val savedToken = settings.optString("deviceToken", SecureTransport.defaultToken()).ifBlank { SecureTransport.defaultToken() }.trim()
         ui = ui.copy(
-            paired = settings.optString("deviceToken", SecureTransport.defaultToken()).ifBlank { SecureTransport.defaultToken() }.isNotBlank(), dark = dark, appearance = savedApp,
+            paired = savedServerUrl.isNotBlank() && savedToken.isNotBlank(), dark = dark, appearance = savedApp,
             motion = settings.optBoolean("motion", true) && !animationsOff(activity), haptics = settings.optBoolean("haptics", true),
             smallModel = smallM, bigModel = bigM, defaultModel = defM,
             draft = draft(ui.botId), attachments = attachments(ui.botId),
@@ -77,7 +84,7 @@ internal fun NativePulseModel.resume() {
         activity.systemBarsFor(dark)
         if (active) {
             if (settings.optBoolean("background", true) && ui.paired && !AgentForegroundService.running) {
-                try { activity.startForegroundService(Intent(activity, AgentForegroundService::class.java)) } catch (e: Exception) { toast(MainActivity.safeError(e)) }
+                try { activity.startForegroundService(Intent(activity, AgentForegroundService::class.java)) } catch (e: Exception) { toast(PulseErrors.safeError(e)) }
             } else if (!settings.optBoolean("background", true)) activity.stopService(Intent(activity, AgentForegroundService::class.java))
             if (ui.activePanel == "cloud_desktop" && cloudStreamJob?.isActive != true) {
                 startCloudDesktopStreamLoop(forceFull = false)
@@ -108,13 +115,23 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                 val botsArr = event.optJSONArray("bots")
                 val primaryId = event.optString("primary_bot_id", ui.primary).ifBlank { "companion" }
                 if (botsArr != null && botsArr.length() > 0) {
-                    val nextBots = botsArr.objects().mapNotNull { runCatching { PulseBot.from(it, mySource) }.getOrNull() }
-                    if (nextBots.isNotEmpty()) {
+                    val parsedBots = botsArr.objects().mapNotNull { runCatching { PulseBot.from(it, mySource) }.getOrNull() }
+                    val nextBots = PulseBot.filterForNode(parsedBots, mySource)
+                    if (nextBots.isNotEmpty() && !(evSource in listOf("pc", "pc2") && mySource !in listOf("pc", "pc2") && parsedBots.all { it.homeNode in listOf("pc", "pc2") })) {
                         revision++
+                        val safePrimary = if (nextBots.any { it.id == primaryId }) primaryId else (nextBots.firstOrNull { it.id == ui.primary }?.id ?: nextBots.first().id)
                         val deletedId = event.optString("deleted_bot_id", "")
                         val needCloseChat = (deletedId.isNotBlank() && ui.botId == deletedId) || nextBots.none { it.id == ui.botId }
-                        ui = ui.copy(bots = nextBots, primary = primaryId, botId = if (needCloseChat) primaryId else ui.botId, chatOpen = if (needCloseChat) false else ui.chatOpen)
-                        cacheRoster(nextBots, primaryId)
+                        val validIds = nextBots.asSequence().map { it.id }.toHashSet()
+                        avatarVersions.keys.retainAll(validIds)
+                        ui = ui.copy(
+                            bots = nextBots,
+                            primary = safePrimary,
+                            botId = if (needCloseChat) safePrimary else ui.botId,
+                            chatOpen = if (needCloseChat) false else ui.chatOpen,
+                            avatars = ui.avatars.filterKeys { it in validIds }
+                        )
+                        cacheRoster(nextBots, safePrimary)
                         loadAvatars()
                         return@launch
                     }
@@ -168,6 +185,16 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                 if (ui.activePanel == "cloud_desktop") {
                     if (frameObj.has("image") || frameObj.has("frame") || frameObj.has("screenshot")) applyCloudDesktopPacket(frameObj)
                     else requestThrottledCloudFrame()
+                }
+            }
+            "subtask_update" -> {
+                event.optJSONObject("subtask")?.let { upsertSubtaskFromJson(it) }
+            }
+            "subtask_gc" -> {
+                val arr = event.optJSONArray("removed_ids")
+                if (arr != null && arr.length() > 0) {
+                    val ids = (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }.toHashSet()
+                    removeSubtasksByIds(ids)
                 }
             }
             "stopped" -> {
@@ -252,37 +279,36 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                 if (seq > lastStreamSeq) lastStreamSeq = seq
                 if (turnId.isNotBlank()) activeStreamTurnId = turnId
                 val incomingTrace = stream.optJSONArray("trace")?.objects().orEmpty()
-                val trace = mergeMonotonicTrace(ui.streamTrace, incomingTrace, ui.streamBotId == sBot || ui.workingBot == sBot)
+                val sameStreamBot = ui.streamBotId == sBot || ui.workingBot == sBot
+                val trace = mergeMonotonicTrace(ui.streamTrace, incomingTrace, sameStreamBot)
                 val rawTool = if (stream.isNull("tool")) "" else stream.optString("tool", "").takeIf { it != "null" }.orEmpty()
                 val toolName = rawTool.ifBlank {
                     if (ui.streamBotId == sBot && ui.streamTool.isNotBlank()) ui.streamTool
                     else if (trace.isNotEmpty()) "已执行 ${trace.size} 步"
                     else ""
                 }
-                val usesCloudDesktop = toolName == "cloud_desktop" || trace.any { it.optString("tool") == "cloud_desktop" }
-                if (usesCloudDesktop) {
-                    ui = ui.copy(cloudDesktopLiveBotId = sBot)
-                    if (ui.activePanel == "cloud_desktop") {
-                        requestThrottledCloudFrame()
-                    }
+                val usesCloudDesktop = toolName == "cloud_desktop" || toolName == "cloud" ||
+                    trace.any { val t = it.optString("tool"); t == "cloud_desktop" || t == "cloud" }
+                if (usesCloudDesktop && ui.activePanel == "cloud_desktop") {
+                    requestThrottledCloudFrame()
                 }
                 if (ui.chatOpen && sBot != ui.botId && ui.streamBotId == ui.botId) return@launch
                 val delta = stream.optString("delta", "")
                 val rawText = stream.optString("text", "").ifEmpty {
-                    if (delta.isNotEmpty() && !isStreamPlaceholder(ui.streamText)) ui.streamText + delta else delta
+                    if (delta.isNotEmpty() && sameStreamBot && !isStreamPlaceholder(ui.streamText)) ui.streamText + delta else delta
                 }
-                val thought = stream.optString("thought", "").ifBlank { ui.streamThought }
+                val thought = stream.optString("thought", "").ifBlank { if (sameStreamBot) ui.streamThought else "" }
                 val stepText = stream.optString("step_text", "").ifBlank {
-                    if (ui.streamBotId == sBot) ui.streamStepText else ""
+                    if (sameStreamBot) ui.streamStepText else ""
                 }
                 val turnSteps = stream.optJSONArray("turn_steps")?.objects()
-                    ?: if (ui.streamBotId == sBot) ui.streamTurnSteps else emptyList()
+                    ?: if (sameStreamBot) ui.streamTurnSteps else emptyList()
                 val timelineItems = stream.optJSONArray("timeline")?.objects()
-                    ?: if (ui.streamBotId == sBot) ui.streamTimeline else emptyList()
-                val subAgents = stream.optJSONArray("sub_agents")?.objects() ?: ui.streamSubAgents
-                val todos = stream.optJSONArray("todos")?.objects() ?: ui.streamTodos
+                    ?: if (sameStreamBot) ui.streamTimeline else emptyList()
+                val subAgents = stream.optJSONArray("sub_agents")?.objects() ?: if (sameStreamBot) ui.streamSubAgents else emptyList()
+                val todos = stream.optJSONArray("todos")?.objects() ?: if (sameStreamBot) ui.streamTodos else emptyList()
                 val choices = PulseChoice.parseArray(stream.optJSONArray("choices")).ifEmpty {
-                    if (ui.streamBotId == sBot) ui.streamChoices else emptyList()
+                    if (sameStreamBot) ui.streamChoices else emptyList()
                 }
                 val preserved = resolveStreamText(sBot, turnId, rawText)
                 val paced = applyPacedStreamText(sBot, preserved)
@@ -322,7 +348,8 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                     streamChoices = choices,
                     streamSubAgents = subAgents,
                     streamTodos = todos,
-                    streamStartedAt = startedMs
+                    streamStartedAt = startedMs,
+                    cloudDesktopLiveBotId = if (usesCloudDesktop) sBot else ui.cloudDesktopLiveBotId
                 )
             }
             "execution" -> {
@@ -334,26 +361,10 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                     if (clearedSeq > lastStreamSeq) lastStreamSeq = clearedSeq
                     val mergedHandoff = mergeHandoffMessage(event)
                     if (clearedBot.isBlank() || clearedBot == ui.botId || clearedBot == ui.streamBotId || clearedBot == ui.workingBot || clearedBot == ui.busyBot) {
-                        activeStreamTurnId = ""
-                        remoteWorkingBot = null
-                        sendGuardBotId = null
-                        sendGuardUntilUptime = 0L
-                        ui = ui.copy(
-                            messages = if (mergedHandoff) combinedMessages() else ui.messages,
-                            busyBot = null,
-                            workingBot = null,
-                            streamBotId = null,
-                            streamText = "",
-                            streamThought = "",
-                            streamStepText = "",
-                            streamTool = "",
-                            streamTrace = emptyList(),
-                            streamTurnSteps = emptyList(), streamTimeline = emptyList(),
-                            streamChoices = emptyList(),
-                            streamSubAgents = emptyList(),
-                            streamTodos = emptyList(),
-                            streamStartedAt = 0L
-                        )
+                        clearStreamUi(clearWorking = true)
+                        if (mergedHandoff) {
+                            ui = ui.copy(messages = combinedMessages())
+                        }
                     } else if (mergedHandoff) {
                         ui = ui.copy(messages = combinedMessages())
                     }
@@ -367,7 +378,7 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                 if (execSeq in 1 until lastStreamSeq) return@launch
                 if (execSeq > lastStreamSeq) lastStreamSeq = execSeq
                 if (execTurnId.isNotBlank()) activeStreamTurnId = execTurnId
-                val incomingTrace = exec?.optJSONArray("trace")?.objects().orEmpty()
+                val incomingTrace = exec.optJSONArray("trace")?.objects().orEmpty()
                 val sameBot = working == null || ui.workingBot == null || ui.workingBot == working || ui.streamBotId == working
                 val trace = mergeMonotonicTrace(ui.streamTrace, incomingTrace, sameBot)
                 val rawTool = if (exec.isNull("tool")) "" else exec.optString("tool").takeIf { it != "null" }.orEmpty()
@@ -376,12 +387,10 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                     else if (trace.isNotEmpty()) "已执行 ${trace.size} 步"
                     else ""
                 }
-                val usesCloudDesktop = tool == "cloud_desktop" || trace.any { it.optString("tool") == "cloud_desktop" }
-                if (usesCloudDesktop) {
-                    ui = ui.copy(cloudDesktopLiveBotId = working ?: ui.botId)
-                    if (ui.activePanel == "cloud_desktop") {
-                        requestThrottledCloudFrame()
-                    }
+                val usesCloudDesktop = tool == "cloud_desktop" || tool == "cloud" ||
+                    trace.any { val t = it.optString("tool"); t == "cloud_desktop" || t == "cloud" }
+                if (usesCloudDesktop && ui.activePanel == "cloud_desktop") {
+                    requestThrottledCloudFrame()
                 }
                 if (ui.chatOpen && working != null && working != ui.botId && ui.workingBot == ui.botId) return@launch
                 val activeBot = working ?: ui.workingBot ?: ui.streamBotId ?: sendGuardBotId
@@ -398,18 +407,33 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                     ?: if (sameBot) ui.streamTurnSteps else emptyList()
                 val execTimeline = exec.optJSONArray("timeline")?.objects()
                     ?: if (sameBot) ui.streamTimeline else emptyList()
-                ui = ui.copy(
-                    online = true,
-                    workingBot = activeBot,
-                    streamBotId = ui.streamBotId ?: activeBot,
-                    workingText = remoteWorkingText,
-                    streamText = ui.streamText,
-                    streamStepText = execStepText,
-                    streamTool = tool,
-                    streamTrace = trace,
-                    streamTurnSteps = execTurnSteps,
-                    streamTimeline = execTimeline
-                )
+                val nextCloudLive = if (usesCloudDesktop) (working ?: ui.botId) else ui.cloudDesktopLiveBotId
+                val nextStreamBot = ui.streamBotId ?: activeBot
+                val unchanged = ui.online &&
+                    ui.workingBot == activeBot &&
+                    ui.streamBotId == nextStreamBot &&
+                    ui.streamTool == tool &&
+                    ui.streamStepText == execStepText &&
+                    ui.cloudDesktopLiveBotId == nextCloudLive &&
+                    ui.streamTrace.size == trace.size &&
+                    ui.streamTimeline.size == execTimeline.size &&
+                    ui.streamTrace.lastOrNull()?.optString("status") == trace.lastOrNull()?.optString("status") &&
+                    ui.streamTrace.lastOrNull()?.optString("tool") == trace.lastOrNull()?.optString("tool")
+                if (!unchanged) {
+                    ui = ui.copy(
+                        online = true,
+                        workingBot = activeBot,
+                        streamBotId = nextStreamBot,
+                        workingText = remoteWorkingText,
+                        streamText = ui.streamText,
+                        streamStepText = execStepText,
+                        streamTool = tool,
+                        streamTrace = trace,
+                        streamTurnSteps = execTurnSteps,
+                        streamTimeline = execTimeline,
+                        cloudDesktopLiveBotId = nextCloudLive
+                    )
+                }
             }
             "message" -> {
                 val mObj = event.optJSONObject("message") ?: return@launch
@@ -440,27 +464,14 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                 val updatedCompByBot = if (msg.role == "assistant" && msg.completionTokens > 0) {
                     ui.contextCompTokensByBot + (msg.botId to msg.completionTokens)
                 } else ui.contextCompTokensByBot
+                val boundedConsumed = if (ui.consumedChoiceIds.size > 200) {
+                    ui.consumedChoiceIds.drop(ui.consumedChoiceIds.size - 200).toSet()
+                } else ui.consumedChoiceIds
                 if (finishedStreamHere) {
-                    remoteWorkingBot = null
-                    sendGuardBotId = null
-                    sendGuardUntilUptime = 0L
-                    streamPacerJob?.cancel()
-                    targetStreamFullText = ""
+                    clearStreamUi(targetBot = msg.botId, clearWorking = true)
                     ui = ui.copy(
                         messages = combinedMessages(),
-                        busyBot = null,
-                        workingBot = null,
-                        streamBotId = null,
-                        streamText = "",
-                        streamThought = "",
-                        streamStepText = "",
-                        streamTool = "",
-                        streamTrace = emptyList(),
-                        streamTurnSteps = emptyList(), streamTimeline = emptyList(),
-                        streamChoices = emptyList(),
-                        streamSubAgents = emptyList(),
-                        streamTodos = emptyList(),
-                        streamStartedAt = 0L,
+                        consumedChoiceIds = boundedConsumed,
                         contextTokensByBot = updatedTokensByBot,
                         contextCachedByBot = updatedCachedByBot,
                         contextTtftByBot = updatedTtftByBot,
@@ -470,6 +481,7 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
                 } else {
                     ui = ui.copy(
                         messages = combinedMessages(),
+                        consumedChoiceIds = boundedConsumed,
                         contextTokensByBot = updatedTokensByBot,
                         contextCachedByBot = updatedCachedByBot,
                         contextTtftByBot = updatedTtftByBot,
@@ -508,6 +520,7 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false, awaitLock:
     refreshLock.withLock {
         pendingReconnectSync = false
         val before = revision; val started = SystemClock.uptimeMillis(); val serverScope = scopeOf(prefs)
+        val myGen = ++refreshGeneration
         try {
             val afterId = if (force) null else lastServerMessageId()
             val syncQuery = buildSyncQuery(afterId, force)
@@ -520,12 +533,22 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false, awaitLock:
             val pending = history.optJSONObject("pending") ?: JSONObject()
             val unread = pending.keys().asSequence().toSet()
             val incomingEpoch = history.optLong("messages_epoch", status.optLong("messages_epoch", 0L))
+            val explicitEpochReset = history.optBoolean("epoch_reset", false) || status.optBoolean("epoch_reset", false)
+            if (shouldRejectStaleSyncEpoch(incomingEpoch, lastMessagesEpoch) && !explicitEpochReset) return@withLock
             val epochChanged = (incomingEpoch > 0L && lastMessagesEpoch > 0L && incomingEpoch != lastMessagesEpoch) ||
-                history.optBoolean("epoch_reset", false) || status.optBoolean("epoch_reset", false)
+                explicitEpochReset
             if (incomingEpoch > 0L) lastMessagesEpoch = incomingEpoch
+            if (force || epochChanged) confirmedSyncSeq = 0L
             val isDelta = history.optBoolean("delta", false) && !epochChanged
-            val messages = history.getJSONArray("messages").objects().map(PulseMessage::from)
+            val messages = (history.optJSONArray("messages")?.objects().orEmpty()).mapNotNull {
+                runCatching { PulseMessage.from(it) }.getOrNull()
+            }
             mergeRemoteMessages(messages, fullReplace = !isDelta)
+            val maxAuthoritativeSeq = messages
+                .asSequence()
+                .filter { !it.optimistic && !isEphemeralMsgId(it.id) && it.orderSeq > 0L }
+                .maxOfOrNull { it.orderSeq } ?: 0L
+            if (maxAuthoritativeSeq > confirmedSyncSeq) confirmedSyncSeq = maxAuthoritativeSeq
             if (!epochChanged) {
                 status.optJSONArray("recent_tail")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }?.let {
                     mergeRemoteMessages(it, fullReplace = false)
@@ -609,7 +632,8 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false, awaitLock:
             val sTool = if (stream == null || stream.isNull("tool")) "" else stream.optString("tool").takeIf { it != "null" }.orEmpty()
             val eTool = if (execution == null || execution.isNull("tool")) "" else execution.optString("tool").takeIf { it != "null" }.orEmpty()
             val curTool = if (effectiveStale) ui.streamTool else (sTool.ifBlank { eTool }.ifBlank { if ((effectiveSBot != null || effectiveWorking != null) && execTrace.isNotEmpty()) ui.streamTool.ifBlank { "已执行 ${execTrace.size} 步" } else "" })
-            val usesCloudDesktop = curTool == "cloud_desktop" || execTrace.any { it.optString("tool") == "cloud_desktop" }
+            val usesCloudDesktop = curTool == "cloud_desktop" || curTool == "cloud" ||
+                execTrace.any { val t = it.optString("tool"); t == "cloud_desktop" || t == "cloud" }
             val startedSec = execution?.optDouble("started_at", 0.0) ?: 0.0
             val startedMs = if (startedSec > 0) (startedSec * 1000).toLong() else if (effectiveSBot != null || effectiveWorking != null) (ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L
             val routinesCount = (status.optInt("routine_count", -1)).let { if (it >= 0) it else ui.routineCount }
@@ -629,11 +653,14 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false, awaitLock:
             applyDeltaVersions(sync)
             val botsUnchanged = roster.optBoolean("bots_unchanged", false)
             val nextBots = if (before == revision && !botsUnchanged) {
-                roster.optJSONArray("bots")?.objects()?.map { PulseBot.from(it, myNodeSource) } ?: ui.bots
-            } else ui.bots
+                roster.optJSONArray("bots")?.objects()?.mapNotNull { runCatching { PulseBot.from(it, myNodeSource) }.getOrNull() }?.let { PulseBot.filterForNode(it, myNodeSource) } ?: ui.bots
+            } else PulseBot.filterForNode(ui.bots, myNodeSource)
+            val validIds = nextBots.asSequence().map { it.id }.toHashSet()
+            avatarVersions.keys.retainAll(validIds)
             val nextPins = sync.optJSONArray("pins")?.objects() ?: ui.pinnedMemories
             ui = ui.copy(
                 bots = nextBots,
+                avatars = ui.avatars.filterKeys { it in validIds },
                 primary = if (before == revision) roster.optString("primary_bot_id", ui.primary) else ui.primary,
                 pinnedMemories = nextPins,
                 messages = combinedMessages(), unread = unread,
@@ -671,8 +698,9 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false, awaitLock:
                 onboardingCompleted = sync.optBoolean("onboarding_completed", ui.onboardingCompleted),
                 cloudDesktopConfigured = sync.optBoolean("cloud_desktop_configured", ui.cloudDesktopConfigured)
             )
-            if (ui.activePanel == "cloud_desktop") requestThrottledCloudFrame()
-            if (before == revision) cacheRoster(ui.bots, ui.primary, serverScope)
+            if (ui.activePanel == "cloud_desktop" && cloudStreamJob?.isActive != true) requestThrottledCloudFrame()
+            refreshSubtasks()
+            if (before == revision && myGen == refreshGeneration) cacheRoster(ui.bots, ui.primary, serverScope)
             val requested = pendingOpenBot
             if (requested != null) { pendingOpenBot = null; if (bot(requested) != null) open(requested) }
             else if (ui.chatOpen && bot() == null) ui = ui.copy(chatOpen = false, botId = ui.primary, draft = draft(ui.primary), attachments = attachments(ui.primary))
@@ -686,17 +714,22 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false, awaitLock:
 
 internal suspend fun NativePulseModel.refreshStreamOnly() {
     if (!ui.paired || streamLock.isLocked) return
+    val startGen = refreshGeneration
     streamLock.withLock {
         runCatching {
             val started = SystemClock.uptimeMillis()
             val afterId = lastServerMessageId()
             val statusQuery = buildStatusQuery(afterId)
             val status = request("GET", "/api/status", null, statusQuery)
+            if (refreshGeneration != startGen) return@withLock
             val rtt = SystemClock.uptimeMillis() - started
             val incomingEpoch = status.optLong("messages_epoch", 0L)
-            val epochReset = status.optBoolean("epoch_reset", false) ||
+            val explicitEpochReset = status.optBoolean("epoch_reset", false)
+            if (shouldRejectStaleSyncEpoch(incomingEpoch, lastMessagesEpoch) && !explicitEpochReset) return@withLock
+            val epochReset = explicitEpochReset ||
                 (incomingEpoch > 0L && lastMessagesEpoch > 0L && incomingEpoch != lastMessagesEpoch)
             if (incomingEpoch > 0L) lastMessagesEpoch = incomingEpoch
+            if (epochReset) confirmedSyncSeq = 0L
             if (epochReset && status.has("messages")) {
                 val fullMsgs = status.optJSONArray("messages")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }.orEmpty()
                 mergeRemoteMessages(fullMsgs, fullReplace = true)
@@ -792,7 +825,8 @@ internal suspend fun NativePulseModel.refreshStreamOnly() {
             val sTool = if (stream == null || stream.isNull("tool")) "" else stream.optString("tool").takeIf { it != "null" }.orEmpty()
             val eTool = if (execution == null || execution.isNull("tool")) "" else execution.optString("tool").takeIf { it != "null" }.orEmpty()
             val curTool = sTool.ifBlank { eTool }.ifBlank { if ((effectiveSBot != null || effectiveWorking != null) && execTrace.isNotEmpty()) ui.streamTool.ifBlank { "已执行 ${execTrace.size} 步" } else "" }
-            val usesCloudDesktop = curTool == "cloud_desktop" || execTrace.any { it.optString("tool") == "cloud_desktop" }
+            val usesCloudDesktop = curTool == "cloud_desktop" || curTool == "cloud" ||
+                execTrace.any { val t = it.optString("tool"); t == "cloud_desktop" || t == "cloud" }
             val startedSec = execution?.optDouble("started_at", 0.0) ?: 0.0
             val startedMs = if (startedSec > 0) (startedSec * 1000).toLong() else if (effectiveSBot != null || effectiveWorking != null) (ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L
             val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
@@ -809,8 +843,11 @@ internal suspend fun NativePulseModel.refreshStreamOnly() {
             val myNodeSource = SecureTransport.getNodeSource(activity)
             applyDeltaVersions(status)
             val statusBots = if (!status.optBoolean("bots_unchanged", true)) {
-                status.optJSONArray("bots")?.objects()?.mapNotNull { runCatching { PulseBot.from(it, myNodeSource) }.getOrNull() }?.takeIf { it.isNotEmpty() }
+                status.optJSONArray("bots")?.objects()?.mapNotNull { runCatching { PulseBot.from(it, myNodeSource) }.getOrNull() }?.let { PulseBot.filterForNode(it, myNodeSource) }?.takeIf { it.isNotEmpty() }
             } else null
+            val effectiveBots = statusBots ?: ui.bots
+            val validBotIds = effectiveBots.asSequence().map { it.id }.toHashSet()
+            avatarVersions.keys.retainAll(validBotIds)
             val statusPins = status.optJSONArray("pins")?.objects()
             val statusPrimary = status.optString("primary_bot_id").takeIf { it.isNotBlank() } ?: ui.primary
             val statusRoutinesCount = status.optInt("routine_count", -1).let { if (it >= 0) it else ui.routineCount }
@@ -818,7 +855,8 @@ internal suspend fun NativePulseModel.refreshStreamOnly() {
             ui = ui.copy(
                 online = true,
                 latency = rtt,
-                bots = statusBots ?: ui.bots,
+                bots = effectiveBots,
+                avatars = ui.avatars.filterKeys { it in validBotIds },
                 primary = statusPrimary,
                 pinnedMemories = statusPins ?: ui.pinnedMemories,
                 routineCount = statusRoutinesCount,
@@ -851,17 +889,21 @@ internal suspend fun NativePulseModel.refreshStreamOnly() {
                 cloudDesktopUrl = stComp?.optString("url")?.takeIf { it.isNotBlank() && it != "null" } ?: ui.cloudDesktopUrl
             )
             if (statusBots != null) cacheRoster(statusBots, statusPrimary)
-            if (ui.activePanel == "cloud_desktop") requestThrottledCloudFrame()
+            if (ui.activePanel == "cloud_desktop" && cloudStreamJob?.isActive != true) requestThrottledCloudFrame()
+            refreshSubtasks()
         }
     }
 }
 
 internal fun NativePulseModel.loadAvatars() {
+    val nowUptime = SystemClock.uptimeMillis()
     for (bot in ui.bots) {
         if (bot.avatarVersion.isBlank()) {
             if (bot.id in avatarVersions) { avatarVersions.remove(bot.id); ui = ui.copy(avatars = ui.avatars - bot.id) }
             continue
         }
+        val prevFail = avatarFailedVersions[bot.id]
+        if (prevFail != null && prevFail.first == bot.avatarVersion && nowUptime - prevFail.second < 60_000L) continue
         if (avatarVersions[bot.id] == bot.avatarVersion || bot.id in avatarLoading || avatarLoading.size >= 2) continue
         avatarLoading.add(bot.id)
         scope.launch {
@@ -872,11 +914,23 @@ internal fun NativePulseModel.loadAvatars() {
                     val bytes = Base64.decode(value.substringAfter(','), Base64.DEFAULT)
                     requireNotNull(BitmapFactory.decodeByteArray(bytes, 0, bytes.size)).asImageBitmap()
                 }
+                avatarFailedVersions.remove(bot.id)
                 if (ui.bots.any { it.id == bot.id && it.avatarVersion == image.optString("version") }) {
                     avatarVersions[bot.id] = image.getString("version"); ui = ui.copy(avatars = ui.avatars + (bot.id to bitmap))
                 }
-            } catch (e: Exception) { if (e is CancellationException) throw e }
-            finally { avatarLoading.remove(bot.id) }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                avatarFailedVersions[bot.id] = bot.avatarVersion to SystemClock.uptimeMillis()
+            } finally {
+                avatarLoading.remove(bot.id)
+                val checkNow = SystemClock.uptimeMillis()
+                val hasMore = ui.bots.any { b ->
+                    val f = avatarFailedVersions[b.id]
+                    b.avatarVersion.isNotBlank() && avatarVersions[b.id] != b.avatarVersion && b.id !in avatarLoading &&
+                        (f == null || f.first != b.avatarVersion || checkNow - f.second >= 60_000L)
+                }
+                if (hasMore && avatarLoading.size < 2) loadAvatars()
+            }
         }
     }
 }

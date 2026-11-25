@@ -26,15 +26,19 @@ from storage import node_display_name, normalize_node_source
 from vault_manager import now_iso
 
 SLASH_RX = re.compile(
-    r"^/(goal|goals|loop|compact|compack|summarize|mcp|mcps|tools|skills|memory|vault|init|model|models|sessions|resume|bots|undo|redo|status|context|cost|doctor|clear|new|reset|pin|pins|unpin|share|export|help|commands)(?:\s+([\s\S]*))?$",
+    r"^/(goal|goals|loop|compact|compack|summarize|mcp|mcps|tools|skills|memory|vault|init|reorganize|subtasks|model|models|sessions|resume|bots|undo|redo|status|context|cost|doctor|clear|new|reset|pin|pins|unpin|share|export|help|commands)(?:\s+([\s\S]*))?$",
     re.IGNORECASE,
 )
 
 SLASH_COMMANDS_CATALOG = [
     {"cmd": "/goal", "aliases": ["/goals", "/loop"], "args": "<目标描述>", "title": "深度目标闭环模式", "desc": "开启长程死磕执行模式（最高 160 步、子目标拆解、报错自动换路与终局完工验收门禁，绝不半途停工）"},
-    {"cmd": "/compact", "aliases": ["/compack", "/summarize"], "args": "[重点说明]", "title": "压缩上下文", "desc": "将较早对话归档至 Zettelkasten 记忆库与 FTS5 索引，释放 Token 窗口"},
+    {"cmd": "/compact", "aliases": ["/compack", "/summarize"], "args": "[重点说明]", "title": "压缩上下文", "desc": "将较早对话归档至长期记忆库与 FTS5 索引，释放 Token 窗口"},
+    {"cmd": "/memory reorganize", "aliases": ["/reorganize"], "args": "[--dry-run]", "title": "深度整理记忆", "desc": "瞬发启动 8 阶段全自动记忆整理子任务（备份、聚类、时间线裁决、Critic 复审、旧轨归档），可点进二级页看进度"},
+    {"cmd": "/memory rollback", "aliases": [], "args": "[backup_id]", "title": "回滚记忆整理", "desc": "一键还原到最近一次或指定的整理前备份快照"},
+    {"cmd": "/memory gardener", "aliases": [], "args": "", "title": "记忆园丁维护", "desc": "清理过期临时事实、合并重复项并按时间金字塔归并老情景"},
+    {"cmd": "/subtasks", "aliases": [], "args": "", "title": "查看子任务状态", "desc": "查看当前并发运行及近期已回收的子任务列表、进度与报错"},
     {"cmd": "/mcp", "aliases": ["/mcps", "/tools", "/skills"], "args": "", "title": "MCP 与工具插件", "desc": "查看已挂载的 MCP 扩展工具、技能包 (Skills) 与本机/跨端工具矩阵"},
-    {"cmd": "/memory", "aliases": ["/vault", "/init"], "args": "[搜索词]", "title": "记忆库与画像检索", "desc": "查看 Zettelkasten 记忆库索引与个人印象，或直接检索记忆卡片"},
+    {"cmd": "/memory", "aliases": ["/vault", "/init"], "args": "[搜索词]", "title": "记忆库与画像检索", "desc": "查看长期记忆库索引与个人印象，或直接检索记忆卡片"},
     {"cmd": "/models", "aliases": ["/model"], "args": "[模型ID]", "title": "查看或切换模型", "desc": "列出可用大模型，或直接切换当前节点 Bot 的专属模型"},
     {"cmd": "/sessions", "aliases": ["/resume", "/bots"], "args": "", "title": "多端会话与工作区", "desc": "查看四端 Bot 房间状态及 Windows DSH 底部工作区活跃会话"},
     {"cmd": "/undo", "aliases": [], "args": "", "title": "撤销上一轮对话", "desc": "撤回当前房间最后一轮问答（可通过 `/redo` 恢复）"},
@@ -183,6 +187,80 @@ async def try_handle_slash_command(brain, raw_text: str, bot_id: str, src: str, 
         ]
         return "\n".join(lines)
 
+    if cmd == "subtasks":
+        from core.subtask_runner import get_subtask_store
+        runs = get_subtask_store(brain).list_runs(parent_bot_id=bot_id, limit=12, recent_steps_limit=3)
+        if not runs:
+            return "### 子任务列表 (`/subtasks`)\n\n当前没有运行中或近期的子任务。"
+        lines = [f"### 子任务列表 (`/subtasks` · 共 `{len(runs)}` 项)", ""]
+        for r in runs:
+            st = r["status"]
+            prog = f"阶段 {r['stage_idx']}/{r['stage_total']}" if r.get("stage_total") else f"步骤 {r['steps_executed']}/{r['max_steps']}"
+            err_s = f" · 报错: `{r['last_error'][:80]}`" if r.get("last_error") else ""
+            lines.append(f"- **{r['title']}** (`{r['task_id']}`) · `{st}` · {prog} ({r['progress_pct']}%){err_s}")
+        return "\n".join(lines)
+
+    if cmd == "reorganize" or (cmd in ("memory", "vault", "init") and arg.lower().split()[:1] in (["reorganize"], ["migrate"], ["rollback"], ["backups"], ["gardener"], ["ledger"], ["reindex"])):
+        parts = arg.split()
+        sub = "reorganize" if cmd == "reorganize" else parts[0].lower()
+        sub_rest = " ".join(parts[1:]).strip() if cmd != "reorganize" else arg.strip()
+        if sub in ("reorganize", "migrate"):
+            dry = "--dry-run" in arg.lower() or "dry" in arg.lower()
+            if dry:
+                from core.memory_migrator import reorganize_legacy_memory
+                res = await reorganize_legacy_memory(brain, dry_run=True, use_llm=True)
+                return (
+                    f"### 重新整理记忆 · 预演统计 (`/memory reorganize --dry-run`)\n\n"
+                    f"- **待整理旧经验**：`{res.get('legacy_experiences_count', 0)}` 条\n"
+                    f"- **预计语义聚类**：`{res.get('estimated_clusters', 0)}` 簇\n"
+                    f"- **待归档压缩笔记 (`compact_*.md`)**：`{res.get('legacy_compacts_count', 0)}` 份\n"
+                    f"- **置顶核心规则**：`{res.get('pins_count', 0)}` 条\n"
+                    f"- **预计可清除过期临时碎片**：`{res.get('estimated_expired_noise', 0)}` 条\n\n"
+                    f"> 确认无误后直接发送 `/memory reorganize` 即可瞬发后台子任务开始整理。"
+                )
+            from core.subtask_runner import spawn_memory_reorganize_subtask
+            sp = await spawn_memory_reorganize_subtask(brain, parent_bot_id=bot_id, parent_source=norm_src)
+            if not sp.get("ok"):
+                return f"### 记忆整理启动失败\n\n- 原因：{sp.get('error', '未知错误')}"
+            return (
+                f"### 记忆深度整理已瞬发启动 (`{sp.get('task_id')}`)\n\n"
+                f"- **子任务名称**：`{sp.get('title', '记忆深度整理')}`\n"
+                f"- **归属对话**：`{bot_id}`（完成后自动回传结果，不阻塞当前聊天）\n"
+                f"- 可直接点击顶部或消息中的子任务入口进入二级页面实时查看 8 阶段进度与日志，不满意随时 `/memory rollback`。"
+            )
+        if sub in ("rollback", "backups"):
+            from core.memory_migrator import list_memory_backups, rollback_memory_backup
+            from pathlib import Path
+            vroot = Path(brain.vault.root) if getattr(brain, "vault", None) is not None else (brain.store.root / "memory_vault")
+            if sub == "backups" or sub_rest == "--list":
+                bks = list_memory_backups(vroot)
+                if not bks:
+                    return "### 记忆备份快照\n\n暂无整理备份。"
+                return "### 可用记忆备份快照\n\n" + "\n".join(f"- `{b['backup_id']}`" for b in bks[:10])
+            rb = rollback_memory_backup(brain, backup_id=sub_rest)
+            if not rb.get("ok"):
+                return f"### 记忆回滚失败\n\n- 原因：{rb.get('error', '未知错误')}"
+            return (
+                f"### 记忆已回滚至整理前快照\n\n"
+                f"- **已还原快照**：`{rb.get('restored_backup')}`\n"
+                f"- **回滚前安全留底**：`{rb.get('safety_backup')}`"
+            )
+        if sub == "gardener":
+            from core.memory_migrator import run_memory_gardener
+            g = run_memory_gardener(brain)
+            return (
+                f"### 记忆园丁维护完成 (`/memory gardener`)\n\n"
+                f"- **退役过期临时事实**：`{g.get('expired_facts', 0)}` 条\n"
+                f"- **合并重复事实**：`{g.get('merged_duplicates', 0)}` 条\n"
+                f"- **时间金字塔归并情景**：`{g.get('rolled_up_episodes', 0)}` 条\n"
+                f"- **账本已同步**：[[profile/memory_ledger]]"
+            )
+        if sub == "reindex":
+            r = brain.memory_engine.get_memory_tables().reindex_vectors()
+            return f"### 本地向量索引重建 (`/memory reindex`)\n\n- **结果**：`ok={r.get('ok')}` · `model_id={r.get('model_id', '')}` · `indexed={r.get('indexed', 0)}`"
+        tables = brain.memory_engine.get_memory_tables()
+        return f"### 长期记忆 5 表账本 (`/memory ledger`)\n\n```json\n{tables.stats()}\n```\n\n{tables.render_memory_ledger_markdown()[:2200]}"
+
     if cmd in ("memory", "vault", "init"):
         if arg:
             hits = brain.vault.search(arg, limit=8)
@@ -241,36 +319,54 @@ async def try_handle_slash_command(brain, raw_text: str, bot_id: str, src: str, 
         return "\n".join(lines)
 
     if cmd == "undo":
-        msgs = brain.store.state.get("messages", [])
-        cur_id = (current_user_msg or {}).get("id")
-        filtered = [m_it for m_it in msgs if m_it.get("id") != cur_id]
-        room_idxs = [
-            i for i, m_it in enumerate(filtered)
-            if m_it.get("bot_id", "companion") == bot_id and normalize_node_source(m_it.get("source")) == norm_src
-        ]
-        if not room_idxs:
-            brain.store.state["messages"] = filtered
-            brain.store.save()
+        removed_ids: list[str] = []
+        preview = ""
+        undone_count = 0
+        empty_undo = False
+        async with brain.lock:
+            with brain.store.lock:
+                msgs = brain.store.state.get("messages", [])
+                cur_id = (current_user_msg or {}).get("id")
+                filtered = [m_it for m_it in msgs if m_it.get("id") != cur_id]
+                removed_cur = len(filtered) != len(msgs)
+                room_idxs = [
+                    i for i, m_it in enumerate(filtered)
+                    if m_it.get("bot_id", "companion") == bot_id and normalize_node_source(m_it.get("source")) == norm_src
+                ]
+                if not room_idxs:
+                    brain.store.state["messages"] = filtered
+                    if removed_cur:
+                        brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
+                    brain.store.save()
+                    empty_undo = True
+                else:
+                    last_user_idx = -1
+                    for i in reversed(room_idxs):
+                        if filtered[i].get("role") == "user":
+                            last_user_idx = i
+                            break
+                    cut_from = last_user_idx if last_user_idx >= 0 else room_idxs[-1]
+                    undone_items = []
+                    kept = []
+                    for idx, m_it in enumerate(filtered):
+                        if idx >= cut_from and m_it.get("bot_id", "companion") == bot_id and normalize_node_source(m_it.get("source")) == norm_src:
+                            undone_items.append(m_it)
+                        else:
+                            kept.append(m_it)
+                    undo_stack = brain.store.state.setdefault("undo_stack", {})
+                    room_key = f"{norm_src}:{bot_id}"
+                    room_stack = undo_stack.setdefault(room_key, [])
+                    room_stack.append(undone_items)
+                    if len(room_stack) > 5:
+                        undo_stack[room_key] = room_stack[-5:]
+                    brain.store.state["messages"] = kept
+                    brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
+                    brain.store.save()
+                    removed_ids = [str(x.get("id") or "") for x in undone_items if x.get("id")]
+                    preview = (undone_items[0].get("text") or "")[:60] if undone_items else ""
+                    undone_count = len(undone_items)
+        if empty_undo:
             return "### ↩️ 暂无可撤销的对话 (`/undo`)\n\n当前房间没有更早的对话轮次。"
-        last_user_idx = -1
-        for i in reversed(room_idxs):
-            if filtered[i].get("role") == "user":
-                last_user_idx = i
-                break
-        cut_from = last_user_idx if last_user_idx >= 0 else room_idxs[-1]
-        undone_items = []
-        kept = []
-        for idx, m_it in enumerate(filtered):
-            if idx >= cut_from and m_it.get("bot_id", "companion") == bot_id and normalize_node_source(m_it.get("source")) == norm_src:
-                undone_items.append(m_it)
-            else:
-                kept.append(m_it)
-        undo_stack = brain.store.state.setdefault("undo_stack", {})
-        room_key = f"{norm_src}:{bot_id}"
-        undo_stack.setdefault(room_key, []).append(undone_items)
-        brain.store.state["messages"] = kept
-        brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
-        brain.store.save()
         if hasattr(brain, "dsh_adapter"):
             with contextlib.suppress(Exception):
                 await brain.dsh_adapter.reset_session(bot_id, norm_src)
@@ -279,28 +375,45 @@ async def try_handle_slash_command(brain, raw_text: str, bot_id: str, src: str, 
             "type": "messages_truncated",
             "source": norm_src,
             "bot_id": bot_id,
-            "removed_message_ids": [str(x.get("id") or "") for x in undone_items if x.get("id")],
+            "removed_message_ids": removed_ids,
             "messages_epoch": brain.store.state["messages_epoch"],
             "seq": brain.stream_seq,
         })
-        preview = (undone_items[0].get("text") or "")[:60] if undone_items else ""
-        return f"### ↩️ 已撤销上一轮对话 (`/undo`)\n\n- **撤回消息数**：`{len(undone_items)} 条`（`{preview}`）\n- 如需恢复，随时输入 `/redo`。"
+        return f"### ↩️ 已撤销上一轮对话 (`/undo`)\n\n- **撤回消息数**：`{undone_count} 条`（`{preview}`）\n- 如需恢复，随时输入 `/redo`。"
 
     if cmd == "redo":
-        msgs = brain.store.state.get("messages", [])
-        cur_id = (current_user_msg or {}).get("id")
-        filtered = [m_it for m_it in msgs if m_it.get("id") != cur_id]
-        undo_stack = brain.store.state.setdefault("undo_stack", {})
-        room_key = f"{norm_src}:{bot_id}"
-        stack_list = undo_stack.get(room_key) or []
-        if not stack_list:
-            brain.store.state["messages"] = filtered
-            brain.store.save()
+        restored_count = 0
+        empty_redo = False
+        async with brain.lock:
+            with brain.store.lock:
+                msgs = brain.store.state.get("messages", [])
+                cur_id = (current_user_msg or {}).get("id")
+                filtered = [m_it for m_it in msgs if m_it.get("id") != cur_id]
+                removed_cur = len(filtered) != len(msgs)
+                undo_stack = brain.store.state.setdefault("undo_stack", {})
+                room_key = f"{norm_src}:{bot_id}"
+                stack_list = undo_stack.get(room_key) or []
+                if not stack_list:
+                    brain.store.state["messages"] = filtered
+                    if removed_cur:
+                        brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
+                    brain.store.save()
+                    empty_redo = True
+                else:
+                    restored = list(stack_list.pop() or [])
+                    sql_backend = getattr(brain.store, "sql", None)
+                    for rm_it in restored:
+                        if isinstance(rm_it, dict) and sql_backend is not None:
+                            new_oseq = sql_backend.alloc_order_seq()
+                            rm_it["order_seq"] = new_oseq
+                            rm_it["seq"] = new_oseq
+                            sql_backend.upsert_message(rm_it)
+                    brain.store.state["messages"] = filtered + restored
+                    brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
+                    brain.store.save()
+                    restored_count = len(restored)
+        if empty_redo:
             return "### ↪️ 暂无可重做的对话 (`/redo`)\n\n当前房间没有通过 `/undo` 撤回的记录。"
-        restored = stack_list.pop()
-        brain.store.state["messages"] = filtered + restored
-        brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
-        brain.store.save()
         if hasattr(brain, "dsh_adapter"):
             with contextlib.suppress(Exception):
                 await brain.dsh_adapter.reset_session(bot_id, norm_src)
@@ -312,7 +425,7 @@ async def try_handle_slash_command(brain, raw_text: str, bot_id: str, src: str, 
             "messages_epoch": brain.store.state["messages_epoch"],
             "seq": brain.stream_seq,
         })
-        return f"### ↪️ 已恢复撤销的对话 (`/redo`)\n\n- 已重新恢复 `{len(restored)} 条` 历史消息。"
+        return f"### ↪️ 已恢复撤销的对话 (`/redo`)\n\n- 已重新恢复 `{restored_count} 条` 历史消息。"
 
     if cmd in ("share", "export"):
         msgs = [
@@ -367,35 +480,37 @@ async def try_handle_slash_command(brain, raw_text: str, bot_id: str, src: str, 
         )
 
     if cmd in ("clear", "new", "reset"):
-        msgs = brain.store.state.get("messages", [])
-        kept = []
-        archived_count = 0
         removed_ids: list[str] = []
-        for m_item in msgs:
-            if m_item.get("bot_id", "companion") == bot_id and normalize_node_source(m_item.get("source")) == norm_src:
-                try:
-                    brain.context_search.index_message(m_item)
-                except Exception:
-                    pass
-                if m_item.get("id"):
-                    removed_ids.append(str(m_item["id"]))
-                archived_count += 1
-            else:
-                kept.append(m_item)
-        brain.store.state["messages"] = kept
-        brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
-        nb_key = f"{norm_src}:{bot_id}"
-        brain.last_prompt_tokens[nb_key] = 0
-        brain.last_cached_tokens[nb_key] = 0
-        brain.store.state.setdefault("last_prompt_tokens", {})[nb_key] = 0
-        brain.store.state.setdefault("last_cached_tokens", {})[nb_key] = 0
-        if norm_src == "phone":
-            brain.last_prompt_tokens[bot_id] = 0
-            brain.last_cached_tokens[bot_id] = 0
-            brain.store.state.setdefault("last_prompt_tokens", {})[bot_id] = 0
-            brain.store.state.setdefault("last_cached_tokens", {})[bot_id] = 0
-        brain.memory_engine.clear_memory_deltas(bot_id=bot_id, source=norm_src)
-        brain.store.save()
+        archived_count = 0
+        async with brain.lock:
+            with brain.store.lock:
+                msgs = brain.store.state.get("messages", [])
+                kept = []
+                for m_item in msgs:
+                    if m_item.get("bot_id", "companion") == bot_id and normalize_node_source(m_item.get("source")) == norm_src:
+                        try:
+                            brain.context_search.index_message(m_item)
+                        except Exception:
+                            pass
+                        if m_item.get("id"):
+                            removed_ids.append(str(m_item["id"]))
+                        archived_count += 1
+                    else:
+                        kept.append(m_item)
+                brain.store.state["messages"] = kept
+                brain.store.state["messages_epoch"] = int(brain.store.state.get("messages_epoch") or 1) + 1
+                nb_key = f"{norm_src}:{bot_id}"
+                brain.last_prompt_tokens[nb_key] = 0
+                brain.last_cached_tokens[nb_key] = 0
+                brain.store.state.setdefault("last_prompt_tokens", {})[nb_key] = 0
+                brain.store.state.setdefault("last_cached_tokens", {})[nb_key] = 0
+                if norm_src == "phone":
+                    brain.last_prompt_tokens[bot_id] = 0
+                    brain.last_cached_tokens[bot_id] = 0
+                    brain.store.state.setdefault("last_prompt_tokens", {})[bot_id] = 0
+                    brain.store.state.setdefault("last_cached_tokens", {})[bot_id] = 0
+                brain.memory_engine.clear_memory_deltas(bot_id=bot_id, source=norm_src)
+                brain.store.save()
         if hasattr(brain, "dsh_adapter"):
             with contextlib.suppress(Exception):
                 await brain.dsh_adapter.reset_session(bot_id, norm_src)

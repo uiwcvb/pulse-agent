@@ -24,7 +24,7 @@ public class AgentActionReceiver extends BroadcastReceiver {
             JSONObject body=new JSONObject();
             if("ack".equals(action))body.put("ids",new JSONArray().put(id));
             else body.put("minutes",i.getIntExtra("minutes",60));
-            new SecureTransport(c).request("POST","ack".equals(action)?"/api/ack":"/api/snooze",body,null);
+            new SecureTransport(c).requestWithTimeout("POST","ack".equals(action)?"/api/ack":"/api/snooze",body,null,6L);
             c.sendBroadcast(new Intent(c.getPackageName()+".UPDATE").setPackage(c.getPackageName()));
         }catch(Exception ignored){}finally{pending.finish();}},"pulse-action").start();
     }

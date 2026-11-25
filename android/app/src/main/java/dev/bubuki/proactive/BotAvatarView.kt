@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
@@ -27,6 +28,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -110,9 +113,10 @@ fun BotColorSwatchRow(
     onSelectColor: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val c = LocalPulsePalette.current
     LazyRow(
         modifier = modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         items(BOT_PRESET_COLORS) { hex ->
@@ -120,21 +124,28 @@ fun BotColorSwatchRow(
             val swatchColor = remember(hex) { BotAvatarView.parseColorSafe(hex) }
             Box(
                 modifier = Modifier
-                    .size(34.dp)
-                    .clip(CircleShape)
-                    .background(swatchColor, CircleShape)
-                    .then(
-                        if (selected) {
-                            Modifier.border(2.5.dp, Color.White, CircleShape)
-                        } else {
-                            Modifier.border(1.dp, Color(0x33FFFFFF), CircleShape)
-                        }
-                    )
-                    .clickable { onSelectColor(hex) },
+                    .size(44.dp)
+                    .iosPressScale(0.92f) { onSelectColor(hex) }
+                    .semantics { contentDescription = "选择颜色 $hex" },
                 contentAlignment = Alignment.Center
             ) {
-                if (selected) {
-                    PulseIcon("check", Color.White, Modifier.size(16.dp))
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(swatchColor, CircleShape)
+                        .then(
+                            if (selected) {
+                                Modifier.border(2.5.dp, c.ink, CircleShape)
+                            } else {
+                                Modifier.border(0.5.dp, c.line, CircleShape)
+                            }
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (selected) {
+                        PulseIcon("check", Color.White, Modifier.size(16.dp))
+                    }
                 }
             }
         }
@@ -149,7 +160,8 @@ fun BotShapeSelectorGrid(
     onSelectShape: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val activeShape = selectedShape.trim().lowercase().ifBlank { "flower" }
+    val c = LocalPulsePalette.current
+    val activeShape = selectedShape.trim().lowercase(java.util.Locale.ROOT).ifBlank { "flower" }
     val previewColor = remember(previewColorHex) { BotAvatarView.parseColorSafe(previewColorHex) }
     val fillPaint = remember { Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL } }
 
@@ -163,15 +175,16 @@ fun BotShapeSelectorGrid(
             val path = remember(shapeKey) { BotAvatarView.createPath(shapeKey) }
             Row(
                 modifier = Modifier
+                    .heightIn(min = 40.dp)
                     .clip(RoundedCornerShape(10.dp))
-                    .background(if (selected) previewColor.copy(alpha = 0.22f) else Color(0xFF2C2C2E))
+                    .background(if (selected) previewColor.copy(alpha = 0.16f) else c.fill)
                     .border(
-                        width = if (selected) 1.5.dp else 0.8.dp,
-                        color = if (selected) previewColor else Color(0x22FFFFFF),
+                        width = if (selected) 1.5.dp else 0.5.dp,
+                        color = if (selected) previewColor else c.line,
                         shape = RoundedCornerShape(10.dp)
                     )
-                    .clickable { onSelectShape(shapeKey) }
-                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                    .iosPressScale(0.95f) { onSelectShape(shapeKey) }
+                    .padding(horizontal = 11.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
@@ -193,7 +206,7 @@ fun BotShapeSelectorGrid(
                 }
                 Text(
                     text = shapeLabel,
-                    color = if (selected) Color.White else Color(0xFFE2E8F0),
+                    color = c.ink,
                     fontSize = 12.sp,
                     fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
                 )

@@ -35,11 +35,10 @@ class PulseAccessibilityService : AccessibilityService() {
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
                 info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
                 info.notificationTimeout = 250L
-                info.flags = (info.flags or
+                info.flags = info.flags or
                     AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS) and
-                    AccessibilityServiceInfo.FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY.inv()
+                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                 serviceInfo = info
             }
         }
@@ -120,6 +119,19 @@ class PulseAccessibilityService : AccessibilityService() {
         fun isConnected(): Boolean = instance != null
 
         @JvmStatic
+        @JvmOverloads
+        fun clearSnapshot(displayId: Int = -1) {
+            if (displayId > 0) snapshotCache.remove(displayId) else snapshotCache.clear()
+        }
+
+        private fun recycleIfLegacy(node: AccessibilityNodeInfo?) {
+            if (android.os.Build.VERSION.SDK_INT < 33 && node != null) {
+                @Suppress("DEPRECATION")
+                runCatching { node.recycle() }
+            }
+        }
+
+        @JvmStatic
         fun getCachedSnapshot(displayId: Int): CachedSnapshot? = snapshotCache[displayId]
 
         @JvmStatic
@@ -152,12 +164,14 @@ class PulseAccessibilityService : AccessibilityService() {
             return snap
         }
 
-        private val SKIPPED_WINDOW_TYPES = setOf(
-            AccessibilityWindowInfo.TYPE_INPUT_METHOD,
-            AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY,
-            AccessibilityWindowInfo.TYPE_MAGNIFICATION_OVERLAY,
-            AccessibilityWindowInfo.TYPE_SPLIT_SCREEN_DIVIDER
-        )
+        private val SKIPPED_WINDOW_TYPES = buildSet {
+            add(AccessibilityWindowInfo.TYPE_INPUT_METHOD)
+            add(AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                add(AccessibilityWindowInfo.TYPE_MAGNIFICATION_OVERLAY)
+            }
+            add(AccessibilityWindowInfo.TYPE_SPLIT_SCREEN_DIVIDER)
+        }
 
         @JvmStatic
         @JvmOverloads
@@ -222,7 +236,8 @@ class PulseAccessibilityService : AccessibilityService() {
                         var activePkg = ""
                         var nextIdx = 1
                         val hasExternalAppWin = contentWindows.any { win ->
-                            val p = try { win.root?.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
+                            val r = try { win.root } catch (_: Throwable) { null }
+                            val p = try { r?.packageName?.toString().orEmpty() } catch (_: Throwable) { "" } finally { recycleIfLegacy(r) }
                             p.isNotBlank() && p != "dev.bubuki.proactive"
                         }
 
@@ -234,6 +249,7 @@ class PulseAccessibilityService : AccessibilityService() {
                                 val winPkg = root.packageName?.toString().orEmpty()
                                 // Skip our VirtualDisplay Home Screen (`DisplayTestActivity`) whenever an external app window is above it
                                 if (winPkg == "dev.bubuki.proactive" && hasExternalAppWin) {
+                                    recycleIfLegacy(root)
                                     continue
                                 }
                                 if (activePkg.isEmpty() && winPkg.isNotBlank() && win.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
@@ -332,10 +348,12 @@ class PulseAccessibilityService : AccessibilityService() {
                                         val child = try { node.getChild(i) } catch (t: Throwable) { null }
                                         if (child != null) {
                                             traverse(child, depth + 1)
+                                            recycleIfLegacy(child)
                                         }
                                     }
                                 }
                                 traverse(root, 0)
+                                recycleIfLegacy(root)
                             }
                         }
 
@@ -346,9 +364,17 @@ class PulseAccessibilityService : AccessibilityService() {
                             collectFromWindows(strictVisible = false)
                         }
                         if (activePkg.isEmpty() || (activePkg == "dev.bubuki.proactive" && hasExternalAppWin)) {
-                            val topPkg = try { DisplayInputHelper.topPackageOnDisplay(displayId) } catch (_: Throwable) { "" }
-                            if (topPkg.isNotBlank() && topPkg != "dev.bubuki.proactive") {
-                                activePkg = topPkg
+                            val inferredPkg = collected.firstOrNull { it.pkg.isNotBlank() && it.pkg != "dev.bubuki.proactive" }?.pkg
+                                ?: contentWindows.firstNotNullOfOrNull { win ->
+                                    val r = try { win.root } catch (_: Throwable) { null }
+                                    try {
+                                        r?.packageName?.toString()?.takeIf { it.isNotBlank() && it != "dev.bubuki.proactive" }
+                                    } finally {
+                                        recycleIfLegacy(r)
+                                    }
+                                }.orEmpty()
+                            if (inferredPkg.isNotBlank()) {
+                                activePkg = inferredPkg
                             }
                         }
 
@@ -410,6 +436,7 @@ class PulseAccessibilityService : AccessibilityService() {
                     val vis = try { child.isVisibleToUser } catch (t: Throwable) { true }
                     if (strictVisible && !vis) {
                         walk(child, depth + 1)
+                        recycleIfLegacy(child)
                         continue
                     }
                     val t = child.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
@@ -417,9 +444,13 @@ class PulseAccessibilityService : AccessibilityService() {
                     if (t != null && t !in parts) {
                         parts.add(t)
                         totalLen += t.length
-                        if (totalLen > 64) return
+                        if (totalLen > 64) {
+                            recycleIfLegacy(child)
+                            return
+                        }
                     }
                     walk(child, depth + 1)
+                    recycleIfLegacy(child)
                 }
             }
             walk(node, 0)
@@ -606,24 +637,27 @@ class PulseAccessibilityService : AccessibilityService() {
                 .filter { it.displayId == displayId && it.type !in SKIPPED_WINDOW_TYPES }
                 .sortedByDescending { it.layer }
             val hasExternalAppWin = contentWindows.any { win ->
-                val p = try { win.root?.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
+                val r = try { win.root } catch (_: Throwable) { null }
+                val p = try { r?.packageName?.toString().orEmpty() } catch (_: Throwable) { "" } finally { recycleIfLegacy(r) }
                 p.isNotBlank() && p != "dev.bubuki.proactive"
             }
             for (win in contentWindows) {
                 val root = try { win.root } catch (t: Throwable) { null } ?: continue
-                val winPkg = root.packageName?.toString().orEmpty()
-                if (winPkg == "dev.bubuki.proactive" && hasExternalAppWin) continue
-                val rootRect = Rect()
-                try { root.getBoundsInScreen(rootRect) } catch (t: Throwable) {}
-                val screenClip = Rect(0, 0, rootRect.right.coerceAtLeast(1080), rootRect.bottom.coerceAtLeast(1920))
-                val maxParentArea = (rootRect.width().coerceAtLeast(1080).toLong() * rootRect.height().coerceAtLeast(1920).toLong() * 70L) / 100L
-                val visited = intArrayOf(0)
-                val found = findLiveNode(root, target, 0, screenClip, visited)
-                if (found != null) {
-                    return try {
-                        when (action) {
+                var found: AccessibilityNodeInfo? = null
+                try {
+                    val winPkg = root.packageName?.toString().orEmpty()
+                    if (winPkg == "dev.bubuki.proactive" && hasExternalAppWin) continue
+                    val rootRect = Rect()
+                    try { root.getBoundsInScreen(rootRect) } catch (t: Throwable) {}
+                    val screenClip = Rect(0, 0, rootRect.right.coerceAtLeast(1080), rootRect.bottom.coerceAtLeast(1920))
+                    val maxParentArea = (rootRect.width().coerceAtLeast(1080).toLong() * rootRect.height().coerceAtLeast(1920).toLong() * 70L) / 100L
+                    val visited = intArrayOf(0)
+                    found = findLiveNode(root, target, 0, screenClip, visited)
+                    if (found != null) {
+                        val f = found
+                        return when (action) {
                             "click" -> {
-                                var current: AccessibilityNodeInfo? = found
+                                var current: AccessibilityNodeInfo? = f
                                 var clicked = false
                                 var hops = 0
                                 while (current != null && hops < 4) {
@@ -636,41 +670,57 @@ class PulseAccessibilityService : AccessibilityService() {
                                         clicked = true
                                         break
                                     }
-                                    current = current.parent
+                                    val next = current.parent
+                                    if (current !== f && current !== root) recycleIfLegacy(current)
+                                    current = next
                                     hops++
                                 }
+                                if (current != null && current !== f && current !== root) recycleIfLegacy(current)
                                 clicked
                             }
                             "set_text" -> {
-                                val editTarget = if (found.isEditable || found.className?.toString()?.contains("EditText", ignoreCase = true) == true) {
-                                    found
+                                val isDirectEdit = f.isEditable || f.className?.toString()?.contains("EditText", ignoreCase = true) == true
+                                val editTarget = if (isDirectEdit) f else findEditableDescendant(f, 0)
+                                if (editTarget == null) {
+                                    false
                                 } else {
-                                    findEditableDescendant(found, 0) ?: return false
+                                    try {
+                                        editTarget.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                                        editTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                                        val args = Bundle().apply {
+                                            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, inputText.orEmpty())
+                                        }
+                                        editTarget.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                                    } finally {
+                                        if (editTarget !== f && editTarget !== root) recycleIfLegacy(editTarget)
+                                    }
                                 }
-                                editTarget.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                                editTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                                val args = Bundle().apply {
-                                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, inputText.orEmpty())
-                                }
-                                editTarget.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                             }
                             "clear_text" -> {
-                                val editTarget = if (found.isEditable || found.className?.toString()?.contains("EditText", ignoreCase = true) == true) {
-                                    found
+                                val isDirectEdit = f.isEditable || f.className?.toString()?.contains("EditText", ignoreCase = true) == true
+                                val editTarget = if (isDirectEdit) f else findEditableDescendant(f, 0)
+                                if (editTarget == null) {
+                                    false
                                 } else {
-                                    findEditableDescendant(found, 0) ?: return false
+                                    try {
+                                        editTarget.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                                        val args = Bundle().apply {
+                                            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+                                        }
+                                        editTarget.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                                    } finally {
+                                        if (editTarget !== f && editTarget !== root) recycleIfLegacy(editTarget)
+                                    }
                                 }
-                                editTarget.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                                val args = Bundle().apply {
-                                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
-                                }
-                                editTarget.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                             }
                             else -> false
                         }
-                    } catch (t: Throwable) {
-                        false
                     }
+                } catch (_: Throwable) {
+                    if (found != null) return false
+                } finally {
+                    if (found != null && found !== root) recycleIfLegacy(found)
+                    recycleIfLegacy(root)
                 }
             }
             return false
@@ -685,7 +735,11 @@ class PulseAccessibilityService : AccessibilityService() {
             for (i in 0 until count) {
                 val child = try { node.getChild(i) } catch (t: Throwable) { null } ?: continue
                 val found = findEditableDescendant(child, depth + 1)
-                if (found != null) return found
+                if (found != null) {
+                    if (found !== child) recycleIfLegacy(child)
+                    return found
+                }
+                recycleIfLegacy(child)
             }
             return null
         }
@@ -701,34 +755,42 @@ class PulseAccessibilityService : AccessibilityService() {
             val raw = Rect()
             try { node.getBoundsInScreen(raw) } catch (t: Throwable) {}
             val r = Rect(raw)
-            r.intersect(screenClip)
-            val resId = node.viewIdResourceName?.substringAfterLast('/')?.trim().orEmpty()
-            if (target.resourceId.isNotEmpty() && resId.equals(target.resourceId, ignoreCase = true) &&
-                kotlin.math.abs(r.centerY() - target.centerY) <= 180
-            ) {
-                return node
-            }
-            if (kotlin.math.abs(r.centerX() - target.centerX) <= 28 && kotlin.math.abs(r.centerY() - target.centerY) <= 28) {
-                val txt = node.text?.toString()?.trim().orEmpty()
-                val desc = node.contentDescription?.toString()?.trim().orEmpty()
-                val hint = node.hintText?.toString()?.trim().orEmpty()
-                val clickable = node.isClickable || node.isLongClickable || node.isContextClickable
-                if (
-                    (target.resourceId.isNotEmpty() && resId.equals(target.resourceId, ignoreCase = true)) ||
-                    (txt.isNotEmpty() && txt == target.text) ||
-                    (desc.isNotEmpty() && desc == target.desc) ||
-                    (hint.isNotEmpty() && hint == target.hint) ||
-                    (node.isEditable && target.editable) ||
-                    (clickable == target.clickable && kotlin.math.abs(r.width() - target.bounds.width()) <= 24)
+            val onScreen = r.intersect(screenClip)
+            if (onScreen) {
+                val resId = node.viewIdResourceName?.substringAfterLast('/')?.trim().orEmpty()
+                val dx = kotlin.math.abs(r.centerX() - target.centerX)
+                val dy = kotlin.math.abs(r.centerY() - target.centerY)
+                if (target.resourceId.isNotEmpty() && resId.equals(target.resourceId, ignoreCase = true) &&
+                    dx <= 160 && (dx + dy) <= 220
                 ) {
                     return node
+                }
+                if (kotlin.math.abs(r.centerX() - target.centerX) <= 28 && kotlin.math.abs(r.centerY() - target.centerY) <= 28) {
+                    val txt = node.text?.toString()?.trim().orEmpty()
+                    val desc = node.contentDescription?.toString()?.trim().orEmpty()
+                    val hint = node.hintText?.toString()?.trim().orEmpty()
+                    val clickable = node.isClickable || node.isLongClickable || node.isContextClickable
+                    if (
+                        (target.resourceId.isNotEmpty() && resId.equals(target.resourceId, ignoreCase = true)) ||
+                        (txt.isNotEmpty() && txt == target.text) ||
+                        (desc.isNotEmpty() && desc == target.desc) ||
+                        (hint.isNotEmpty() && hint == target.hint) ||
+                        (node.isEditable && target.editable) ||
+                        (clickable == target.clickable && kotlin.math.abs(r.width() - target.bounds.width()) <= 24)
+                    ) {
+                        return node
+                    }
                 }
             }
             val count = try { node.childCount } catch (t: Throwable) { 0 }
             for (i in 0 until count) {
-                val child = try { node.getChild(i) } catch (t: Throwable) { null }
+                val child = try { node.getChild(i) } catch (t: Throwable) { null } ?: continue
                 val match = findLiveNode(child, target, depth + 1, screenClip, visited)
-                if (match != null) return match
+                if (match != null) {
+                    if (match !== child) recycleIfLegacy(child)
+                    return match
+                }
+                recycleIfLegacy(child)
             }
             return null
         }
@@ -800,12 +862,11 @@ class PulseAccessibilityService : AccessibilityService() {
             val pkgSafe = snap.activePackage.ifBlank { "unknown" }
             val layoutSig = "${snap.screenW}x${snap.screenH}_${pkgSafe}_${snap.treeHash}_n${snap.nodes.size}"
             val realDpi = runCatching {
-                val dm = instance?.getSystemService(android.hardware.display.DisplayManager::class.java)
+                val appCtx = instance ?: return@runCatching null
+                val dm = appCtx.getSystemService(android.hardware.display.DisplayManager::class.java)
                 val disp = dm?.getDisplay(snap.displayId) ?: dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
-                val metrics = android.util.DisplayMetrics()
-                @Suppress("DEPRECATION")
-                disp?.getRealMetrics(metrics)
-                metrics.densityDpi.takeIf { it in 120..800 }
+                val dispCtx = disp?.let { appCtx.createDisplayContext(it) }
+                dispCtx?.resources?.displayMetrics?.densityDpi?.takeIf { it in 120..800 }
             }.getOrNull() ?: ((snap.screenW * 160) / 360).coerceIn(240, 640)
             val realSwDp = ((snap.screenW * 160f) / realDpi).toInt().coerceAtLeast(320)
             return JSONObject()

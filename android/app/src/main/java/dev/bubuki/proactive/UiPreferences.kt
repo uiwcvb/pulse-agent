@@ -21,10 +21,10 @@ object UiPreferences {
             prefs.edit().putBoolean("migrated", true).putString("appearance", "dark")
                 .putBoolean("motion", old.optBoolean("motion", true))
                 .putBoolean("haptics", old.optBoolean("haptics", true))
-                .putBoolean("power_save", old.optBoolean("power_save", false)).commit()
+                .putBoolean("power_save", old.optBoolean("power_save", false)).apply()
         }
         if (!prefs.contains("fixed_dark_v280")) {
-            prefs.edit().putBoolean("fixed_dark_v280", true).putString("appearance", "dark").commit()
+            prefs.edit().putBoolean("fixed_dark_v280", true).putString("appearance", "dark").apply()
         }
         store = prefs; prefs.registerOnSharedPreferenceChangeListener(listener); refresh()
     }
@@ -32,12 +32,11 @@ object UiPreferences {
         val p = store ?: return
         val raw = p.getString("appearance", "dark") ?: "dark"
         val normalized = if (raw == "light") "light" else "dark"
-        state.value = UiAppearance(
-            normalized,
-            p.getBoolean("motion", true),
-            p.getBoolean("haptics", true),
-            p.getBoolean("power_save", false)
-        )
+        val mot = p.getBoolean("motion", true)
+        val hap = p.getBoolean("haptics", true)
+        val pwr = p.getBoolean("power_save", false)
+        state.value = UiAppearance(normalized, mot, hap, pwr)
+        SecurePrefs.syncUiFlagsInFastConfig(normalized, mot, hap, pwr)
     }
     fun changes(context: Context): StateFlow<UiAppearance> { initialize(context); return state.asStateFlow() }
     @JvmStatic fun readPowerSave(context: Context): Boolean {
@@ -46,7 +45,7 @@ object UiPreferences {
     }
     @JvmStatic fun writePowerSave(context: Context, enabled: Boolean) {
         initialize(context)
-        store?.edit()?.putBoolean("power_save", enabled)?.commit()
+        store?.edit()?.putBoolean("power_save", enabled)?.apply()
         refresh()
     }
     @JvmStatic fun update(context: Context, values: JSONObject) {
@@ -56,7 +55,7 @@ object UiPreferences {
         store!!.edit().putString("appearance", appearance)
             .putBoolean("motion", values.optBoolean("motion", current.motion))
             .putBoolean("haptics", values.optBoolean("haptics", current.haptics))
-            .putBoolean("power_save", values.optBoolean("power_save", current.powerSave)).commit(); refresh()
+            .putBoolean("power_save", values.optBoolean("power_save", current.powerSave)).apply(); refresh()
     }
     @JvmStatic fun decorate(context: Context, values: JSONObject): JSONObject {
         initialize(context); val p = state.value

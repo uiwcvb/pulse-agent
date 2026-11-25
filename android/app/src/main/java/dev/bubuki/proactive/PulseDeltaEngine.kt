@@ -14,6 +14,73 @@ import kotlin.math.abs
  *                  and monotonic trace/assistant deduplication.
  */
 
+internal fun shouldRejectStaleSyncEpoch(incomingEpoch: Long, currentEpoch: Long): Boolean =
+    incomingEpoch > 0L && currentEpoch > 0L && incomingEpoch < currentEpoch
+
+/**
+ * Total, strictly transitive merge-sort between server-sequenced messages (`orderSeq > 0`)
+ * and local/ephemeral messages (`orderSeq <= 0`), preserving exact server `orderSeq` order
+ * while interleaving local entries chronologically without violating TimSort's contract.
+ */
+internal fun sortPulseMessages(messages: List<PulseMessage>): List<PulseMessage> {
+    if (messages.size <= 1) return messages
+    val serverMsgs = ArrayList<PulseMessage>(messages.size)
+    val localMsgs = ArrayList<PulseMessage>()
+    for (m in messages) {
+        if (m.orderSeq > 0L) serverMsgs.add(m) else localMsgs.add(m)
+    }
+    if (localMsgs.isEmpty()) {
+        return serverMsgs.sortedWith(compareBy<PulseMessage>({ it.orderSeq }, { it.created }, { it.seq }, { it.id }))
+    }
+    if (serverMsgs.isEmpty()) {
+        return localMsgs.sortedWith(compareBy<PulseMessage>({ it.created }, { it.seq }, { it.id }))
+    }
+    val sortedServer = serverMsgs.sortedWith(compareBy<PulseMessage>({ it.orderSeq }, { it.created }, { it.seq }, { it.id }))
+    val sortedLocal = localMsgs.sortedWith(compareBy<PulseMessage>({ it.created }, { it.seq }, { it.id }))
+    val monoTime = DoubleArray(sortedServer.size)
+    monoTime[0] = sortedServer[0].created
+    for (i in 1 until sortedServer.size) {
+        monoTime[i] = maxOf(monoTime[i - 1], sortedServer[i].created)
+    }
+    val out = ArrayList<PulseMessage>(messages.size)
+    var si = 0
+    var li = 0
+    while (si < sortedServer.size && li < sortedLocal.size) {
+        if (sortedLocal[li].created < monoTime[si]) {
+            out.add(sortedLocal[li++])
+        } else {
+            out.add(sortedServer[si++])
+        }
+    }
+    while (si < sortedServer.size) out.add(sortedServer[si++])
+    while (li < sortedLocal.size) out.add(sortedLocal[li++])
+    return out
+}
+
+internal fun capRemoteMessages(messages: List<PulseMessage>, limit: Int = 600): List<PulseMessage> {
+    if (messages.size <= limit) return messages
+    val keepIndices = HashSet<Int>(limit)
+    val countPerBot = HashMap<String, Int>()
+    for (i in messages.indices.reversed()) {
+        val bid = messages[i].botId
+        val c = countPerBot[bid] ?: 0
+        if (c < 30) {
+            keepIndices.add(i)
+            countPerBot[bid] = c + 1
+            if (keepIndices.size >= limit) break
+        }
+    }
+    for (i in messages.indices.reversed()) {
+        if (keepIndices.size >= limit) break
+        keepIndices.add(i)
+    }
+    val out = ArrayList<PulseMessage>(keepIndices.size)
+    for (i in messages.indices) {
+        if (i in keepIndices) out.add(messages[i])
+    }
+    return out
+}
+
 internal val pulseMessageComparator = Comparator<PulseMessage> { a, b ->
     if (a.orderSeq > 0L && b.orderSeq > 0L && a.orderSeq != b.orderSeq) {
         return@Comparator a.orderSeq.compareTo(b.orderSeq)
@@ -50,10 +117,13 @@ internal fun deduplicateAssistantList(rawMerged: List<PulseMessage>): ArrayList<
             out[out.lastIndex] = keepMsg.copy(
                 trace = if (msg.trace.length > prev.trace.length) msg.trace else prev.trace,
                 turnSteps = if (msg.turnSteps.length > prev.turnSteps.length) msg.turnSteps else prev.turnSteps,
+                timeline = if (msg.timeline.length > prev.timeline.length) msg.timeline else prev.timeline,
                 choices = if (msg.choices.isNotEmpty()) msg.choices else prev.choices,
                 thought = if (msg.thought.isNotBlank()) msg.thought else prev.thought,
                 sticker = if (msg.sticker.isNotBlank()) msg.sticker else prev.sticker,
-                attachments = if (msg.attachments.isNotEmpty()) msg.attachments else prev.attachments
+                attachments = if (msg.attachments.isNotEmpty()) msg.attachments else prev.attachments,
+                variants = if (msg.variants.isNotEmpty()) msg.variants else prev.variants,
+                activeVariantIdx = if (msg.variants.isNotEmpty()) msg.activeVariantIdx else prev.activeVariantIdx
             )
         } else {
             out.add(msg)
@@ -82,14 +152,10 @@ internal fun mergeMonotonicTrace(
 }
 
 internal fun NativePulseModel.buildSyncQuery(afterId: String?, force: Boolean): JSONObject = JSONObject().apply {
-    val maxOrderSeq = if (force) 0L else {
-        remoteMessages.asSequence()
-            .filter { !it.optimistic && !isEphemeralMsgId(it.id) }
-            .maxOfOrNull { it.orderSeq } ?: 0L
-    }
-    put("since_seq", maxOrderSeq)
+    val syncSeq = if (force) 0L else confirmedSyncSeq
+    put("since_seq", syncSeq)
     put("limit", 120)
-    if (maxOrderSeq <= 0L && !force && !afterId.isNullOrBlank()) put("after_id", afterId)
+    if (syncSeq <= 0L && !force && !afterId.isNullOrBlank()) put("after_id", afterId)
     if (lastMessagesEpoch > 0L) put("messages_epoch", lastMessagesEpoch)
     if (!force && lastBotsVer.isNotBlank()) put("bots_ver", lastBotsVer)
     put("pins_ver", if (force) "" else lastPinsVer)
@@ -153,7 +219,7 @@ internal suspend fun NativePulseModel.refreshVaultSilently(changedPath: String) 
         val filesArr = listRes.optJSONArray("files") ?: JSONArray()
         val paths = (0 until filesArr.length()).map { filesArr.getJSONObject(it).getString("path") }
         val target = if (ui.selectedVaultPath in paths) ui.selectedVaultPath else (paths.firstOrNull() ?: "INDEX.md")
-        val shouldReloadDoc = !ui.vaultSaving && (changedPath.isBlank() || changedPath == target || target != ui.selectedVaultPath)
+        val shouldReloadDoc = !ui.vaultSaving && !ui.vaultDirty && (changedPath.isBlank() || changedPath == target || target != ui.selectedVaultPath)
         val content = if (shouldReloadDoc) {
             request("GET", "/api/vault", query = JSONObject().put("path", target)).optString("content", ui.vaultContent)
         } else {
@@ -252,11 +318,7 @@ internal fun NativePulseModel.hasInFlightWork(): Boolean {
 
 internal fun NativePulseModel.combinedMessages(): List<PulseMessage> {
     val phoneMsgs = RootPhoneHarness.changes.value.messages.filter { it.role != "user" && it.kind != "phone_task" }
-    val rawMerged = if (phoneMsgs.isEmpty()) {
-        remoteMessages.sortedWith(pulseMessageComparator)
-    } else {
-        (remoteMessages + phoneMsgs).distinctBy { it.id }.sortedWith(pulseMessageComparator)
-    }
+    val rawMerged = sortPulseMessages((remoteMessages + phoneMsgs).distinctBy { it.id })
     val baseList = deduplicateAssistantList(rawMerged)
     if (optimisticList.isEmpty()) return baseList
     val existingIds = baseList.asSequence().map { it.id }.toHashSet()
@@ -293,12 +355,12 @@ internal fun NativePulseModel.scopeOf(settings: JSONObject): String {
 }
 
 internal fun NativePulseModel.homeCache(settings: JSONObject): Triple<List<PulseBot>, String, List<PulseMessage>> {
-    val cache = settings.optJSONObject("nativeHomeCache")
+    val cache = SecurePrefs.readHomeCache(activity) ?: settings.optJSONObject("nativeHomeCache")
     if (cache?.optString("scope") == scopeOf(settings)) runCatching {
         val myNodeSource = SecureTransport.getNodeSource(activity)
-        val bots = cache.getJSONArray("bots").objects().map { PulseBot.from(it, myNodeSource) }
+        val bots = PulseBot.filterForNode(cache.getJSONArray("bots").objects().map { PulseBot.from(it, myNodeSource) }, myNodeSource)
         val primary = cache.getString("primary")
-        val msgs = (cache.optJSONArray("messages") ?: JSONArray()).objects().map(PulseMessage::from)
+        val msgs = (cache.optJSONArray("messages") ?: JSONArray()).objects().mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }
         return Triple(bots, primary, msgs)
     }
     return Triple(
@@ -325,31 +387,47 @@ internal fun NativePulseModel.homeCache(settings: JSONObject): Triple<List<Pulse
 }
 
 internal fun NativePulseModel.cacheRoster(bots: List<PulseBot>, primary: String, serverScope: String = scopeOf(prefs)) {
-    val recentMsgsJson = JSONArray()
-    remoteMessages.takeLast(80).forEach { m ->
-        recentMsgsJson.put(
-            JSONObject()
-                .put("id", m.id).put("bot_id", m.botId).put("role", m.role)
-                .put("text", m.text).put("kind", m.kind).put("engine", m.engine)
-                .put("created_at", m.created).put("decision", m.decision)
-                .put("order_seq", m.orderSeq).put("seq", m.seq)
-                .put("turn_id", m.turnId).put("client_msg_id", m.clientMsgId)
-                .put("trace", runCatching { JSONArray(m.trace) }.getOrDefault(JSONArray()))
-                .put("choices", JSONArray(m.choices.map { it.json() }))
-                .put("from_bot_id", m.fromBotId).put("from_bot_name", m.fromBotName)
-                .put("thought", m.thought).put("sticker", m.sticker)
-                .put("attachments", JSONArray(m.attachments.map { a ->
-                    JSONObject().put("path", a.path).put("name", a.name).put("size", a.size).put("ext", a.ext).put("mime", a.mime)
-                }))
-        )
+    val msgSnapshot = remoteMessages.takeLast(80)
+    val botSnapshot = bots.toList()
+    val appCtx = activity.applicationContext
+    draftWriter.submit {
+        runCatching {
+            val fresh = SecurePrefs.readFast(appCtx)
+            if (scopeOf(fresh) != serverScope) return@submit
+            val recentMsgsJson = JSONArray()
+            msgSnapshot.forEach { m ->
+                recentMsgsJson.put(
+                    JSONObject()
+                        .put("id", m.id).put("bot_id", m.botId).put("role", m.role)
+                        .put("text", m.text).put("kind", m.kind).put("engine", m.engine)
+                        .put("created_at", m.created).put("decision", m.decision)
+                        .put("order_seq", m.orderSeq).put("seq", m.seq)
+                        .put("turn_id", m.turnId).put("client_msg_id", m.clientMsgId)
+                        .put("trace", runCatching { JSONArray(m.trace) }.getOrDefault(JSONArray()))
+                        .put("turn_steps", runCatching { JSONArray(m.turnSteps) }.getOrDefault(JSONArray()))
+                        .put("timeline", runCatching { JSONArray(m.timeline) }.getOrDefault(JSONArray()))
+                        .put("choices", JSONArray(m.choices.map { it.json() }))
+                        .put("from_bot_id", m.fromBotId).put("from_bot_name", m.fromBotName)
+                        .put("thought", m.thought).put("sticker", m.sticker)
+                        .put("api_calls", m.apiCalls)
+                        .put("ttft_ms", m.ttftMs)
+                        .put("tps", m.tps)
+                        .put("cache_hit_pct", m.cacheHitPct)
+                        .put("total_ms", m.totalMs)
+                        .put("active_variant_idx", m.activeVariantIdx)
+                        .put("attachments", JSONArray(m.attachments.map { a ->
+                            JSONObject().put("path", a.path).put("name", a.name).put("size", a.size).put("ext", a.ext).put("mime", a.mime)
+                        }))
+                )
+            }
+            val cache = JSONObject()
+                .put("scope", serverScope)
+                .put("primary", primary)
+                .put("bots", JSONArray(botSnapshot.map { it.json() }))
+                .put("messages", recentMsgsJson)
+            SecurePrefs.saveHomeCache(appCtx, cache)
+        }
     }
-    val cache = JSONObject().put("scope", serverScope).put("primary", primary)
-        .put("bots", JSONArray(bots.map { it.json() }))
-        .put("messages", recentMsgsJson)
-    draftWriter.submit { synchronized(SecurePrefs::class.java) {
-        val fresh = SecurePrefs.read(activity)
-        if (scopeOf(fresh) == serverScope) SecurePrefs.save(activity, fresh.put("nativeHomeCache", cache))
-    } }
 }
 
 internal fun NativePulseModel.readAttachments(settings: JSONObject) {
@@ -384,13 +462,17 @@ internal fun NativePulseModel.isSuppressedByStop(botId: String?, turnId: String)
 
 internal fun NativePulseModel.mergeRemoteMessages(incoming: List<PulseMessage>, fullReplace: Boolean = false) {
     if (incoming.isEmpty() && !fullReplace) return
+    val normalized = incoming.mapIndexed { idx, msg ->
+        if (msg.id.isNotBlank()) msg
+        else msg.copy(id = "anon-${msg.botId}-${msg.orderSeq}-${msg.seq}-$idx")
+    }
     val oldIds = remoteMessages.asSequence().map { it.id }.toHashSet()
     val rawMerged = if (fullReplace) {
-        incoming
+        normalized.distinctBy { it.id }
     } else {
-        val byId = LinkedHashMap<String, PulseMessage>(remoteMessages.size + incoming.size)
+        val byId = LinkedHashMap<String, PulseMessage>(remoteMessages.size + normalized.size)
         remoteMessages.forEach { local ->
-            val replacedByServerStop = local.id.startsWith("stopped-") && incoming.any { inc ->
+            val replacedByServerStop = local.id.startsWith("stopped-") && normalized.any { inc ->
                 !inc.id.startsWith("stopped-") && inc.botId == local.botId && inc.role == "assistant" &&
                     (inc.text.trim() == local.text.trim() || abs(inc.created - local.created) < 20.0)
             }
@@ -398,10 +480,10 @@ internal fun NativePulseModel.mergeRemoteMessages(incoming: List<PulseMessage>, 
                 byId[local.id] = local
             }
         }
-        incoming.forEach { byId[it.id] = it }
+        normalized.forEach { byId[it.id] = it }
         byId.values.toList()
     }
-    val merged = deduplicateAssistantList(rawMerged.sortedWith(pulseMessageComparator))
+    val merged = capRemoteMessages(deduplicateAssistantList(sortPulseMessages(rawMerged)), 600)
     remoteMessages = merged
     optimisticList.removeAll { opt ->
         merged.takeLast(18).any {
@@ -410,7 +492,7 @@ internal fun NativePulseModel.mergeRemoteMessages(incoming: List<PulseMessage>, 
         }
     }
     if (!fullReplace && oldIds.isNotEmpty()) {
-        val newestAssistant = incoming.lastOrNull { it.isTerminalAssistantReply && it.id !in oldIds }
+        val newestAssistant = normalized.lastOrNull { it.isTerminalAssistantReply && it.id !in oldIds }
         if (newestAssistant != null && newestAssistant.id == merged.lastOrNull { it.botId == newestAssistant.botId }?.id) {
             if (sendGuardBotId == newestAssistant.botId) {
                 sendGuardBotId = null
