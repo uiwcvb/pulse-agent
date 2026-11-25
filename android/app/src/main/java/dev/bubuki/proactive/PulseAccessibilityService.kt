@@ -854,6 +854,99 @@ class PulseAccessibilityService : AccessibilityService() {
             return sb.toString().trim()
         }
 
+        /**
+         * Display-isolated BACK action (`displayId > 0` only): locates a standard back/up/close control
+         * inside the VirtualDisplay's top window and triggers node-level `ACTION_CLICK` directly.
+         * Never calls `performGlobalAction(GLOBAL_ACTION_BACK)` and never touches Display 0 focus.
+         */
+        @JvmStatic
+        fun performDisplayIsolatedBack(displayId: Int, screenW: Int, screenH: Int): JSONObject? {
+            if (displayId <= 0) return null
+            val svc = instance ?: return null
+            val wSafe = screenW.coerceAtLeast(320)
+            val hSafe = screenH.coerceAtLeast(640)
+            val snap = dumpDisplayTree(displayId, wSafe, hSafe, forceRefresh = true, waitMs = 180L)
+                ?.let { snapshotCache[displayId] } ?: return null
+            val backKeywords = listOf("返回", "转到上一层级", "上一页", "后退", "navigate up", "go back", "back", "关闭", "close")
+            val topLeftMaxX = (wSafe * 0.28f).toInt()
+            val topBarMaxY = (hSafe * 0.16f).toInt()
+            var bestNode: CachedNode? = null
+            var bestScore = 0
+            for (n in snap.nodes) {
+                if (!n.clickable) continue
+                val lbl = "${n.desc} ${n.text}".trim().lowercase()
+                val rid = n.resourceId.lowercase()
+                val inTopLeft = n.centerX <= topLeftMaxX && n.centerY <= topBarMaxY
+                val inTopBar = n.centerY <= topBarMaxY
+                var score = 0
+                if (backKeywords.any { kw -> lbl == kw || lbl.startsWith(kw) }) score += 100
+                else if (backKeywords.any { kw -> lbl.contains(kw) }) score += 70
+                if (rid.contains("back") || rid.contains("navigate_up") || rid.contains("nav_up") || rid.contains("close") || rid.contains("return")) {
+                    score += 65
+                }
+                if (score <= 0) continue
+                if (inTopLeft) score += 40
+                else if (inTopBar) score += 20
+                else if (lbl == "关闭" || lbl == "close") continue // Avoid clicking unrelated mid-page close buttons
+                if (score > bestScore) {
+                    bestScore = score
+                    bestNode = n
+                }
+            }
+            val chosen = bestNode ?: return null
+            val clicked = clickNodeOnDisplay(svc, displayId, chosen)
+            if (!clicked) return null
+            return JSONObject()
+                .put("ok", true)
+                .put("uid", 2000)
+                .put("displayId", displayId)
+                .put("key", "back")
+                .put("method", "a11y_isolated_back")
+                .put("ref", chosen.ref)
+                .put("label", chosen.desc.ifBlank { chosen.text }.ifBlank { chosen.resourceId })
+                .put("x", chosen.centerX)
+                .put("y", chosen.centerY)
+        }
+
+        private fun clickNodeOnDisplay(svc: PulseAccessibilityService, displayId: Int, target: CachedNode): Boolean {
+            return runCatching {
+                val windows = svc.windowsOnAllDisplays?.get(displayId) ?: return false
+                for (w in windows) {
+                    val root = w?.root ?: continue
+                    try {
+                        val found = findMatchingNode(root, target)
+                        if (found != null) {
+                            val ok = found.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                            if (ok) return true
+                        }
+                    } finally {
+                        @Suppress("DEPRECATION")
+                        runCatching { root.recycle() }
+                    }
+                }
+                false
+            }.getOrDefault(false)
+        }
+
+        private fun findMatchingNode(root: AccessibilityNodeInfo, target: CachedNode): AccessibilityNodeInfo? {
+            val queue = ArrayDeque<AccessibilityNodeInfo>()
+            queue.add(root)
+            val rect = Rect()
+            var visited = 0
+            while (queue.isNotEmpty() && visited < 400) {
+                val cur = queue.removeFirst()
+                visited++
+                cur.getBoundsInScreen(rect)
+                val matchBounds = kotlin.math.abs(rect.centerX() - target.centerX) <= 12 &&
+                    kotlin.math.abs(rect.centerY() - target.centerY) <= 12
+                if (matchBounds && cur.isClickable) return cur
+                for (i in 0 until cur.childCount) {
+                    cur.getChild(i)?.let { queue.add(it) }
+                }
+            }
+            return null
+        }
+
         internal fun snapshotToJson(snap: CachedSnapshot, fromCache: Boolean): JSONObject {
             val arr = JSONArray()
             snap.nodes.forEach { arr.put(it.toJson()) }

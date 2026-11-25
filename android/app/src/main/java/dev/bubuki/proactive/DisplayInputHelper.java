@@ -427,7 +427,6 @@ final class DisplayInputHelper {
             keyCode = explicitCode;
         } else {
             switch (key) {
-                case "home": keyCode = KeyEvent.KEYCODE_BACK; break;
                 case "back": keyCode = KeyEvent.KEYCODE_BACK; break;
                 case "enter":
                 case "66": keyCode = KeyEvent.KEYCODE_ENTER; break;
@@ -449,7 +448,7 @@ final class DisplayInputHelper {
             }
         }
         if (keyCode == KeyEvent.KEYCODE_HOME || keyCode == KeyEvent.KEYCODE_APP_SWITCH) {
-            keyCode = KeyEvent.KEYCODE_BACK;
+            throw new Exception("为保护物理主屏不跳回桌面，禁止在虚拟屏注入系统导航键 keycode=" + keyCode);
         }
         return keyCode;
     }
@@ -599,6 +598,10 @@ final class DisplayInputHelper {
                         snap.existingMainIsFloatingOrVisible = true;
                     }
                 }
+            }
+            String currentMainTop = topPackageOnDisplay(Display.DEFAULT_DISPLAY);
+            if (pkg != null && !pkg.isEmpty() && !"dev.bubuki.proactive".equals(pkg) && pkg.equals(currentMainTop)) {
+                snap.existingMainIsFloatingOrVisible = true;
             }
         } catch (Throwable ignored) {}
         return snap;

@@ -21,9 +21,9 @@ ver_name = re.search(r"versionName\s+'([^']+)'", gradle_txt).group(1)
 ver_code = int(re.search(r"versionCode\s+(\d+)", gradle_txt).group(1))
 notes = (
     f"v{ver_name} (Build {ver_code}): "
-    "1) 全链路校准 Token 计数：Sidecar 显式透传真实 promptTokens，修复空闲热压缩清零、pc_* 节点串台与主动关心小会话覆盖主对话计数问题，客户端本地估算按最新压缩点截断；"
-    "2) 修复 BUG-2026-11-25-01：主动关心注入带北京时间戳的最近 16 条主对话作为最高权威事实源，严禁编造当下现场位置/车厢旁白及复读过期旧账；"
-    "3) 修复 BUG-2026-11-23-07（贴纸开头多段 thinking 自动合并去重）与云桌面命令 600s 超时兜底。"
+    "1) 彻底修复虚拟屏操控导致主屏老是跳回桌面/主页面的根因：虚拟屏 back 键改为优先走仅作用于虚拟屏窗口的无障碍节点级返回（零穿透 Display 0），彻底禁用易漏屏的 shell input keyevent 4 兜底与 HOME/APP_SWITCH 偷转 BACK，并加入主屏前台自检秒恢复与 ROM 穿透自动熔断；"
+    "2) 修复 DisplayTaskContainment.isTaskVisible 在 Android 14/15 反射失效与 Launcher 误设基线问题，防止 launch 搬走主屏前台应用；"
+    "3) 内置 v4.0.43–44 全量向量记忆空间、Token 计数校准与主动关心反幻觉。"
 )
 release_meta = {
     'version': ver_name,

@@ -757,7 +757,9 @@ object RootPhoneHarness {
                 })?.treeHash.orEmpty()
         } else ""
         try {
-            val result = privilege!!.execute(command)
+            val isBackKey = operation == "key" && currentDisplay > 0 && (command.optString("key").equals("back", true) || command.optInt("keycode", -1) == 4)
+            val result = (if (isBackKey) PulseAccessibilityService.performDisplayIsolatedBack(currentDisplay, dispW, dispH) else null)
+                ?: privilege!!.execute(command)
             val uid = result.optInt("uid", -1)
             if (uid != 0 && uid != 2000) throw Exception("拒绝无特权的手机执行结果 (uid=$uid)")
             if (operation == "promote" && result.optBoolean("promoted", false)) {

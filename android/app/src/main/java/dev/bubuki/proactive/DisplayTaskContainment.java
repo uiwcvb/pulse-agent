@@ -97,6 +97,18 @@ final class DisplayTaskContainment {
             Object vis = taskInfo.getClass().getField("isVisible").get(taskInfo);
             if (vis instanceof Boolean) return (Boolean) vis;
         } catch (Throwable ignored) {}
+        try {
+            Object vis = taskInfo.getClass().getMethod("isVisible").invoke(taskInfo);
+            if (vis instanceof Boolean) return (Boolean) vis;
+        } catch (Throwable ignored) {}
+        try {
+            Object vis = taskInfo.getClass().getField("isVisibleRequested").get(taskInfo);
+            if (vis instanceof Boolean) return (Boolean) vis;
+        } catch (Throwable ignored) {}
+        try {
+            Object foc = taskInfo.getClass().getField("isFocused").get(taskInfo);
+            if (foc instanceof Boolean && (Boolean) foc) return true;
+        } catch (Throwable ignored) {}
         return false;
     }
 
@@ -138,7 +150,7 @@ final class DisplayTaskContainment {
                 }
 
                 if (!floating && !managedVirtualPackages.contains(topPkg)) {
-                    if (fallbackTid < 0) {
+                    if (fallbackTid < 0 && !isHomeOrLauncherPackage(topPkg)) {
                         fallbackTid = tid;
                         fallbackPkg = topPkg;
                     }
@@ -149,7 +161,7 @@ final class DisplayTaskContainment {
                 }
                 idx++;
             }
-            if (baselineMainTaskId <= 0 && fallbackTid > 0) {
+            if (baselineMainTaskId <= 0 && fallbackTid > 0 && !isHomeOrLauncherPackage(fallbackPkg)) {
                 baselineMainTaskId = fallbackTid;
                 baselineMainPkg = fallbackPkg;
             }

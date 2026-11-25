@@ -1,15 +1,15 @@
 {
-  "version": "4.0.44",
-  "version_name": "4.0.44",
-  "versionName": "4.0.44",
-  "tag_name": "v4.0.44",
-  "version_code": 132,
-  "versionCode": 132,
-  "build": 132,
-  "published_at": "2026-11-25T20:18:45.726362+08:00",
-  "apk_size": 33420550,
-  "sha256": "0bb146f7583322532dd02d4e17cb282ed2ab813dc611a5d90bb68b06b8ec846d",
+  "version": "4.0.45",
+  "version_name": "4.0.45",
+  "versionName": "4.0.45",
+  "tag_name": "v4.0.45",
+  "version_code": 133,
+  "versionCode": 133,
+  "build": 133,
+  "published_at": "2026-11-25T20:48:38.523174+08:00",
+  "apk_size": 33423866,
+  "sha256": "256dae78df06e2ea3e74d046648d29d5589c27642ab572ff7992037ae5260e71",
   "download_url": "/proactive-agent/download/proactive-agent.apk",
-  "notes": "v4.0.44 (Build 132): 1) 全链路校准 Token 计数：Sidecar 显式透传真实 promptTokens，修复空闲热压缩清零、pc_* 节点串台与主动关心小会话覆盖主对话计数问题，客户端本地估算按最新压缩点截断；2) 修复 BUG-2026-11-25-01：主动关心注入带北京时间戳的最近 16 条主对话作为最高权威事实源，严禁编造当下现场位置/车厢旁白及复读过期旧账；3) 修复 BUG-2026-11-23-07（贴纸开头多段 thinking 自动合并去重）与云桌面命令 600s 超时兜底。",
-  "body": "v4.0.44 (Build 132): 1) 全链路校准 Token 计数：Sidecar 显式透传真实 promptTokens，修复空闲热压缩清零、pc_* 节点串台与主动关心小会话覆盖主对话计数问题，客户端本地估算按最新压缩点截断；2) 修复 BUG-2026-11-25-01：主动关心注入带北京时间戳的最近 16 条主对话作为最高权威事实源，严禁编造当下现场位置/车厢旁白及复读过期旧账；3) 修复 BUG-2026-11-23-07（贴纸开头多段 thinking 自动合并去重）与云桌面命令 600s 超时兜底。"
+  "notes": "v4.0.45 (Build 133): 1) 彻底修复虚拟屏操控导致主屏老是跳回桌面/主页面的根因：虚拟屏 back 键改为优先走仅作用于虚拟屏窗口的无障碍节点级返回（零穿透 Display 0），彻底禁用易漏屏的 shell input keyevent 4 兜底与 HOME/APP_SWITCH 偷转 BACK，并加入主屏前台自检秒恢复与 ROM 穿透自动熔断；2) 修复 DisplayTaskContainment.isTaskVisible 在 Android 14/15 反射失效与 Launcher 误设基线问题，防止 launch 搬走主屏前台应用；3) 内置 v4.0.43–44 全量向量记忆空间、Token 计数校准与主动关心反幻觉。",
+  "body": "v4.0.45 (Build 133): 1) 彻底修复虚拟屏操控导致主屏老是跳回桌面/主页面的根因：虚拟屏 back 键改为优先走仅作用于虚拟屏窗口的无障碍节点级返回（零穿透 Display 0），彻底禁用易漏屏的 shell input keyevent 4 兜底与 HOME/APP_SWITCH 偷转 BACK，并加入主屏前台自检秒恢复与 ROM 穿透自动熔断；2) 修复 DisplayTaskContainment.isTaskVisible 在 Android 14/15 反射失效与 Launcher 误设基线问题，防止 launch 搬走主屏前台应用；3) 内置 v4.0.43–44 全量向量记忆空间、Token 计数校准与主动关心反幻觉。"
 }

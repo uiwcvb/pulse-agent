@@ -6,7 +6,7 @@
 <br />
 **多端协同个人智能伴侣与跨设备自主执行系统**
 
-[![Release](https://img.shields.io/badge/release-v4.0.44%20(Build%20132)-0A84FF?style=flat-square)](https://github.com/uiwcvb/pulse-agent/releases/latest)
+[![Release](https://img.shields.io/badge/release-v4.0.45%20(Build%20133)-0A84FF?style=flat-square)](https://github.com/uiwcvb/pulse-agent/releases/latest)
 [![Architecture](https://img.shields.io/badge/engine-FastAPI%20%2B%20Node%20DSH%20Sidecar-10B981?style=flat-square)](#-系统架构-architecture)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Linux%20Cloud%20OS%20%7C%20Desktop-6366F1?style=flat-square)](#-核心能力-features)
 [![License](https://img.shields.io/badge/license-MIT-slate?style=flat-square)](LICENSE)

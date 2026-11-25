@@ -38,6 +38,7 @@ final class DisplayRuntime {
 
     private volatile boolean trustedDisplay = true;
     private volatile boolean releasedToBackground = false;
+    private volatile boolean backKeyLeaksToMain = false;
     private RootClipboard clipboard;
     private volatile int width = 1472, height = 3232, densityDpi = 480;
     private volatile String activeTier = "compact";
@@ -513,13 +514,38 @@ final class DisplayRuntime {
                         .put("keycode", keyCode)
                         .put("at_virtual_root", true);
                 }
+                if (backKeyLeaksToMain || !trustedDisplay || Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    return state()
+                        .put("key", "back")
+                        .put("keycode", keyCode)
+                        .put("key_consumed", false)
+                        .put("back_blocked_main_protect", true)
+                        .put("note", "为防止系统把 KEYCODE_BACK 穿透到物理主屏，已拦截硬件返回键；请直接点击页面内左上角返回按钮。");
+                }
             }
             onBeforeVirtualInteraction(id);
-            if (!DisplayInputHelper.injectKey(id, keyCode)) {
+            int mainTaskBeforeKey = containment.baselineMainTaskId;
+            String mainPkgBeforeKey = containment.baselineMainPkg;
+            boolean injected = DisplayInputHelper.injectKey(id, keyCode);
+            if (!injected && keyCode != android.view.KeyEvent.KEYCODE_BACK) {
                 DisplayInputHelper.checkedInputShell("input", "-d", String.valueOf(id), "keyevent", String.valueOf(keyCode));
             }
+            if (keyCode == android.view.KeyEvent.KEYCODE_BACK && mainTaskBeforeKey > 0 && !DisplayTaskContainment.isHomeOrLauncherPackage(mainPkgBeforeKey)) {
+                try {
+                    Object atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+                    for (long waitMs : new long[]{85L, 160L}) {
+                        Thread.sleep(waitMs);
+                        String mainAfter = DisplayInputHelper.topPackageOnDisplay(android.view.Display.DEFAULT_DISPLAY);
+                        if (DisplayTaskContainment.isHomeOrLauncherPackage(mainAfter) || (!mainAfter.isEmpty() && !mainAfter.equals(mainPkgBeforeKey))) {
+                            backKeyLeaksToMain = true;
+                            DisplayTaskContainment.invokeMoveTaskToFront(atm, mainTaskBeforeKey, android.view.Display.DEFAULT_DISPLAY);
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
             scheduleEscapeContainment(id);
-            return state().put("key", key).put("keycode", keyCode);
+            return state().put("key", key).put("keycode", keyCode).put("back_leak_protected", backKeyLeaksToMain);
         } else if (op.equals("open_uri") || op.equals("open_url")) {
             int id = requireDisplay();
             String uri = cmd.optString("uri", cmd.optString("url", cmd.optString("text", ""))).trim();
